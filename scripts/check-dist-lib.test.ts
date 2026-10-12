@@ -124,8 +124,8 @@ describe('checkDist', () => {
       to: '<h1></h1>',
       failure: 'dist/index.html does not contain ">Zach Davids</h1>"',
     },
-    // The template's meta description repeats the role and status, so these
-    // two catch only rendered page content.
+    // The meta description repeats the role and status, so these two catch
+    // only rendered page content.
     {
       problem: 'a home page without the rendered role',
       file: 'index.html',
@@ -305,20 +305,33 @@ describe('checkDist', () => {
   });
 
   it('resolves links to pages as CloudFront does', async () => {
-    // CloudFront serves /about from about/index.html and /notes/ from notes/index.html,
-    // so /talks is missing although talks/ exists.
-    const links = '<a href="/about">About</a><a href="/notes/">Notes</a><a href="/talks">Talks</a>';
+    // CloudFront serves /about from about/index.html, /notes/ from notes/index.html, and
+    // /.well-known/ paths as they are. So /talks is missing although talks/ exists, and
+    // /notes.v2 is missing although notes.v2/index.html exists: its dot makes it a file name.
+    const links = [
+      '<a href="/about">About</a>',
+      '<a href="/notes/">Notes</a>',
+      '<a href="/talks">Talks</a>',
+      '<a href="/.well-known/apple-app-site-association">Apps</a>',
+      '<a href="/notes.v2">Notes v2</a>',
+    ].join('');
     const changes = {
       ...edit('index.html', '</main>', `${links}</main>`),
       'about/index.html': '',
       'notes/index.html': '',
       'talks/slides.pdf': '',
+      '.well-known/apple-app-site-association': '{}\n',
+      'notes.v2/index.html': '',
     };
-    expect(checkDist(await project(changes))).toEqual(['dist/index.html references missing /talks']);
+    expect(checkDist(await project(changes))).toEqual([
+      'dist/index.html references missing /talks',
+      'dist/index.html references missing /notes.v2',
+    ]);
   });
 
-  it('checks the file a URL names, without its query or fragment', async () => {
-    const changes = edit('404.html', 'src="/assets/index-mKM-b7Ju.js"', 'src="/assets/index-mKM-b7Ju.js?v=2#app"');
+  // Also a fragment with no query, as in an SVG sprite reference such as /assets/icons-AbCd1234.svg#github.
+  it.each(['?v=2#app', '#app'])('checks the file a URL names, without its query or fragment: %s', async (suffix) => {
+    const changes = edit('404.html', 'src="/assets/index-mKM-b7Ju.js"', `src="/assets/index-mKM-b7Ju.js${suffix}"`);
     expect(checkDist(await project(changes))).toEqual([]);
   });
 

@@ -1,16 +1,21 @@
 // Post-build check: the generated HTML must contain the substantive page
 // content (not an empty client-rendered shell) and the head both pages share,
-// every root-relative file it references must exist, and every /assets/ file
-// it references must be a build output with a content hash in its name.
-import { existsSync, readFileSync } from 'node:fs';
+// and use only root-relative or absolute URLs (or fragments); every
+// root-relative file it references must exist, and every /assets/ file it
+// references must be a build output with a content hash in its name.
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { profile, site } from '../src/content.ts';
 import { escapeHtml } from './prerender-lib.ts';
 
 // The file CloudFront serves for a path, as infra/functions/viewer-request.js maps it.
 function servedFile(path: string): string {
+  if (path.startsWith('/.well-known/')) return path;
   if (path.endsWith('/')) return `${path}index.html`;
   return path.lastIndexOf('.') < path.lastIndexOf('/') ? `${path}/index.html` : path;
 }
+
+// S3 serves objects, so a directory at a served path is as good as missing.
+const isFile = (url: URL) => existsSync(url) && statSync(url).isFile();
 
 // Returns one message per problem found in rootDir's dist/. rootDir is a
 // directory URL ending in "/".
@@ -78,7 +83,7 @@ export function checkDist(rootDir: URL): string[] {
     // Root-relative paths, without any query or fragment; //host is another host.
     const paths = urls.filter((url) => /^\/(?!\/)/.test(url)).map((url) => url.split(/[?#]/)[0]!);
     for (const path of paths) {
-      if (!existsSync(new URL(`.${servedFile(path)}`, dist))) failures.push(`dist/${file} references missing ${path}`);
+      if (!isFile(new URL(`.${servedFile(path)}`, dist))) failures.push(`dist/${file} references missing ${path}`);
     }
     const assets = paths.filter((path) => path.startsWith('/assets/'));
     if (!assets.some((a) => a.endsWith('.js'))) failures.push(`dist/${file} references no JavaScript bundle`);

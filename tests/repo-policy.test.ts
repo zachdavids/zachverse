@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { isAbsolute, posix, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { resolveConfig } from 'vite';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { site } from '../src/content.ts';
@@ -86,6 +87,15 @@ function deploysToProduction(workflow: Workflow, job: Job) {
     return event === 'push' && isDeepStrictEqual(branches, ['main']) && tags === undefined && tagsIgnore === undefined;
   });
   return environment === 'production' && mainOrManual;
+}
+
+// Every key and string value in a parsed workflow value, at any depth. Expressions are read from these rather than
+// from JSON text, which escapes a tab or newline before a name as \t or \n and so hides the name from \b.
+function strings(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(strings);
+  if (typeof value !== 'object' || value === null) return [];
+  return Object.entries(value).flatMap(([key, item]) => [key, ...strings(item)]);
 }
 
 // Each ${{ }} expression in the text. As in GitHub, a }} inside a single-quoted string does not end one.
@@ -237,9 +247,9 @@ describe('GitHub Actions workflows', () => {
     }
   });
 
-  it('run every job on a GitHub-hosted runner', () => {
+  it('run every job on a GitHub-hosted Ubuntu runner', () => {
     // A self-hosted or CodeBuild runner can hold an AWS role and lends it to every job it runs, PR code included.
-    const hosted = /^ubuntu-(?:latest|\d+\.\d+)(?:-arm)?$/;
+    const hosted = /^ubuntu-(?:slim|(?:latest|\d+\.\d+)(?:-arm)?)$/;
     const others = jobs.filter(({ job }) => typeof job['runs-on'] !== 'string' || !hosted.test(job['runs-on']));
     expect(others.map(({ where, job }) => `${where}: ${JSON.stringify(job['runs-on'])}`)).toEqual([]);
   });
@@ -252,8 +262,10 @@ describe('GitHub Actions workflows', () => {
     expect(configured.map(({ where }) => where)).toEqual([]);
     for (const { file, text, workflow } of workflows) {
       // Every ${{ }} expression, plus "secrets:" keys such as "secrets: inherit".
-      const json = JSON.stringify(workflow);
-      const references = [...expressions(json), ...(json.match(/"secrets":[^,}]*/g) ?? [])];
+      const references = [
+        ...strings(workflow).flatMap(expressions),
+        ...(JSON.stringify(workflow).match(/"secrets":[^,}]*/g) ?? []),
+      ];
       expect(references.filter((reference) => /\bsecrets\b/i.test(reference)), file).toEqual([]);
       expect(text.match(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g) ?? [], file).toEqual([]);
     }
@@ -265,7 +277,9 @@ describe('GitHub Actions workflows', () => {
         .map(({ where, job }) => ({ where, settings: job })),
     ];
     const readingVariables = outsideDeploys.filter(({ settings }) =>
-      expressions(JSON.stringify(settings)).some((expression) => /\bvars\b/i.test(expression)),
+      strings(settings)
+        .flatMap(expressions)
+        .some((expression) => /\bvars\b/i.test(expression)),
     );
     expect(readingVariables.map(({ where }) => where)).toEqual([]);
   });
@@ -367,16 +381,23 @@ describe('CI workflow', () => {
           compilerOptions: Record<string, unknown>;
           files: string[];
         };
-        // noCheck turns type checking off while the tsc command stays the same.
+        // noCheck turns type checking off while the tsc command stays the same; "noCheck": false is the default.
         const { strict, noEmit, noCheck } = config.compilerOptions;
-        expect({ strict, noEmit, noCheck }, `${dir}${project}`).toEqual({ strict: true, noEmit: true });
+        expect({ strict, noEmit, noCheck: noCheck === true }, `${dir}${project}`).toEqual({
+          strict: true,
+          noEmit: true,
+          noCheck: false,
+        });
         expect(strictFamily.filter((flag) => config.compilerOptions[flag] === false), `${dir}${project}`).toEqual([]);
         return config.files.map((file) => posix.join(dir, file));
       });
       // Vitest, Vite, and Node only strip types, so a file that no project includes is never type-checked.
-      const sources = files(['ts', 'tsx', 'mts', 'cts'].map((extension) => `${dir}*.${extension}`));
-      const unchecked = sources.filter((file) => !checked.includes(file) && (dir !== '' || !file.startsWith('infra/')));
-      expect(unchecked, `${dir}tsconfig*.json`).toEqual([]);
+      const sources = files(['ts', 'tsx', 'mts', 'cts'].map((extension) => `${dir}*.${extension}`)).filter(
+        (file) => dir !== '' || !file.startsWith('infra/'),
+      );
+      // An empty list would pass, as when git takes pathspecs literally (GIT_LITERAL_PATHSPECS=1).
+      expect(sources, dir).not.toHaveLength(0);
+      expect(sources.filter((file) => !checked.includes(file)), `${dir}tsconfig*.json`).toEqual([]);
     }
   });
 
@@ -400,6 +421,20 @@ describe('CI workflow', () => {
     expect(scripts['check:dist']).toBe('node scripts/check-dist.ts');
   });
 
+  it('lets the Vite config set no client output name without a content hash', async () => {
+    // check:dist cannot tell a dropped [hash] from a name ending in a long word, such as three-renderer.js, and Vite's
+    // own names all have one. Resolving the config as vite build does also covers a config function, client-only
+    // environment options, and the deprecated rollupOptions; web workers take their names from the worker options.
+    const config = await resolveConfig({ root: fileURLToPath(root), logLevel: 'silent' }, 'build', 'production');
+    const outputs = [config.environments.client!.build.rolldownOptions.output, config.worker.rolldownOptions.output];
+    const names = outputs.flat().flatMap((output) =>
+      (['entryFileNames', 'chunkFileNames', 'assetFileNames'] as const).map((option) => [option, output?.[option]] as const),
+    );
+    // A function can return any name, so only a pattern with [hash] passes.
+    const hashed = (name: unknown) => typeof name === 'string' && /\[hash(?::\d+)?\]/.test(name);
+    expect(names.filter(([, name]) => name !== undefined && !hashed(name))).toEqual([]);
+  });
+
   it('runs every test file in each package', async () => {
     // Other settings, such as exclude, changed, dir, or projects, can leave test files unrun.
     const allowed = ['include', 'environment', 'testTimeout', 'passWithNoTests', 'coverage'];
@@ -414,9 +449,10 @@ describe('CI workflow', () => {
       expect(settings.include?.filter((glob) => glob.startsWith('!')), dir).toEqual([]);
       // On CI's clean checkout, changed selects no tests and turns passWithNoTests on unless it is set to false.
       expect(settings.passWithNoTests, dir).toBe(false);
-      // Coverage does not notice a suite that stops running, such as one renamed to *.spec.ts.
+      // Coverage does not notice a suite that stops running, such as one renamed to *.spec.ts. Only script files
+      // count, so an OS or editor file there, such as .DS_Store, does not.
       const unrun = readdirSync(new URL(dir + tests, root), { withFileTypes: true })
-        .filter((entry) => entry.isFile())
+        .filter((entry) => entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name))
         .map(({ name }) => tests + name)
         .filter((file) => !settings.include?.some((glob) => posix.matchesGlob(file, glob)));
       expect(unrun, dir).toEqual([]);
@@ -462,6 +498,8 @@ describe('CI workflow', () => {
     // inside a string; the ts-nocheck pragma skips a file's type check (its name is split so this file passes).
     const optOut = new RegExp(String.raw`(?:istanbul|[cv]8|node:coverage)\s+ignore\b|@ts-${'no'}check`, 'i');
     const sources = files(['ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs'].map((extension) => `*.${extension}`));
+    // The scan must reach both packages' sources: an empty list would pass, as when git takes pathspecs literally.
+    expect(sources).toEqual(expect.arrayContaining(['src/content.ts', 'infra/functions/viewer-request.js']));
     expect(sources.filter((file) => optOut.test(read(file)))).toEqual([]);
   });
 });
