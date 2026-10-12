@@ -22,6 +22,12 @@ export function productionConfig(overrides: Partial<SiteConfig> = {}): SiteConfi
   return { ...production, certificateArn: production.certificateArn ?? TEST_CERTIFICATE_ARN, ...overrides };
 }
 
+/** The production config with the Free flat-rate plan off and on. Production deploys one, so tests check both. */
+export const PRICING_MODES = {
+  'pay-as-you-go': productionConfig({ pricingPlan: undefined }),
+  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
+};
+
 export interface SynthesizedStack {
   stack: Stack;
   template: Template;

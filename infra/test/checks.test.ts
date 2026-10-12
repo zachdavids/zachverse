@@ -150,6 +150,9 @@ describe('retentionViolations', () => {
     ['only DeletionPolicy Retain', { DeletionPolicy: 'Retain' }],
     ['only DeletionPolicy RetainExceptOnCreate', { DeletionPolicy: 'RetainExceptOnCreate' }],
     ['only UpdateReplacePolicy Retain', { UpdateReplacePolicy: 'Retain' }],
+    ['DeletionPolicy Delete', { DeletionPolicy: 'Delete', UpdateReplacePolicy: 'Retain' }],
+    ['DeletionPolicy Snapshot', { DeletionPolicy: 'Snapshot', UpdateReplacePolicy: 'Retain' }],
+    ['UpdateReplacePolicy Delete', { DeletionPolicy: 'RetainExceptOnCreate', UpdateReplacePolicy: 'Delete' }],
   ])('flags a resource with %s', (_case, policies) => {
     expect(retentionViolations({ Resources: { Bucket: { Type: 'AWS::S3::Bucket', ...policies } } })).toEqual([
       'Bucket (AWS::S3::Bucket) must have DeletionPolicy Retain or RetainExceptOnCreate, and UpdateReplacePolicy Retain',
@@ -426,6 +429,15 @@ describe('dnsWriteViolations', () => {
       computedAction(POLICY),
     ]);
   });
+
+  // CloudFormation substitutes a reference anywhere in the string, so a literal prefix does not limit the action:
+  // these could deploy as *:* or route53:*.
+  it.each(['*{{resolve:ssm:/zachverse/suffix}}', 'route53:{{resolve:ssm:/zachverse/action}}'])(
+    'flags the Action %s, a dynamic reference after a literal prefix',
+    (action) => {
+      expect(dnsWriteViolations(allow(action))).toEqual([computedAction('Policy')]);
+    },
+  );
 
   it('flags a dynamic reference among literal actions, even next to a record change the allowance accepts', () => {
     expect(dnsWriteViolations(allow(['s3:GetObject', '{{resolve:ssm:/zachverse/more-actions:3}}']))).toEqual([computedAction('Policy')]);
@@ -862,6 +874,15 @@ describe('freePlanViolations', () => {
       expect(withPreview()).toEqual([shared(`CloudFront Function ${FN}`)]);
     });
 
+    it('flags a CloudFront Function the second uses only on a path behavior', () => {
+      const violations = withPreview((preview, c, t) => {
+        ownFunction(preview, t);
+        preview.WebACLId = TEST_WEB_ACL_ARN.replace(/zachverse/, 'preview');
+        preview.CacheBehaviors = [{ ...clone(c.DefaultCacheBehavior), PathPattern: '/x/*' }];
+      });
+      expect(violations).toEqual([shared(`CloudFront Function ${FN}`)]);
+    });
+
     it.each([
       ['an ARN', TEST_WEB_ACL_ARN],
       ['a reference to a web ACL in the stack', { 'Fn::GetAtt': ['Acl', 'Arn'] }],
@@ -879,6 +900,15 @@ describe('freePlanViolations', () => {
         ownFunction(preview, t);
         c.WebACLId = TEST_WEB_ACL_ARN;
         preview.WebACLId = TEST_WEB_ACL_ARN.replace(/zachverse/, 'preview');
+      });
+      expect(violations).toEqual([]);
+    });
+
+    it("accepts distributions that both set WebACLId to '', which CloudFront reads as no web ACL", () => {
+      const violations = withPreview((preview, c, t) => {
+        ownFunction(preview, t);
+        c.WebACLId = '';
+        preview.WebACLId = '';
       });
       expect(violations).toEqual([]);
     });

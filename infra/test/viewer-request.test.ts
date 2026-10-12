@@ -11,15 +11,18 @@ type Querystring = Record<string, { value: string; multiValue?: { value: string 
 type Handler = (event: unknown) => any;
 
 // cloudfront-js-2.0 is ES 5.1 plus the ES 6-12 features listed in functions-javascript-runtime-20.html (read
-// 2026-10-12). Node's V8 has far more, so these tests narrow it to that list: runtimeContext deletes the built-ins
-// the page does not list, so a test fails when the function calls one, and syntaxViolations rejects the syntax the
-// page does not list. Neither shows where the runtime and V8 differ in a feature both have (its regular expressions
+// 2026-10-12). Node's V8 has far more, so these tests narrow it: runtimeContext deletes the built-ins outside
+// RUNTIME_BUILT_INS, so a test fails when the function calls one, and syntaxViolations rejects the syntax the page
+// does not list. Neither shows where the runtime and V8 differ in a feature both have (its regular expressions
 // are PCRE, for example), and built-ins are checked only on the paths the tests run.
 
 // What each object keeps: the ES 5.1 built-ins, which the page says the runtime complies with, plus the newer ones
-// it lists. Other string-keyed members are deleted. Members keyed by symbols stay, as do the well-known symbols on
-// Symbol, which V8 will not delete. Listed globals that V8 lacks (atob, btoa, Buffer, TextEncoder, TextDecoder,
-// InternalError, require) stay absent, so code using one fails here until it is added.
+// it lists. ES 5.1 members that the page's lists leave out, such as charCodeAt, stay, so calls to them pass. The
+// exceptions are those that njs, whose compatibility list the page mirrors, also lacks (its source, read 2026-10-12):
+// the locale methods outside Date, and Function.prototype.toString. Other string-keyed members are deleted. Members
+// keyed by symbols stay, as do the well-known symbols on Symbol, which V8 will not delete. Listed globals that V8
+// lacks (atob, btoa, Buffer, TextEncoder, TextDecoder, InternalError, require) stay absent, so code using one fails
+// here until it is added.
 const RUNTIME_BUILT_INS: Record<string, string> = {
   globalThis:
     'globalThis NaN Infinity undefined eval parseInt parseFloat isNaN isFinite decodeURI decodeURIComponent encodeURI ' +
@@ -31,22 +34,22 @@ const RUNTIME_BUILT_INS: Record<string, string> = {
     'create defineProperties defineProperty freeze getOwnPropertyDescriptor getOwnPropertyDescriptors ' +
     'getOwnPropertyNames getPrototypeOf isExtensible isFrozen isSealed keys preventExtensions seal assign entries ' +
     'values is setPrototypeOf',
-  'Object.prototype': 'hasOwnProperty isPrototypeOf propertyIsEnumerable toLocaleString toString valueOf',
-  'Function.prototype': 'apply bind call toString',
+  'Object.prototype': 'hasOwnProperty isPrototypeOf propertyIsEnumerable toString valueOf',
+  'Function.prototype': 'apply bind call',
   Array: 'isArray of',
   'Array.prototype':
     'concat every filter forEach indexOf join lastIndexOf map pop push reduce reduceRight reverse shift slice some ' +
-    'sort splice toLocaleString toString unshift copyWithin fill find findIndex includes',
+    'sort splice toString unshift copyWithin fill find findIndex includes',
   String: 'fromCharCode fromCodePoint',
   'String.prototype':
-    'charAt charCodeAt concat indexOf lastIndexOf localeCompare match replace search slice split substr substring ' +
-    'toLocaleLowerCase toLocaleUpperCase toLowerCase toString toUpperCase trim valueOf codePointAt endsWith includes ' +
-    'repeat startsWith padStart padEnd trimStart trimEnd replaceAll',
+    'charAt charCodeAt concat indexOf lastIndexOf match replace search slice split substr substring toLowerCase ' +
+    'toString toUpperCase trim valueOf codePointAt endsWith includes repeat startsWith padStart padEnd trimStart ' +
+    'trimEnd replaceAll',
   'Boolean.prototype': 'toString valueOf',
   Number:
     'MAX_VALUE MIN_VALUE NaN NEGATIVE_INFINITY POSITIVE_INFINITY EPSILON MAX_SAFE_INTEGER MIN_SAFE_INTEGER isFinite ' +
     'isInteger isNaN isSafeInteger parseFloat parseInt',
-  'Number.prototype': 'toExponential toFixed toLocaleString toPrecision toString valueOf',
+  'Number.prototype': 'toExponential toFixed toPrecision toString valueOf',
   Math:
     'E LN10 LN2 LOG10E LOG2E PI SQRT1_2 SQRT2 abs acos acosh asin asinh atan atan2 atanh cbrt ceil clz32 cos cosh ' +
     'exp expm1 floor fround hypot imul log log1p log2 log10 max min pow random round sign sin sinh sqrt tan tanh trunc',
@@ -132,31 +135,48 @@ const ES5_ASSIGNMENT_OPERATORS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '<<
 /** Syntax in `code` that the page does not list, with its line. Each unsupported node is reported once. */
 function syntaxViolations(code: string): string[] {
   const violations: string[] = [];
-  const visit = (node: any): void => {
-    const unsupported = unsupportedSyntax(node);
+  const visit = (node: any, parent: any): void => {
+    const unsupported = unsupportedSyntax(code, node, parent);
     if (unsupported) {
       violations.push(`${unsupported} (line ${code.slice(0, node.start).split('\n').length})`);
       return;
     }
     for (const value of Object.values(node)) {
       for (const child of Array.isArray(value) ? value : [value]) {
-        if (typeof child?.type === 'string') visit(child);
+        if (typeof child?.type === 'string') visit(child, node);
       }
     }
   };
-  visit(parseAst(code, { lang: 'js', sourceType: 'script' }));
+  visit(parseAst(code, { lang: 'js', sourceType: 'script' }), undefined);
   return violations;
 }
 
-function unsupportedSyntax(node: any): string | undefined {
+// Comments, which may contain commas, can sit between the last argument or parameter and the closing parenthesis.
+const COMMENTS = /\/\*[\s\S]*?\*\/|\/\/.*/g;
+
+/** Whether a comma follows the last of `nodes` before `end`: the ES 2017 trailing comma, as in `f(a,)`. */
+function hasTrailingComma(code: string, nodes: any[], end: number): boolean {
+  const last = nodes[nodes.length - 1];
+  return last !== undefined && code.slice(last.end, end).replace(COMMENTS, '').includes(',');
+}
+
+function unsupportedSyntax(code: string, node: any, parent: any): string | undefined {
   if (!SUPPORTED_SYNTAX.has(node.type)) return node.type;
   switch (node.type) {
+    case 'VariableDeclaration':
+      // The parser gives `using` and `await using` declarations this type too.
+      return ['var', 'let', 'const'].includes(node.kind) ? undefined : `${node.kind} declaration`;
     case 'FunctionDeclaration':
     case 'FunctionExpression':
     case 'ArrowFunctionExpression':
       if (node.generator) return 'generator function';
-      // The page: "async arguments and closures are not supported".
-      return node.async && node.type !== 'FunctionDeclaration' ? 'async function expression' : undefined;
+      // The page: "async arguments and closures are not supported". Only a top-level declaration is neither.
+      if (node.async && node.type !== 'FunctionDeclaration') return 'async function expression';
+      if (node.async && parent.type !== 'Program') return 'nested async function declaration';
+      return hasTrailingComma(code, node.params, node.body.start) ? 'trailing comma after the last parameter' : undefined;
+    case 'CallExpression':
+    case 'NewExpression':
+      return hasTrailingComma(code, node.arguments, node.end) ? 'trailing comma after the last argument' : undefined;
     case 'Property':
       if (node.shorthand) return 'shorthand property';
       if (node.method) return 'method definition';
@@ -339,6 +359,7 @@ describe('syntaxViolations', () => {
       'outer: for (var key in o) { if (key) break outer; }',
       'var year = /(?<year>\\d{4})/gy;',
       'try { throw new Error("x"); } catch (e) {} finally {}',
+      'function pick(first /* , second */) { function inner() {} return inner(first, (1, 2)); } // a, b',
     ].join('\n');
     expect(syntaxViolations(code)).toEqual([]);
   });
@@ -365,8 +386,19 @@ describe('syntaxViolations', () => {
     ['var dotAll = /./s;', 'regular expression flags s'],
     ['try {} catch {}', 'catch without a binding'],
     ['debugger;', 'DebuggerStatement'],
+    ['function handler() { using unused = null; }', 'using declaration'],
+    ['async function handler() { await using unused = null; }', 'await using declaration'],
+    ['function handler() { async function later() {} }', 'nested async function declaration'],
+    ['parts.push(name,);', 'trailing comma after the last argument'],
+    ['throw new Error(message,);', 'trailing comma after the last argument'],
+    ['function serialize(querystring,) {}', 'trailing comma after the last parameter'],
+    ['var square = (x,) => x * x;', 'trailing comma after the last parameter'],
   ])('rejects %s', (code, violation) => {
     expect(syntaxViolations(code)).toEqual([`${violation} (line 1)`]);
+  });
+
+  it('rejects the trailing comma that the TypeScript style puts after multi-line arguments', () => {
+    expect(syntaxViolations('parts.push(\n  name,\n);')).toEqual(['trailing comma after the last argument (line 1)']);
   });
 
   it('reports each violation with its line', () => {
@@ -388,10 +420,16 @@ describe('runtimeContext', () => {
   it.each([
     "''.at", "''.matchAll", "''.normalize", '[].at', '[].flat', '[].flatMap', '[].findLast', '[].toSorted', 'Array.from',
     'Object.fromEntries', 'Object.hasOwn', 'String.raw', 'Promise.withResolvers', 'Map', 'Set', 'WeakMap', 'Proxy',
-    'Reflect', 'BigInt', 'Intl', 'Iterator', 'escape', 'console.error',
+    'Reflect', 'BigInt', 'Intl', 'Iterator', 'escape', 'console.error', "''.localeCompare", "''.toLocaleLowerCase",
+    "''.toLocaleUpperCase", '({}).toLocaleString', '[].toLocaleString', '(0).toLocaleString',
   ])('removes %s, which V8 has but the runtime does not list', (expression) => {
     expect(vm.runInNewContext(`typeof ${expression}`)).not.toBe('undefined');
     expect(vm.runInContext(`typeof ${expression}`, context)).toBe('undefined');
+  });
+
+  it('removes Function.prototype.toString, so functions inherit Object.prototype.toString as on njs', () => {
+    expect(vm.runInNewContext('String(function f() {})')).toBe('function f() {}');
+    expect(vm.runInContext('String(function f() {})', context)).toBe('[object Function]');
   });
 
   it('refuses to evaluate strings as code, as the runtime does', () => {
@@ -412,6 +450,12 @@ describe('runtimeContext', () => {
       ['param.multiValue || [param]', 'param.multiValue ? param.multiValue.flat() : [param]'],
       viewerRequest('/', 'www.zachdavids.com', { tag: { value: 'a', multiValue: [{ value: 'a' }] } }),
       'param.multiValue.flat is not a function',
+    ],
+    [
+      'String.prototype.localeCompare',
+      ['host === WWW_HOST', 'host.localeCompare(WWW_HOST) === 0'],
+      viewerRequest('/', 'www.zachdavids.com'),
+      'host.localeCompare is not a function',
     ],
   ] as const)('fails a function that calls %s, though Node runs it', (_case, [from, to], event, message) => {
     const source = readFileSync(VIEWER_REQUEST_SOURCE, 'utf8');

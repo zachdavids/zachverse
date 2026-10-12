@@ -358,9 +358,11 @@ function sharedAssociationViolations(distributions: [string, Json][]): string[] 
   const usedBy = new Map<string, Set<string>>();
   for (const [id, config] of distributions) {
     const refs = behaviorsOf(config).flatMap((b) => asArray<Json>(b.FunctionAssociations).map(functionRefOf));
+    // CloudFront reads an empty WebACLId as no web ACL.
+    const hasWebAcl = config.WebACLId !== undefined && config.WebACLId !== '';
     const associations = [
       ...refs.filter((ref) => typeof ref === 'string').map((ref) => `CloudFront Function ${ref}`),
-      ...(config.WebACLId === undefined ? [] : [`web ACL ${JSON.stringify(config.WebACLId)}`]),
+      ...(hasWebAcl ? [`web ACL ${JSON.stringify(config.WebACLId)}`] : []),
     ];
     for (const association of associations) usedBy.set(association, new Set([...(usedBy.get(association) ?? []), id]));
   }

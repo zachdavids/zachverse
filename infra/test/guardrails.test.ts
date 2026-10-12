@@ -6,17 +6,15 @@ import {
   prohibitedResourceViolations,
   retentionViolations,
 } from './support/checks';
-import { productionConfig, synthesizeAll, TEST_WEB_ACL_ARN } from './support/synth';
+import { PRICING_MODES, productionConfig, synthesizeAll } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
-const modes = {
-  'pay-as-you-go': productionConfig(),
-  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
-};
+// What production deploys as configured, and both pricing modes whichever one it selects.
+const configs = { 'production config': productionConfig(), ...PRICING_MODES };
 
-describe.each(Object.entries(modes))('every stack (%s)', (_mode, config) => {
+describe.each(Object.entries(configs))('every stack (%s)', (_label, config) => {
   const stacks = synthesizeAll(config);
 
   it.each(stacks.map((s) => [s.stack.stackName, s] as const))('%s creates no prohibited resources', (_name, s) => {

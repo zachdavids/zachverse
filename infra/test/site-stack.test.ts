@@ -1,13 +1,14 @@
 import { Annotations, Match } from 'aws-cdk-lib/assertions';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
-import { productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import { PRICING_MODES, productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
 const BUCKET = 'SiteBucket397A1860';
+const BUCKET_POLICY = 'SiteBucketPolicy3AC1D0F8';
 const ORIGIN_ACCESS_CONTROL = 'SiteOriginAccessControl4DD454FF';
 const VIEWER_REQUEST_FUNCTION = 'ViewerRequestFunction48E73F66';
 const CACHING_OPTIMIZED = '658327ea-f89d-4fab-a63d-7e88639e58f6';
@@ -15,15 +16,10 @@ const SECURITY_HEADERS_POLICY = '67f7725c-6f97-4210-82d7-5512b31e9d03';
 const VIEWER_REQUEST = { EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': [VIEWER_REQUEST_FUNCTION, 'FunctionARN'] } };
 
 // Enabling the plan may add only the web ACL and the subscription, so the design is checked with it off and on.
-const modes = {
-  'pay-as-you-go': productionConfig({ pricingPlan: undefined }),
-  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
-};
-
-describe.each(Object.entries(modes))('site stack design (%s)', (_mode, siteConfig) => {
+describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, siteConfig) => {
   const { stack, template, json } = synthesizeSite(siteConfig);
   const distributionConfig = () => json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
-  const bucketPolicyStatements = () => json.Resources['SiteBucketPolicy3AC1D0F8']!.Properties!.PolicyDocument.Statement as any[];
+  const bucketPolicyStatements = () => json.Resources[BUCKET_POLICY]!.Properties!.PolicyDocument.Statement as any[];
 
   it('keeps the bucket private: Block Public Access on, no static website hosting', () => {
     template.hasResourceProperties('AWS::S3::Bucket', {
@@ -206,7 +202,7 @@ describe.each(Object.entries(modes))('site stack design (%s)', (_mode, siteConfi
 });
 
 describe('site stack (pay-as-you-go)', () => {
-  const { template, json } = synthesizeSite(modes['pay-as-you-go']);
+  const { template, json } = synthesizeSite(PRICING_MODES['pay-as-you-go']);
 
   it('has no web ACL or pricing-plan subscription before the plan is enabled', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
@@ -215,7 +211,7 @@ describe('site stack (pay-as-you-go)', () => {
 });
 
 describe('site stack (Free flat-rate plan enabled)', () => {
-  const { template, json } = synthesizeSite(modes['Free flat-rate plan']);
+  const { template, json } = synthesizeSite(PRICING_MODES['Free flat-rate plan']);
 
   it('attaches the intended web ACL to the distribution', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
@@ -363,6 +359,11 @@ describe('web ACL configuration errors', () => {
     ['an extra path segment', `${TEST_WEB_ACL_ARN}/extra`],
     ['the ARN pasted twice', TEST_WEB_ACL_ARN.repeat(2)],
     ['a colon after the scope', TEST_WEB_ACL_ARN.replace(':global/', ':global:')],
+    ['a letter that is not hex in the web ACL ID', TEST_WEB_ACL_ARN.replace(/0{8}-/, '0000000o-')],
+    ['an uppercase web ACL ID', TEST_WEB_ACL_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID.toUpperCase())],
+    ['a misplaced dash in the web ACL ID', TEST_WEB_ACL_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
+    ['an empty web ACL name', TEST_WEB_ACL_ARN.replace('/zachverse/', '//')],
+    ['a web ACL name longer than 128 characters', TEST_WEB_ACL_ARN.replace('/zachverse/', `/${'a'.repeat(129)}/`)],
   ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
     expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
     expect(synthesizeWith(webAclArn)).toThrow(
@@ -372,6 +373,12 @@ describe('web ACL configuration errors', () => {
 
   it('accepts a web ACL name with hyphens and underscores and an ID with any lowercase hex digit', () => {
     const webAclArn = TEST_WEB_ACL_ARN.replace(/zachverse\/[0-9a-f-]{36}$/, `zachverse_site-1/${ANY_ID}`);
+    const { json } = synthesizeWith(webAclArn)();
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(webAclArn);
+  });
+
+  it('accepts a web ACL name of 128 characters, the longest WAF allows', () => {
+    const webAclArn = TEST_WEB_ACL_ARN.replace('/zachverse/', `/${'a'.repeat(128)}/`);
     const { json } = synthesizeWith(webAclArn)();
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(webAclArn);
   });
