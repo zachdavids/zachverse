@@ -1,7 +1,6 @@
 {
   "app": "node --import tsx bin/zachverse.ts",
   "build": "npm run typecheck 1>&2 && npm test 1>&2",
-  "versionReporting": false,
   "context": {
     "@aws-cdk-containers/ecs-service-extensions:enableDefaultLogDriver": true,
     "@aws-cdk/aws-apigateway:authorizerChangeDeploymentLogicalId": true,

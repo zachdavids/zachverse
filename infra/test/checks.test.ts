@@ -164,6 +164,13 @@ describe('retentionViolations', () => {
       expect(retentionViolations({ Resources: { Bucket: bucket } })).toEqual([]);
     },
   );
+
+  it('exempts CDK version-reporting metadata by its type, not its logical ID', () => {
+    expect(retentionViolations({ Resources: { CDKMetadata: { Type: 'AWS::CDK::Metadata' } } })).toEqual([]);
+    expect(retentionViolations({ Resources: { CDKMetadata: { Type: 'AWS::S3::Bucket' } } })).toEqual([
+      'CDKMetadata (AWS::S3::Bucket) must have DeletionPolicy Retain or RetainExceptOnCreate, and UpdateReplacePolicy Retain',
+    ]);
+  });
 });
 
 // Operation lists from the Amazon Route 53 API Reference ("Amazon Route 53" and "Amazon Route 53

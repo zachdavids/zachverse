@@ -84,7 +84,10 @@ describe('synthesizeAll', () => {
     });
     const stacks = synthesizeAll();
     expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite', stackPath]);
-    expect(Object.values(stacks[1]!.json.Resources).map((r) => r.Type)).toEqual(['AWS::Route53::HostedZone']);
+    expect(Object.values(stacks[1]!.json.Resources).map((r) => r.Type)).toEqual([
+      'AWS::Route53::HostedZone',
+      'AWS::CDK::Metadata',
+    ]);
   });
 
   it('leaves a nested stack to its parent template, where the prohibited-resource check flags it', () => {

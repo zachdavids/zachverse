@@ -183,7 +183,10 @@ describe.each(Object.entries(modes))('site stack design (%s)', (_mode, siteConfi
 
   it('retains every resource on stack deletion and replacement, deleting only what a failed first create made', () => {
     // RetainExceptOnCreate: a rolled-back first deploy leaves no fixed-name function or OAC to block the retry.
-    for (const [id, resource] of Object.entries(json.Resources)) {
+    // CDK's version-reporting metadata holds no data, and retentionViolations exempts it.
+    const retained = Object.entries(json.Resources).filter(([, resource]) => resource.Type !== 'AWS::CDK::Metadata');
+    expect(retained).toHaveLength(Object.keys(json.Resources).length - 1);
+    for (const [id, resource] of retained) {
       expect([resource.DeletionPolicy, resource.UpdateReplacePolicy], id).toEqual(['RetainExceptOnCreate', 'Retain']);
     }
   });

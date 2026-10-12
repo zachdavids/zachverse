@@ -16,9 +16,10 @@ describe('cdk.json', () => {
     expect(cdkJson.build).toBe('npm run typecheck 1>&2 && npm test 1>&2');
   });
 
-  it('turns version reporting off, so deployed templates hold only the resources the tests check', () => {
-    // Otherwise the CLI adds AWS::CDK::Metadata, which the tests never see (support/synth.ts mirrors this key).
-    expect(cdkJson.versionReporting).toBe(false);
+  it('keeps version reporting on', () => {
+    // AWS uses the reported versions to contact users of CDK releases with serious security or reliability issues.
+    // The CLI then adds AWS::CDK::Metadata, and support/synth.ts adds it to the test templates too.
+    expect(cdkJson.versionReporting ?? true).toBe(true);
   });
 
   it('sets every feature flag the installed CDK recommends', () => {
