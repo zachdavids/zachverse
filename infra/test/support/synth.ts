@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { Template } from 'aws-cdk-lib/assertions';
-import { App, type Stack } from 'aws-cdk-lib/core';
+import { App, NestedStack, Stack } from 'aws-cdk-lib/core';
 import { createStacks } from '../../lib/app';
 import { production, type SiteConfig } from '../../lib/config';
 
@@ -42,10 +42,15 @@ export interface CfnTemplate {
   Outputs?: Record<string, unknown>;
 }
 
-/** Synthesizes every stack in the app for the given configuration. */
+/**
+ * Synthesizes every stack in the app for the given configuration, including any created inside another
+ * stack or a Stage, which createStacks does not return but `cdk synth` still emits. A nested stack is
+ * part of its parent's template, where prohibitedResourceViolations flags it.
+ */
 export function synthesizeAll(config: SiteConfig = productionConfig()): SynthesizedStack[] {
   const app = new App({ context: cdkContext });
-  const stacks = Object.values(createStacks(app, config));
+  createStacks(app, config);
+  const stacks = app.node.findAll().filter((c): c is Stack => Stack.isStack(c) && !NestedStack.isNestedStack(c));
   return stacks.map((stack) => {
     const template = Template.fromStack(stack);
     return { stack, template, json: template.toJSON() as CfnTemplate };

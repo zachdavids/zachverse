@@ -53,6 +53,6 @@ describe('CDK entry point', () => {
     const [app, config] = calls[0]!;
     expect(App.isApp(app)).toBe(true);
     expect(config).toEqual(configured);
-    expect(app.node.children.filter((c) => Stack.isStack(c)).map((s) => s.node.id)).toEqual(['ZachverseSite']);
+    expect(app.node.findAll().filter((c) => Stack.isStack(c)).map((s) => s.node.id)).toEqual(['ZachverseSite']);
   });
 });

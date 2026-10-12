@@ -84,7 +84,7 @@ export interface DnsWriteAllowance {
   validationRecordNames: string[];
 }
 
-/** IAM action matching: case-insensitive; `*` matches any run of characters and `?` any one character. */
+/** IAM action matching: case-insensitive; `*` matches any run of characters (including none) and `?` any one character. */
 function wildcardMatches(pattern: string, action: string): boolean {
   const source = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
   return new RegExp(`^${source}$`, 'i').test(action);
@@ -117,6 +117,8 @@ const ROUTE53_WRITE_PROBES = [
 ];
 const ROUTE53_ACTION = /^route53(?:domains)?:/i;
 const ROUTE53_READ = /^route53(?:domains)?:(?:Get|List|Check|Test|View)/i;
+/** A CloudFormation dynamic reference, which is resolved only during deployment. */
+const DYNAMIC_REFERENCE = /\{\{resolve:/i;
 
 /** An action named exactly in either service that is neither a read nor listed above, such as one added since. */
 function isUnlistedRoute53Write(action: string): boolean {
@@ -188,9 +190,10 @@ function unverifiableGrantViolations(template: CfnTemplate): string[] {
  * Any IAM permission that can change DNS must be limited to UPSERT/CREATE of
  * CNAMEs with the exact ACM validation names in the one existing zone. With
  * no allowance (the current design) any Route 53 write is a violation, and so
- * is any permission the check cannot read: NotAction, computed actions or
- * documents, and managed policies, groups, or Identity Center permissions from
- * outside the stack. It does not model privilege escalation, such as
+ * is any permission the check cannot read: NotAction, computed actions
+ * (intrinsic functions or {{resolve:...}} dynamic references) or documents,
+ * and managed policies, groups, or Identity Center permissions from outside
+ * the stack. It does not model privilege escalation, such as
  * iam:PutRolePolicy or sts:AssumeRole into a role that can write DNS.
  */
 export function dnsWriteViolations(template: CfnTemplate, allowance?: DnsWriteAllowance): string[] {
@@ -209,7 +212,7 @@ export function dnsWriteViolations(template: CfnTemplate, allowance?: DnsWriteAl
         continue;
       }
       const actions = asArray<Json>(statement.Action);
-      if (actions.length === 0 || actions.some((a) => typeof a !== 'string')) {
+      if (actions.length === 0 || actions.some((a) => typeof a !== 'string' || DYNAMIC_REFERENCE.test(a))) {
         violations.push(`${where}: Allow with a computed or missing Action is too broad to verify`);
         continue;
       }
@@ -219,7 +222,13 @@ export function dnsWriteViolations(template: CfnTemplate, allowance?: DnsWriteAl
       ].sort();
       if (grants.length === 0) continue;
       const onlyRecordChanges = grants.every((g) => g === 'route53:ChangeResourceRecordSets');
-      const exactActions = actions.every((a) => a === 'route53:ChangeResourceRecordSets' || !ROUTE53_ACTION.test(a));
+      // Any other action must be outside Route 53. A pattern that matches the record change, even through
+      // a wildcard service prefix, also grants later actions it matches, which the conditions do not limit.
+      const exactActions = actions.every(
+        (a) =>
+          a === 'route53:ChangeResourceRecordSets' ||
+          (!ROUTE53_ACTION.test(a) && !ROUTE53_WRITE_PROBES.some((probe) => wildcardMatches(a, probe))),
+      );
       if (!allowance || !onlyRecordChanges || !exactActions) {
         violations.push(`${where}: grants Route 53 write access (${grants.join(', ')})`);
         continue;
@@ -257,7 +266,7 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
 // ---------------------------------------------------------------------------
 // CloudFront flat-rate Free plan compatibility
 // Source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html
-// (feature table and "Unsupported features"), read 2026-10-11.
+// (feature table, "Unsupported features" and "Unsupported associations"), read 2026-10-12.
 // ---------------------------------------------------------------------------
 
 export const FREE_PLAN_LIMITS = { cacheBehaviors: 5, wafRules: 5 } as const;
@@ -302,6 +311,8 @@ const FREE_PLAN_DISALLOWED_TYPES: Record<string, string> = {
   'AWS::CloudFront::AnycastIpList': 'Anycast IP lists are unsupported on pricing plans',
   'AWS::CloudFront::VpcOrigin': 'VPC origins need Business or higher',
   'AWS::CloudFront::DistributionTenant': 'multi-tenant distributions are unsupported on pricing plans',
+  'AWS::CloudFront::TrustStore': 'viewer mutual TLS needs Premium',
+  'AWS::CloudFront::ConnectionFunction': 'connection functions (viewer mutual TLS) need Premium',
   'AWS::Logs::DeliverySource': 'access-log delivery needs Pro or higher on flat-rate plans',
   'AWS::WAFv2::LoggingConfiguration': 'WAF request logs need Pro or higher',
   'AWS::WAFv2::RuleGroup': 'rule groups are unsupported on pricing plans',
@@ -314,18 +325,45 @@ export function freePlanViolations(template: CfnTemplate): string[] {
     const reason = FREE_PLAN_DISALLOWED_TYPES[r.Type];
     if (reason) violations.push(`${id} (${r.Type}): ${reason}`);
   }
-  for (const [id, r] of resourcesOf(template, (r) => r.Type === 'AWS::CloudFront::Distribution')) {
-    violations.push(...distributionViolations(template, id, r.Properties?.DistributionConfig ?? {}));
-  }
+  const distributions = resourcesOf(template, (r) => r.Type === 'AWS::CloudFront::Distribution').map(
+    ([id, r]): [string, Json] => [id, r.Properties?.DistributionConfig ?? {}],
+  );
+  for (const [id, config] of distributions) violations.push(...distributionViolations(template, id, config));
+  violations.push(...sharedAssociationViolations(distributions));
   for (const [id, r] of resourcesOf(template, (r) => r.Type === 'AWS::WAFv2::WebACL')) {
     violations.push(...freePlanWebAclViolations(r.Properties ?? {}).map((v) => `${id}: ${v}`));
   }
   return violations;
 }
 
+const behaviorsOf = (config: Json): Json[] => [config.DefaultCacheBehavior ?? {}, ...asArray<Json>(config.CacheBehaviors)];
+
+/** The logical ID of the function a function association references through Fn::GetAtt, if it does. */
+const functionRefOf = (assoc: Json): unknown => assoc.FunctionARN?.['Fn::GetAtt']?.[0];
+
+/**
+ * A plan distribution's CloudFront Functions and web ACL can be used by no other distribution
+ * ("Unsupported associations"). Only distributions in this template can be compared.
+ */
+function sharedAssociationViolations(distributions: [string, Json][]): string[] {
+  const usedBy = new Map<string, Set<string>>();
+  for (const [id, config] of distributions) {
+    const refs = behaviorsOf(config).flatMap((b) => asArray<Json>(b.FunctionAssociations).map(functionRefOf));
+    const associations = [
+      ...refs.filter((ref) => typeof ref === 'string').map((ref) => `CloudFront Function ${ref}`),
+      ...(config.WebACLId === undefined ? [] : [`web ACL ${JSON.stringify(config.WebACLId)}`]),
+    ];
+    for (const association of associations) usedBy.set(association, new Set([...(usedBy.get(association) ?? []), id]));
+  }
+  const reason = 'a pricing-plan distribution cannot share its functions or web ACL';
+  return [...usedBy]
+    .filter(([, ids]) => ids.size > 1)
+    .map(([association, ids]) => `${association} is shared by ${[...ids].join(', ')}: ${reason}`);
+}
+
 function distributionViolations(template: CfnTemplate, id: string, config: Json): string[] {
   const out: string[] = [];
-  const behaviors: Json[] = [config.DefaultCacheBehavior ?? {}, ...asArray<Json>(config.CacheBehaviors)];
+  const behaviors = behaviorsOf(config);
   if (behaviors.length > FREE_PLAN_LIMITS.cacheBehaviors) {
     out.push(`${id}: ${behaviors.length} cache behaviors exceeds the Free limit of ${FREE_PLAN_LIMITS.cacheBehaviors}`);
   }
@@ -358,6 +396,9 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
     S3Origin: 'legacy origin settings are unsupported',
     CustomOrigin: 'legacy origin settings are unsupported',
     CNAMEs: 'legacy CNAMEs setting is unsupported; use Aliases',
+    ViewerMtlsConfig: 'viewer mutual TLS needs Premium',
+    ConnectionFunctionAssociation: 'connection functions (viewer mutual TLS) need Premium',
+    CacheTagConfig: 'cache-tag invalidation needs Pro or higher',
   };
   for (const [key, reason] of Object.entries(unsupportedConfig)) {
     if (config[key] !== undefined) out.push(`${id}: ${key}: ${reason}`);
@@ -372,6 +413,9 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
   for (const origin of asArray<Json>(config.Origins)) {
     if (origin.OriginShield?.Enabled) out.push(`${id} origin ${origin.Id}: Origin Shield needs Premium`);
     if (origin.VpcOriginConfig !== undefined) out.push(`${id} origin ${origin.Id}: VPC origins need Business or higher`);
+    if (origin.CustomOriginConfig?.OriginMtlsConfig !== undefined) {
+      out.push(`${id} origin ${origin.Id}: origin mutual TLS needs Business or higher`);
+    }
     const oai = origin.S3OriginConfig?.OriginAccessIdentity;
     if (oai !== undefined && oai !== '') out.push(`${id} origin ${origin.Id}: OAI is unsupported; use OAC`);
   }
@@ -379,7 +423,7 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
 }
 
 function functionAssociationViolations(template: CfnTemplate, where: string, assoc: Json): string[] {
-  const ref = assoc.FunctionARN?.['Fn::GetAtt']?.[0];
+  const ref = functionRefOf(assoc);
   const fn = typeof ref === 'string' ? template.Resources[ref] : undefined;
   if (!fn || fn.Type !== 'AWS::CloudFront::Function') {
     return [`${where}: function associations must reference a CloudFront Function defined in this stack`];

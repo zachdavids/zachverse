@@ -7,18 +7,21 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Template } from 'aws-cdk-lib/assertions';
-import { App, CfnParameter, Fn, NestedStack, RemovalPolicy, Stack } from 'aws-cdk-lib/core';
+import { App, CfnDynamicReference, CfnDynamicReferenceService, CfnParameter, Fn, NestedStack, RemovalPolicy, Stack } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   dnsWriteViolations,
   freePlanViolations,
   freePlanWebAclViolations,
+  MANAGED_CACHE_POLICY_IDS,
+  MANAGED_ORIGIN_REQUEST_POLICY_IDS,
+  MANAGED_RESPONSE_HEADERS_POLICY_IDS,
   prohibitedResourceViolations,
   retentionViolations,
 } from './support/checks';
 import type { CfnResource, CfnTemplate } from './support/synth';
-import { synthesizeSite } from './support/synth';
+import { synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -193,14 +196,25 @@ describe('dnsWriteViolations', () => {
   const lambda = new iam.ServicePrincipal('lambda.amazonaws.com');
   const POLICY = 'RoleDefaultPolicy5FFB7DAB';
   const NAMES = `${POLICY}: record names must be limited to the exact ACM validation names`;
+  const TYPES = `${POLICY}: record types must be limited to CNAME`;
+  const CHANGES = `${POLICY}: change actions must be limited to CREATE/UPSERT`;
+  const computedAction = (where: string) => `${where}: Allow with a computed or missing Action is too broad to verify`;
   const grants = (where: string, actions: string[]) => `${where}: grants Route 53 write access (${[...actions].sort().join(', ')})`;
+  /** A validation name of the right shape that the allowance does not list, as another account's request would have. */
+  const UNLISTED_NAME = '_ffffffffffffffffffffffffffffffff.zachdavids.com';
   /** ChangeResourceRecordSets scoped like the ACM validation allowance; override one part to break it. */
-  const recordChanges = ({ resource = zoneArn, names = [VALIDATION_NAME], types = ['CNAME'], actions = ['UPSERT'] } = {}) =>
+  const recordChanges = ({
+    resource = zoneArn,
+    names = [VALIDATION_NAME],
+    types = ['CNAME'],
+    actions = ['UPSERT'],
+    operator = 'ForAllValues:StringEquals',
+  } = {}) =>
     new iam.PolicyStatement({
       actions: ['route53:ChangeResourceRecordSets'],
       resources: [resource],
       conditions: {
-        'ForAllValues:StringEquals': {
+        [operator]: {
           'route53:ChangeResourceRecordSetsNormalizedRecordNames': names,
           'route53:ChangeResourceRecordSetsRecordTypes': types,
           'route53:ChangeResourceRecordSetsActions': actions,
@@ -239,9 +253,17 @@ describe('dnsWriteViolations', () => {
     expect(dnsWriteViolations(roleWith(recordChanges()), loose)).toEqual([]);
   });
 
-  it('ignores allowance names that are not ACM validation names', () => {
-    const www = { hostedZoneId: ZONE_ID, validationRecordNames: ['www.zachdavids.com'] };
-    expect(dnsWriteViolations(roleWith(recordChanges({ names: ['www.zachdavids.com'] })), www)).toEqual([NAMES]);
+  // The site certificate's validation names are _<32 hex digits> on the apex or www; the allowance drops anything else.
+  it.each([
+    ['a website name', 'www.zachdavids.com'],
+    ['a label too short for a validation token', '_ab.zachdavids.com'],
+    ['31 hex digits', '_123456789abcdef0123456789abcdef.zachdavids.com'],
+    ['33 hex digits', '_0123456789abcdef0123456789abcdef0.zachdavids.com'],
+    ['a letter that is not hex', '_0123456789abcdef0123456789abcdeg.zachdavids.com'],
+    ['a host other than the apex and www', '_0123456789abcdef0123456789abcdef.mail.zachdavids.com'],
+  ])('ignores allowance names that are not ACM validation names: %s', (_case, name) => {
+    const other = { hostedZoneId: ZONE_ID, validationRecordNames: [name] };
+    expect(dnsWriteViolations(roleWith(recordChanges({ names: [name] })), other)).toEqual([NAMES]);
   });
 
   it.each([
@@ -259,18 +281,36 @@ describe('dnsWriteViolations', () => {
     [
       'unconditioned record changes',
       new iam.PolicyStatement({ actions: ['route53:ChangeResourceRecordSets'], resources: [zoneArn] }),
-      [NAMES, `${POLICY}: record types must be limited to CNAME`, `${POLICY}: change actions must be limited to CREATE/UPSERT`],
+      [NAMES, TYPES, CHANGES],
+    ],
+    // ForAnyValue holds when any one requested value is listed, so one batch could also DELETE the MX records.
+    ['record conditions under ForAnyValue', recordChanges({ operator: 'ForAnyValue:StringEquals' }), [NAMES, TYPES, CHANGES]],
+    ['record conditions without a set operator', recordChanges({ operator: 'StringEquals' }), [NAMES, TYPES, CHANGES]],
+    [
+      'record types and change actions under ForAnyValue',
+      new iam.PolicyStatement({
+        actions: ['route53:ChangeResourceRecordSets'],
+        resources: [zoneArn],
+        conditions: {
+          'ForAllValues:StringEquals': { 'route53:ChangeResourceRecordSetsNormalizedRecordNames': [VALIDATION_NAME] },
+          'ForAnyValue:StringEquals': {
+            'route53:ChangeResourceRecordSetsRecordTypes': ['CNAME'],
+            'route53:ChangeResourceRecordSetsActions': ['UPSERT'],
+          },
+        },
+      }),
+      [TYPES, CHANGES],
     ],
     ['wildcard record names', recordChanges({ names: ['*.zachdavids.com'] }), [NAMES]],
     ['a validation name next to a website name', recordChanges({ names: [VALIDATION_NAME, 'www.zachdavids.com'] }), [NAMES]],
+    // ACM makes each validation name for one account's request, so only the exact names listed may change.
+    ['a validation name the allowance does not list', recordChanges({ names: [UNLISTED_NAME] }), [NAMES]],
+    ['a listed validation name next to an unlisted one', recordChanges({ names: [VALIDATION_NAME, UNLISTED_NAME] }), [NAMES]],
+    ['an unlisted www validation name', recordChanges({ names: ['_ffffffffffffffffffffffffffffffff.www.zachdavids.com'] }), [NAMES]],
     // IAM compares the normalized (lower-case, dotless) names case-sensitively, so these never match.
     ['a validation name with a trailing dot', recordChanges({ names: [`${VALIDATION_NAME}.`] }), [NAMES]],
     ['a validation name in upper case', recordChanges({ names: [VALIDATION_NAME.toUpperCase()] }), [NAMES]],
-    [
-      'MX/TXT changes',
-      recordChanges({ types: ['CNAME', 'MX', 'TXT'], actions: ['UPSERT', 'DELETE'] }),
-      [`${POLICY}: record types must be limited to CNAME`, `${POLICY}: change actions must be limited to CREATE/UPSERT`],
-    ],
+    ['MX/TXT changes', recordChanges({ types: ['CNAME', 'MX', 'TXT'], actions: ['UPSERT', 'DELETE'] }), [TYPES, CHANGES]],
     [
       'every hosted zone',
       (() => { const st = recordChanges(); st.addResources('arn:aws:route53:::hostedzone/*'); return st; })(),
@@ -307,13 +347,28 @@ describe('dnsWriteViolations', () => {
       (() => { const st = recordChanges(); st.addActions('*'); return st; })(),
       [grants(POLICY, [...ROUTE53_WRITES, ...ROUTE53_DOMAINS_WRITES])],
     ],
-    [
-      'TXT-only changes',
-      recordChanges({ types: ['TXT'] }),
-      [`${POLICY}: record types must be limited to CNAME`],
-    ],
+    ['TXT-only changes', recordChanges({ types: ['TXT'] }), [TYPES]],
   ])('flags %s', (_case, statement, expected) => {
     expect(dnsWriteViolations(roleWith(statement), allowance)).toEqual(expected);
+  });
+
+  // A pattern also grants actions added later, which the record conditions do not limit (ForAllValues holds
+  // for a request that has none of their keys); IAM matches wildcards in the service prefix too.
+  it.each([
+    'route53:ChangeResourceRecordSet*',
+    'route53:ChangeResourceRecordSet?',
+    'route53:Change*Sets',
+    '*:ChangeResourceRecordSets',
+    'route5?:ChangeResourceRecordSet*',
+  ])('flags the record change granted by the pattern %s, even with the allowance', (action) => {
+    const statement = { ...recordChanges().toStatementJson(), Action: action };
+    expect(dnsWriteViolations(policy(statement), allowance)).toEqual([grants('Policy', ['route53:ChangeResourceRecordSets'])]);
+  });
+
+  it('accepts actions outside Route 53 next to the exact record change', () => {
+    const statement = recordChanges();
+    statement.addActions('s3:GetObject');
+    expect(dnsWriteViolations(roleWith(statement), allowance)).toEqual([]);
   });
 
   it('flags wildcard record names even when the allowance lists them', () => {
@@ -327,8 +382,11 @@ describe('dnsWriteViolations', () => {
     expect(dnsWriteViolations(roleWith(deny))).toEqual([]);
   });
 
-  it('treats a computed Effect as Allow', () => {
-    const statement = { Effect: { 'Fn::If': ['IsProd', 'Deny', 'Allow'] }, Action: 'route53:CreateHostedZone', Resource: '*' };
+  it.each([
+    ['an Fn::If', { 'Fn::If': ['IsProd', 'Deny', 'Allow'] }],
+    ['a dynamic reference', '{{resolve:ssm:/zachverse/effect}}'],
+  ])('treats a computed Effect (%s) as Allow', (_case, effect) => {
+    const statement = { Effect: effect, Action: 'route53:CreateHostedZone', Resource: '*' };
     expect(dnsWriteViolations(policy(statement))).toEqual([grants('Policy', ['route53:CreateHostedZone'])]);
   });
 
@@ -341,13 +399,27 @@ describe('dnsWriteViolations', () => {
 
   it('flags an Action it cannot read: a CloudFormation token, or a statement wrapped in Fn::If', () => {
     const imported = new iam.PolicyStatement({ actions: [Fn.importValue('DnsActions')], resources: ['*'] });
-    expect(dnsWriteViolations(roleWith(imported))).toEqual([
-      `${POLICY}: Allow with a computed or missing Action is too broad to verify`,
-    ]);
+    expect(dnsWriteViolations(roleWith(imported))).toEqual([computedAction(POLICY)]);
     const conditional = { 'Fn::If': ['GrantDns', { Effect: 'Allow', Action: 'route53:*', Resource: '*' }, { Ref: 'AWS::NoValue' }] };
-    expect(dnsWriteViolations(policy(conditional))).toEqual([
-      'Policy: Allow with a computed or missing Action is too broad to verify',
+    expect(dnsWriteViolations(policy(conditional))).toEqual([computedAction('Policy')]);
+  });
+
+  // CloudFormation resolves {{resolve:...}} during deployment, so the deployed action could be route53:* or *.
+  it.each([
+    ['an SSM parameter', CfnDynamicReferenceService.SSM, '/zachverse/ops-actions'],
+    ['a Secrets Manager secret', CfnDynamicReferenceService.SECRETS_MANAGER, 'dns:SecretString:action'],
+  ])('flags an Action that a dynamic reference reads from %s', (_case, service, key) => {
+    const action = new CfnDynamicReference(service, key).toString();
+    expect(dnsWriteViolations(roleWith(new iam.PolicyStatement({ actions: [action], resources: ['*'] })))).toEqual([
+      computedAction(POLICY),
     ]);
+  });
+
+  it('flags a dynamic reference among literal actions, even next to a record change the allowance accepts', () => {
+    expect(dnsWriteViolations(allow(['s3:GetObject', '{{resolve:ssm:/zachverse/more-actions:3}}']))).toEqual([computedAction('Policy')]);
+    const statement = recordChanges();
+    statement.addActions(new CfnDynamicReference(CfnDynamicReferenceService.SSM, '/zachverse/extra-actions').toString());
+    expect(dnsWriteViolations(roleWith(statement), allowance)).toEqual([computedAction(POLICY)]);
   });
 
   it.each<[string, CfnResource, string]>([
@@ -392,6 +464,9 @@ describe('dnsWriteViolations', () => {
     ['? as one character in the service prefix', 'route5?:CreateHostedZone', 'route53:CreateHostedZone'],
     ['? in a Route 53 Domains action', 'route53domains:TransferDomai?', 'route53domains:TransferDomain'],
     ['a different letter case', 'ROUTE53:createhostedzone', 'route53:CreateHostedZone'],
+    ['* matching nothing at the end', 'route53:ChangeResourceRecordSets*', 'route53:ChangeResourceRecordSets'],
+    ['* matching nothing at the start of the action name', 'route53:*DeleteHostedZone', 'route53:DeleteHostedZone'],
+    ['* matching nothing inside the action name', 'route53:Delete*HostedZone', 'route53:DeleteHostedZone'],
   ])('matches actions the way IAM does: %s', (_case, pattern, granted) => {
     expect(dnsWriteViolations(allow(pattern))).toEqual([grants('Policy', [granted])]);
   });
@@ -411,6 +486,17 @@ describe('dnsWriteViolations', () => {
 
   it('treats unknown Route 53 actions named like reads as reads', () => {
     expect(dnsWriteViolations(allow(['route53:GetFutureThing', 'route53domains:ListFutureThings']))).toEqual([]);
+  });
+
+  it('flags unknown Route 53 actions with a read verb after the first word', () => {
+    // Only a name that starts with a read verb is a read. These contain Check, List, and (ignoring case, as IAM does) get.
+    const actions = [
+      'route53:CreateHealthCheckAlarm',
+      'route53:UpdateTrafficTarget',
+      'route53:ChangeTrafficPolicyTags',
+      'route53domains:UpdateDomainListing',
+    ];
+    expect(dnsWriteViolations(allow(actions))).toEqual([grants('Policy', actions)]);
   });
 
   it('flags DNS write granted through inline policies of roles, users, and groups', () => {
@@ -536,6 +622,7 @@ describe('freePlanViolations', () => {
   const DIST = 'SiteDistribution3FF9535D';
   const FN = 'ViewerRequestFunction48E73F66';
   const ORIGIN: string = site.Resources[DIST]!.Properties!.DistributionConfig.Origins[0].Id;
+  const API_ORIGIN = { Id: 'Api', DomainName: 'api.example.com', CustomOriginConfig: { OriginProtocolPolicy: 'https-only' } };
   const mutate = (fn: (config: any, template: CfnTemplate) => void) => {
     const template = clone(site);
     fn(template.Resources[DIST]!.Properties!.DistributionConfig, template);
@@ -547,16 +634,6 @@ describe('freePlanViolations', () => {
   });
 
   it.each<[string, (config: any, template: CfnTemplate) => unknown, string]>([
-    ['a custom cache policy', (c) => (c.DefaultCacheBehavior.CachePolicyId = { Ref: 'MyCachePolicy' }),
-      `${DIST} behavior default: CachePolicyId must be an AWS-managed policy ID`],
-    ['an unknown origin request policy', (c) => (c.DefaultCacheBehavior.OriginRequestPolicyId = 'not-managed'),
-      `${DIST} behavior default: OriginRequestPolicyId must be an AWS-managed policy ID`],
-    ['a custom response headers policy', (c) => (c.DefaultCacheBehavior.ResponseHeadersPolicyId = { Ref: 'X' }),
-      `${DIST} behavior default: ResponseHeadersPolicyId must be an AWS-managed policy ID`],
-    ['real-time logs', (c) => (c.DefaultCacheBehavior.RealtimeLogConfigArn = 'arn:aws:cloudfront::1:realtime-log-config/x'),
-      `${DIST} behavior default: real-time logs are unsupported on pricing plans`],
-    ['Lambda@Edge', (c) => (c.DefaultCacheBehavior.LambdaFunctionAssociations = [{ EventType: 'origin-request' }]),
-      `${DIST} behavior default: Lambda@Edge is not allowed in this project`],
     ['standard access logging', (c) => (c.Logging = { Bucket: 'logs.s3.amazonaws.com' }), `${DIST}: Logging: access logs need Pro or higher`],
     ['continuous deployment', (c) => (c.ContinuousDeploymentPolicyId = 'cdp-1'),
       `${DIST}: ContinuousDeploymentPolicyId: continuous deployment is unsupported`],
@@ -573,12 +650,16 @@ describe('freePlanViolations', () => {
     ['an IAM server certificate', (c) => (c.ViewerCertificate.IamCertificateId = 'ASCAEXAMPLE'),
       `${DIST}: IAM server certificates are unsupported; use ACM`],
     ['dedicated IP SSL', (c) => (c.ViewerCertificate.SslSupportMethod = 'vip'), `${DIST}: dedicated IP SSL is unsupported`],
-    ['Origin Shield', (c) => (c.Origins[0].OriginShield = { Enabled: true, OriginShieldRegion: 'us-east-2' }),
-      `${DIST} origin ${ORIGIN}: Origin Shield needs Premium`],
-    ['a VPC origin', (c) => (c.Origins[0].VpcOriginConfig = { VpcOriginId: 'vo-1' }),
-      `${DIST} origin ${ORIGIN}: VPC origins need Business or higher`],
-    ['an OAI', (c) => (c.Origins[0].S3OriginConfig.OriginAccessIdentity = 'origin-access-identity/cloudfront/E1'),
-      `${DIST} origin ${ORIGIN}: OAI is unsupported; use OAC`],
+    ['viewer mutual TLS', (c) => (c.ViewerMtlsConfig = { Mode: 'required', TrustStoreConfig: { TrustStoreId: 'ts-1' } }),
+      `${DIST}: ViewerMtlsConfig: viewer mutual TLS needs Premium`],
+    ['a connection function', (c) => (c.ConnectionFunctionAssociation = { Id: 'cf-1' }),
+      `${DIST}: ConnectionFunctionAssociation: connection functions (viewer mutual TLS) need Premium`],
+    ['cache-tag invalidation', (c) => (c.CacheTagConfig = { HeaderName: 'Cache-Tag' }),
+      `${DIST}: CacheTagConfig: cache-tag invalidation needs Pro or higher`],
+    ['origin mutual TLS', (c) => c.Origins.push({
+      ...API_ORIGIN,
+      CustomOriginConfig: { ...API_ORIGIN.CustomOriginConfig, OriginMtlsConfig: { ClientCertificateArn: TEST_CERTIFICATE_ARN } },
+    }), `${DIST} origin Api: origin mutual TLS needs Business or higher`],
     ['more than five cache behaviors',
       (c) => (c.CacheBehaviors = Array.from({ length: 5 }, (_, i) => ({ ...c.DefaultCacheBehavior, PathPattern: `/p${i}/*` }))),
       `${DIST}: 6 cache behaviors exceeds the Free limit of 5`],
@@ -589,24 +670,80 @@ describe('freePlanViolations', () => {
     ['a KeyValueStore association', (_c, t) => (t.Resources[FN]!.Properties!.FunctionConfig.KeyValueStoreAssociations = [
       { KeyValueStoreARN: 'arn:aws:cloudfront::1:key-value-store/x' },
     ]), `${DIST} behavior default: ${FN}: KeyValueStore needs Pro or higher`],
-    ['a function association by literal ARN',
-      (c) => (c.DefaultCacheBehavior.FunctionAssociations[0].FunctionARN = 'arn:aws:cloudfront::426499248998:function/other'),
-      `${DIST} behavior default: function associations must reference a CloudFront Function defined in this stack`],
-    ['a function association to a resource that is not a CloudFront Function',
-      (c) => (c.DefaultCacheBehavior.FunctionAssociations[0].FunctionARN = { 'Fn::GetAtt': ['SiteBucket397A1860', 'Arn'] }),
-      `${DIST} behavior default: function associations must reference a CloudFront Function defined in this stack`],
   ])('flags %s', (_case, fn, expected) => {
     expect(mutate(fn)).toEqual([expected]);
   });
 
-  it.each(['ForwardedValues', 'MinTTL', 'DefaultTTL', 'MaxTTL', 'TrustedSigners', 'FieldLevelEncryptionId'])(
-    'flags the legacy cache behavior setting %s',
-    (setting) => {
-      expect(mutate((c) => (c.DefaultCacheBehavior[setting] = {}))).toEqual([
-        `${DIST} behavior default: legacy setting ${setting} is unsupported on pricing plans`,
-      ]);
-    },
-  );
+  // Every cache behavior is checked, not only the default: the second run adds a path behavior copied from it.
+  describe.each<[string, (config: any) => any]>([
+    ['default', (c) => c.DefaultCacheBehavior],
+    ['/api/*', (c) => (c.CacheBehaviors = [{ ...clone(c.DefaultCacheBehavior), PathPattern: '/api/*' }])[0]],
+  ])('on the %s cache behavior', (label, behaviorIn) => {
+    /** Points the behavior at its own CloudFront Function with this config, which no other behavior uses. */
+    const ownFunction = (behavior: any, template: CfnTemplate, FunctionConfig: object) => {
+      template.Resources.OwnFunction = { Type: 'AWS::CloudFront::Function', Properties: { FunctionConfig } };
+      behavior.FunctionAssociations = [{ EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': ['OwnFunction', 'FunctionARN'] } }];
+    };
+
+    // Each policy ID is tried as an intrinsic and as a literal, the form a custom policy imported by ID takes.
+    it.each<[string, (behavior: any, template: CfnTemplate) => unknown, string]>([
+      ['a custom cache policy', (b) => (b.CachePolicyId = { Ref: 'MyCachePolicy' }), 'CachePolicyId must be an AWS-managed policy ID'],
+      ['an unknown cache policy', (b) => (b.CachePolicyId = 'not-managed'), 'CachePolicyId must be an AWS-managed policy ID'],
+      ['an imported origin request policy', (b) => (b.OriginRequestPolicyId = { 'Fn::ImportValue': 'SharedOriginRequestPolicyId' }),
+        'OriginRequestPolicyId must be an AWS-managed policy ID'],
+      ['an unknown origin request policy', (b) => (b.OriginRequestPolicyId = 'not-managed'), 'OriginRequestPolicyId must be an AWS-managed policy ID'],
+      ['a custom response headers policy', (b) => (b.ResponseHeadersPolicyId = { Ref: 'X' }),
+        'ResponseHeadersPolicyId must be an AWS-managed policy ID'],
+      ['an unknown response headers policy', (b) => (b.ResponseHeadersPolicyId = 'not-managed'),
+        'ResponseHeadersPolicyId must be an AWS-managed policy ID'],
+      ['real-time logs', (b) => (b.RealtimeLogConfigArn = 'arn:aws:cloudfront::1:realtime-log-config/x'),
+        'real-time logs are unsupported on pricing plans'],
+      // An existing Lambda@Edge version adds no Lambda resource, so only this check sees it.
+      ['Lambda@Edge', (b) => (b.LambdaFunctionAssociations = [
+        { EventType: 'origin-request', LambdaFunctionARN: 'arn:aws:lambda:us-east-1:426499248998:function:edge:3' },
+      ]), 'Lambda@Edge is not allowed in this project'],
+      ['a function association by literal ARN', (b) => (b.FunctionAssociations[0].FunctionARN = 'arn:aws:cloudfront::426499248998:function/other'),
+        'function associations must reference a CloudFront Function defined in this stack'],
+      ['a function association to a resource that is not a CloudFront Function',
+        (b) => (b.FunctionAssociations[0].FunctionARN = { 'Fn::GetAtt': ['SiteBucket397A1860', 'Arn'] }),
+        'function associations must reference a CloudFront Function defined in this stack'],
+      ['a function on cloudfront-js-1.0', (b, t) => ownFunction(b, t, { Runtime: 'cloudfront-js-1.0' }),
+        'OwnFunction must use runtime cloudfront-js-2.0'],
+      ['a function with a KeyValueStore', (b, t) => ownFunction(b, t, {
+        Runtime: 'cloudfront-js-2.0',
+        KeyValueStoreAssociations: [{ KeyValueStoreARN: 'arn:aws:cloudfront::1:key-value-store/x' }],
+      }), 'OwnFunction: KeyValueStore needs Pro or higher'],
+    ])('flags %s', (_case, fn, expected) => {
+      expect(mutate((c, t) => fn(behaviorIn(c), t))).toEqual([`${DIST} behavior ${label}: ${expected}`]);
+    });
+
+    it.each(['ForwardedValues', 'MinTTL', 'DefaultTTL', 'MaxTTL', 'TrustedSigners', 'FieldLevelEncryptionId'])(
+      'flags the legacy cache behavior setting %s',
+      (setting) => {
+        expect(mutate((c) => (behaviorIn(c)[setting] = {}))).toEqual([
+          `${DIST} behavior ${label}: legacy setting ${setting} is unsupported on pricing plans`,
+        ]);
+      },
+    );
+  });
+
+  // Every origin is checked, not only the first: the second run adds a copy of the S3 origin.
+  describe.each<[string, (config: any) => any]>([
+    [ORIGIN, (c) => c.Origins[0]],
+    ['second', (c) => {
+      const origin = { ...clone(c.Origins[0]), Id: 'second' };
+      c.Origins.push(origin);
+      return origin;
+    }],
+  ])('on origin %s', (originId, originIn) => {
+    it.each<[string, (origin: any) => unknown, string]>([
+      ['Origin Shield', (o) => (o.OriginShield = { Enabled: true, OriginShieldRegion: 'us-east-2' }), 'Origin Shield needs Premium'],
+      ['a VPC origin', (o) => (o.VpcOriginConfig = { VpcOriginId: 'vo-1' }), 'VPC origins need Business or higher'],
+      ['an OAI', (o) => (o.S3OriginConfig.OriginAccessIdentity = 'origin-access-identity/cloudfront/E1'), 'OAI is unsupported; use OAC'],
+    ])('flags %s', (_case, fn, expected) => {
+      expect(mutate((c) => fn(originIn(c)))).toEqual([`${DIST} origin ${originId}: ${expected}`]);
+    });
+  });
 
   it.each<[string, (config: any) => unknown]>([
     ['an AWS-managed origin request policy', (c) => (c.DefaultCacheBehavior.OriginRequestPolicyId = '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf')],
@@ -614,8 +751,30 @@ describe('freePlanViolations', () => {
     ['Staging set to false', (c) => (c.Staging = false)],
     ['the direct connection mode', (c) => (c.ConnectionMode = 'direct')],
     ['Origin Shield turned off', (c) => (c.Origins[0].OriginShield = { Enabled: false })],
+    ['a custom origin', (c) => c.Origins.push(clone(API_ORIGIN))],
+    ['an S3 origin without an OriginAccessIdentity setting', (c) => delete c.Origins[0].S3OriginConfig.OriginAccessIdentity],
   ])('accepts %s', (_case, fn) => {
     expect(mutate(fn)).toEqual([]);
+  });
+
+  // aws-cdk-lib's constants for the AWS-managed policies: a source independent of the ID lists in checks.ts.
+  const { CachePolicy: CP, OriginRequestPolicy: ORP, ResponseHeadersPolicy: RHP } = cloudfront;
+  it.each<[string, Set<string>, string[]]>([
+    ['CachePolicyId', MANAGED_CACHE_POLICY_IDS, [
+      CP.AMPLIFY, CP.CACHING_DISABLED, CP.CACHING_OPTIMIZED, CP.CACHING_OPTIMIZED_FOR_UNCOMPRESSED_OBJECTS, CP.ELEMENTAL_MEDIA_PACKAGE,
+      CP.USE_ORIGIN_CACHE_CONTROL_HEADERS, CP.USE_ORIGIN_CACHE_CONTROL_HEADERS_QUERY_STRINGS,
+    ].map((p) => p.cachePolicyId)],
+    ['OriginRequestPolicyId', MANAGED_ORIGIN_REQUEST_POLICY_IDS, [
+      ORP.ALL_VIEWER, ORP.ALL_VIEWER_AND_CLOUDFRONT_2022, ORP.ALL_VIEWER_EXCEPT_HOST_HEADER, ORP.CORS_CUSTOM_ORIGIN, ORP.CORS_S3_ORIGIN,
+      ORP.ELEMENTAL_MEDIA_TAILOR, ORP.HOST_HEADER_ONLY, ORP.USER_AGENT_REFERER_HEADERS,
+    ].map((p) => p.originRequestPolicyId)],
+    ['ResponseHeadersPolicyId', MANAGED_RESPONSE_HEADERS_POLICY_IDS, [
+      RHP.CORS_ALLOW_ALL_ORIGINS, RHP.CORS_ALLOW_ALL_ORIGINS_WITH_PREFLIGHT, RHP.SECURITY_HEADERS, RHP.CORS_ALLOW_ALL_ORIGINS_AND_SECURITY_HEADERS,
+      RHP.CORS_ALLOW_ALL_ORIGINS_WITH_PREFLIGHT_AND_SECURITY_HEADERS,
+    ].map((p) => p.responseHeadersPolicyId)],
+  ])('allows exactly the AWS-managed policies as %s, and accepts each one', (field, allowed, managed) => {
+    expect([...allowed].sort()).toEqual([...managed].sort());
+    for (const id of managed) expect(mutate((c) => (c.DefaultCacheBehavior[field] = id)), id).toEqual([]);
   });
 
   it('names extra cache behaviors by path pattern, or by position when the pattern is missing', () => {
@@ -660,12 +819,57 @@ describe('freePlanViolations', () => {
     ['AWS::CloudFront::AnycastIpList', 'Anycast IP lists are unsupported on pricing plans'],
     ['AWS::CloudFront::VpcOrigin', 'VPC origins need Business or higher'],
     ['AWS::CloudFront::DistributionTenant', 'multi-tenant distributions are unsupported on pricing plans'],
+    ['AWS::CloudFront::TrustStore', 'viewer mutual TLS needs Premium'],
+    ['AWS::CloudFront::ConnectionFunction', 'connection functions (viewer mutual TLS) need Premium'],
     ['AWS::Logs::DeliverySource', 'access-log delivery needs Pro or higher on flat-rate plans'],
     ['AWS::WAFv2::LoggingConfiguration', 'WAF request logs need Pro or higher'],
     ['AWS::WAFv2::RuleGroup', 'rule groups are unsupported on pricing plans'],
     ['AWS::Shield::Protection', 'Shield Advanced makes a distribution ineligible'],
   ])('flags a %s resource', (type, reason) => {
     expect(freePlanViolations({ Resources: { Extra: { Type: type, Properties: {} } } })).toEqual([`Extra (${type}): ${reason}`]);
+  });
+
+  // A plan distribution's functions and web ACL can be used by no other distribution ("Unsupported associations").
+  describe('with a second distribution', () => {
+    const PREVIEW = 'PreviewDistribution';
+    const shared = (what: string) => `${what} is shared by ${DIST}, ${PREVIEW}: a pricing-plan distribution cannot share its functions or web ACL`;
+    /** Adds a copy of the site distribution, as a preview distribution might be, then changes both configs. */
+    const withPreview = (change: (preview: any, config: any, template: CfnTemplate) => void = () => {}) =>
+      mutate((c, t) => {
+        const preview = clone(t.Resources[DIST]!);
+        preview.Properties!.DistributionConfig.Aliases = ['preview.zachdavids.com'];
+        t.Resources[PREVIEW] = preview;
+        change(preview.Properties!.DistributionConfig, c, t);
+      });
+    const ownFunction = (preview: any, t: CfnTemplate) => {
+      t.Resources.PreviewFunction = clone(t.Resources[FN]!);
+      preview.DefaultCacheBehavior.FunctionAssociations[0].FunctionARN = { 'Fn::GetAtt': ['PreviewFunction', 'FunctionARN'] };
+    };
+
+    it('flags a CloudFront Function both use', () => {
+      expect(withPreview()).toEqual([shared(`CloudFront Function ${FN}`)]);
+    });
+
+    it.each([
+      ['an ARN', TEST_WEB_ACL_ARN],
+      ['a reference to a web ACL in the stack', { 'Fn::GetAtt': ['Acl', 'Arn'] }],
+    ])('flags a web ACL both use, given as %s', (_case, webAclId) => {
+      const violations = withPreview((preview, c, t) => {
+        ownFunction(preview, t);
+        c.WebACLId = webAclId;
+        preview.WebACLId = webAclId;
+      });
+      expect(violations).toEqual([shared(`web ACL ${JSON.stringify(webAclId)}`)]);
+    });
+
+    it('accepts distributions with their own functions and web ACLs', () => {
+      const violations = withPreview((preview, c, t) => {
+        ownFunction(preview, t);
+        c.WebACLId = TEST_WEB_ACL_ARN;
+        preview.WebACLId = TEST_WEB_ACL_ARN.replace(/zachverse/, 'preview');
+      });
+      expect(violations).toEqual([]);
+    });
   });
 });
 
@@ -718,8 +922,6 @@ describe('freePlanWebAclViolations', () => {
       'custom WAF responses need Pro or higher'],
     ['a custom response on the default action', (a) => (a.DefaultAction = { Block: { CustomResponse: { ResponseCode: 403 } } }),
       'custom WAF responses need Pro or higher'],
-    ['larger body inspection', (a) => (a.AssociationConfig = { RequestBody: { CLOUDFRONT: { DefaultSizeInspectionLimit: 'KB_64' } } }),
-      'request body inspection above 16 KB needs Business or higher'],
     ['partner rules', (a) => (a.Rules[0].Statement.ManagedRuleGroupStatement.VendorName = 'F5'),
       'AWSManagedRulesAmazonIpReputationList: partner managed rules (F5) are unsupported'],
     ['a rule group reference', (a) => (a.Rules[3] = rule('RG', { RuleGroupReferenceStatement: { Arn: 'arn' } })),
@@ -785,6 +987,11 @@ describe('freePlanWebAclViolations', () => {
     const acl = freeAcl();
     acl.Rules[1].Statement.ManagedRuleGroupStatement.RuleActionOverrides = [{ Name: 'SizeRestrictions_BODY', ActionToUse: { Count: {} } }];
     expect(freePlanWebAclViolations(acl)).toEqual([]);
+  });
+
+  it.each(['KB_32', 'KB_48', 'KB_64'])('flags the body inspection limit %s, above the 16 KB of the Free plan', (limit) => {
+    const acl = { ...freeAcl(), AssociationConfig: { RequestBody: { CLOUDFRONT: { DefaultSizeInspectionLimit: limit } } } };
+    expect(freePlanWebAclViolations(acl)).toEqual(['request body inspection above 16 KB needs Business or higher']);
   });
 
   it.each([

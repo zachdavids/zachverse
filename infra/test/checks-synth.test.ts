@@ -1,11 +1,15 @@
 // Tests for test/support/synth.ts, which every guardrail and stack test synthesizes through.
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import { type App, NestedStack, Stack, Stage } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { Construct } from 'constructs';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { createStacks } from '../lib/app';
 import { production } from '../lib/config';
 import { SiteStack } from '../lib/site-stack';
+import { prohibitedResourceViolations } from './support/checks';
 import { productionConfig, synthesizeAll, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 // The real createStacks, wrapped so one test can make the app build a differently named stack.
@@ -64,6 +68,36 @@ describe('synthesizeAll', () => {
     expect(flags.length).toBeGreaterThan(0);
     const [site] = synthesizeAll();
     for (const [key, value] of flags) expect(site!.stack.node.tryGetContext(key), key).toEqual(value);
+  });
+
+  // cdk synth emits these stacks as well, so the guardrails must see them although createStacks returns only the site.
+  it.each<[string, (app: App, site: Stack) => Construct, string]>([
+    ['inside the site stack', (_app, site) => site, 'ZachverseSite/Dns'],
+    ['inside a Stage', (app) => new Stage(app, 'Staged'), 'Staged/Dns'],
+    ['under a plain construct', (app) => new Construct(app, 'Shared'), 'Shared/Dns'],
+  ])('includes a stack created %s', (_case, scopeFor, stackPath) => {
+    vi.mocked(createStacks).mockImplementationOnce((app, config) => {
+      const site = new SiteStack(app, 'ZachverseSite', { config });
+      const dns = new Stack(scopeFor(app, site), 'Dns');
+      new route53.PublicHostedZone(dns, 'Zone', { zoneName: config.domainName });
+      return { site };
+    });
+    const stacks = synthesizeAll();
+    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite', stackPath]);
+    expect(Object.values(stacks[1]!.json.Resources).map((r) => r.Type)).toEqual(['AWS::Route53::HostedZone']);
+  });
+
+  it('leaves a nested stack to its parent template, where the prohibited-resource check flags it', () => {
+    vi.mocked(createStacks).mockImplementationOnce((app, config) => {
+      const site = new SiteStack(app, 'ZachverseSite', { config });
+      new NestedStack(site, 'Nested');
+      return { site };
+    });
+    const stacks = synthesizeAll();
+    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite']);
+    expect(prohibitedResourceViolations(stacks[0]!.json)).toEqual([
+      expect.stringMatching(/^Nested\w+ \(AWS::CloudFormation::Stack\): nested stacks are not checked by these guardrails$/),
+    ]);
   });
 });
 

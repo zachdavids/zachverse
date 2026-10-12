@@ -62,6 +62,7 @@ export function dnsBatchViolations(batch: Json): string[] {
 /**
  * Checks every file under `dir` except its README as a change batch, whatever its
  * name or folder: the AWS CLI applies any file it is given, so none may skip review.
+ * That includes dot-names, which globs skip by default, and links, read through.
  */
 export function batchDirectoryViolations(dir: string): string[] {
   const files = readdirSync(dir, { recursive: true, withFileTypes: true })
