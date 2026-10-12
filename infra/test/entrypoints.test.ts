@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import * as path from 'node:path';
 import { App, Stack } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -10,17 +8,12 @@ import { TEST_CERTIFICATE_ARN } from './support/synth';
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
-// Importing bin/zachverse.ts runs the same code `cdk synth` does.
+// Importing bin/zachverse.ts runs the same code `cdk synth` does (cdk-json.test.ts pins the app command).
 describe('CDK entry point', () => {
   afterEach(() => {
     vi.doUnmock('../lib/config');
     vi.doUnmock('../lib/app');
     vi.resetModules();
-  });
-
-  it('is the app cdk.json runs', () => {
-    const cdkJson = JSON.parse(readFileSync(path.join(__dirname, '..', 'cdk.json'), 'utf8'));
-    expect(cdkJson.app).toBe('npx tsx bin/zachverse.ts');
   });
 
   it('lets a configuration error fail the synth instead of swallowing it', async () => {

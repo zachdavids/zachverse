@@ -248,14 +248,16 @@ describe('GitHub Actions workflows', () => {
 });
 
 describe('CI workflow', () => {
-  it('runs on every pull request into main and every push to main', () => {
+  it('runs on every pull request and every push to main', () => {
     const events = ci ? triggers(ci) : {};
     // GitHub runs pull_request for this activity unless "types" names other activity.
     const activity = ['opened', 'synchronize', 'reopened'];
     for (const event of ['pull_request', 'push']) {
       expect(Object.keys(events), event).toContain(event);
-      const { branches = ['main'], types = activity, ...narrowing } = events[event] ?? {};
-      expect([branches].flat(), event).toContain('main');
+      const { branches, types = activity, ...narrowing } = events[event] ?? {};
+      // A branches filter on pull_request skips stacked PRs, whose base is another PR's branch.
+      if (event === 'pull_request') expect(branches, event).toBeUndefined();
+      else expect([branches ?? 'main'].flat(), event).toContain('main');
       expect(types, event).toEqual(expect.arrayContaining(activity));
       // paths, paths-ignore, branches-ignore, or tags would skip CI for some changes to main.
       expect(narrowing, event).toEqual({});
@@ -287,7 +289,17 @@ describe('CI workflow', () => {
   it('typechecks every TypeScript project with tsc and runs Vitest with coverage', () => {
     for (const dir of ['', 'infra/']) {
       const { scripts } = readJson<{ scripts: Record<string, string | undefined> }>(`${dir}package.json`);
-      const projects = readdirSync(new URL(dir, root)).filter((file) => /^tsconfig\b.*\.json$/.test(file));
+      const configs = readdirSync(new URL(dir, root)).filter((file) => /^tsconfig\b.*\.json$/.test(file));
+      // A solution file ("files": [] plus "references") checks nothing itself; it lets editors find the projects.
+      const solutions = configs.filter((file) => {
+        const { files, references, ...rest } = readJson<Record<string, unknown>>(`${dir}${file}`);
+        return isDeepStrictEqual(files, []) && references !== undefined && Object.keys(rest).length === 0;
+      });
+      const projects = configs.filter((file) => !solutions.includes(file));
+      for (const file of solutions) {
+        const { references } = readJson<{ references: { path: string }[] }>(`${dir}${file}`);
+        expect(references.map(({ path }) => posix.normalize(path)).sort(), `${dir}${file}`).toEqual(projects.sort());
+      }
       // One plain tsc run per project, so none can be dropped and no flag or "|| true" can weaken one.
       expect(scripts.typecheck?.split(' && ').sort(), `${dir}package.json`).toEqual(
         projects.sort().map((project) => `tsc -p ${project}`),
@@ -349,8 +361,53 @@ describe('Node version', () => {
   });
 });
 
+describe('npm settings', () => {
+  const packages = ['', 'infra/'];
+
+  it('never run dependency install scripts, and npx never downloads a missing package', () => {
+    // A nested package does not inherit the root .npmrc.
+    for (const dir of packages) expect(read(`${dir}.npmrc`), `${dir}.npmrc`).toBe('ignore-scripts=true\nyes=false\n');
+  });
+
+  it('leave no lifecycle script that ignore-scripts would silently skip', () => {
+    // npm runs these on install, and a pre/post hook around any script it runs; ignore-scripts skips them all.
+    const lifecycle = ['install', 'prepare', 'prepublish', 'dependencies'];
+    for (const dir of packages) {
+      const { scripts = {} } = readJson<{ scripts?: Record<string, string> }>(`${dir}package.json`);
+      const hooks = Object.keys(scripts).filter((name) => {
+        const event = /^(?:pre|post)(.+)$/.exec(name)?.[1];
+        return lifecycle.includes(name) || (event !== undefined && (event in scripts || lifecycle.includes(event)));
+      });
+      expect(hooks, `${dir}package.json`).toEqual([]);
+    }
+  });
+
+  it('are not overridden in any workflow', () => {
+    for (const { file, text } of workflows) {
+      // --ignore-scripts=false, --no-ignore-scripts, npm_config_ignore_scripts, and npm rebuild would run them.
+      expect(text.match(/ignore[-_]scripts|\bnpm\s+(?:rebuild|rb)\b/gi) ?? [], file).toEqual([]);
+    }
+  });
+});
+
 describe('lockfiles', () => {
-  type Entry = { name?: string; version?: string; resolved?: string; integrity?: string; inBundle?: boolean };
+  type Entry = {
+    name?: string;
+    version?: string;
+    resolved?: string;
+    integrity?: string;
+    inBundle?: boolean;
+    hasInstallScript?: boolean;
+  };
+
+  it.each([
+    ['package-lock.json', ['node_modules/fsevents']],
+    ['infra/package-lock.json', ['node_modules/esbuild', 'node_modules/fsevents']],
+  ])('%s adds no package with an install script beyond the reviewed ones', (path, reviewed) => {
+    // Install scripts never run here (see .npmrc), so a new package that needs one may not work as installed.
+    const { packages } = readJson<{ packages: Record<string, Entry> }>(path);
+    expect(Object.keys(packages).filter((key) => packages[key]!.hasInstallScript)).toEqual(reviewed);
+  });
 
   it.each(['package-lock.json', 'infra/package-lock.json'])(
     '%s installs each package from its own npm registry tarball, with a sha512 hash',

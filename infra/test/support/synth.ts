@@ -9,8 +9,14 @@ import { production, type SiteConfig } from '../../lib/config';
 export const TEST_CERTIFICATE_ARN = `arn:aws:acm:us-east-1:${production.account}:certificate/00000000-0000-0000-0000-000000000000`;
 export const TEST_WEB_ACL_ARN = `arn:aws:wafv2:us-east-1:${production.account}:global/webacl/zachverse/00000000-0000-0000-0000-000000000000`;
 
-/** Feature flags from cdk.json, so tests synthesize exactly what `cdk deploy` would. */
-const cdkContext = JSON.parse(readFileSync(path.join(__dirname, '..', '..', 'cdk.json'), 'utf8')).context;
+const cdkJson = JSON.parse(readFileSync(path.join(__dirname, '..', '..', 'cdk.json'), 'utf8'));
+
+/**
+ * The context the CLI gives the app: cdk.json's feature flags, plus version reporting, which the CLI turns on
+ * unless cdk.json sets versionReporting to false. Tests then synthesize the same resources and properties as
+ * `cdk deploy`; only the CLI's path metadata differs.
+ */
+const cdkContext = { ...cdkJson.context, 'aws:cdk:version-reporting': cdkJson.versionReporting !== false };
 
 export function productionConfig(overrides: Partial<SiteConfig> = {}): SiteConfig {
   return { ...production, certificateArn: production.certificateArn ?? TEST_CERTIFICATE_ARN, ...overrides };
