@@ -281,32 +281,35 @@ describe('githubTrustViolations', () => {
       }
     });
 
-  it('accepts the exact production-environment subject with the STS audience', () => {
-    const template = roleTrusting({
-      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': subject },
-    });
-    expect(githubTrustViolations(template, subject)).toEqual([]);
+  const AUD = 'token.actions.githubusercontent.com:aud';
+  const SUB = 'token.actions.githubusercontent.com:sub';
+  const REF = 'token.actions.githubusercontent.com:ref';
+  const ref = production.github.deployRef;
+  const exact = { [AUD]: 'sts.amazonaws.com', [SUB]: subject, [REF]: ref };
+
+  it('accepts the exact production-environment subject on main with the STS audience', () => {
+    expect(githubTrustViolations(roleTrusting({ StringEquals: exact }), subject, ref)).toEqual([]);
   });
 
   it.each([
     ['a repository-wide wildcard', {
-      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com' },
-      StringLike: { 'token.actions.githubusercontent.com:sub': 'repo:zachdavids@43345768/zachverse@1414719760:*' },
+      StringEquals: { [AUD]: 'sts.amazonaws.com', [REF]: ref },
+      StringLike: { [SUB]: 'repo:zachdavids@43345768/zachverse@1414719760:*' },
     }],
-    ['the old name-only subject format', {
-      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': 'repo:zachdavids/zachverse:environment:production' },
-    }],
+    ['the old name-only subject format', { StringEquals: { ...exact, [SUB]: 'repo:zachdavids/zachverse:environment:production' } }],
     ['a branch subject instead of the environment', {
-      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': 'repo:zachdavids@43345768/zachverse@1414719760:ref:refs/heads/main' },
+      StringEquals: { ...exact, [SUB]: 'repo:zachdavids@43345768/zachverse@1414719760:ref:refs/heads/main' },
     }],
-    ['a missing audience', { StringEquals: { 'token.actions.githubusercontent.com:sub': subject } }],
+    ['a missing audience', { StringEquals: { [SUB]: subject, [REF]: ref } }],
+    ['a missing ref', { StringEquals: { [AUD]: 'sts.amazonaws.com', [SUB]: subject } }],
+    ['a ref other than main', { StringEquals: { ...exact, [REF]: 'refs/heads/feature' } }],
   ])('flags %s', (_case, conditions) => {
-    expect(githubTrustViolations(roleTrusting(conditions), subject).length).toBeGreaterThan(0);
+    expect(githubTrustViolations(roleTrusting(conditions), subject, ref).length).toBeGreaterThan(0);
   });
 
   it('flags trust statements that allow more than AssumeRoleWithWebIdentity', () => {
     const template = roleTrusting({}, ['sts:AssumeRoleWithWebIdentity', 'sts:TagSession']);
-    expect(githubTrustViolations(template, subject).some((v) => v.includes('only sts:AssumeRoleWithWebIdentity'))).toBe(true);
+    expect(githubTrustViolations(template, subject, ref).some((v) => v.includes('only sts:AssumeRoleWithWebIdentity'))).toBe(true);
   });
 });
 

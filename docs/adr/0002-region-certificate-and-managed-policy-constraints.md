@@ -1,13 +1,13 @@
 # ADR 0002: Region, certificate, and organization-policy constraints
 
-- Status: Accepted. Deployment is blocked by SCP `p-ie47xwqg` (see "Blocker")
+- Status: Accepted. The SCP blocker was resolved on 2026-10-12 (see "Resolution")
 - Date: 2026-10-11, revised after AWS advanced features were activated
 
 ## Decision
 
 1. All regional Zachverse infrastructure lives in **us-east-1** in the Website account `426499248998`, which owns hosted zone `Z03492543O0YEY0RDZZ0J`. That covers the CDK bootstrap, every stack, the S3 bucket, the ACM certificate, and the CLOUDFRONT-scope WAF ACL. CloudFront, Route 53, and IAM are global. Nothing is deployed to us-east-2 (the project's originally selected Region), or to the Management (`969788248923`) or Identity Delegated Admin accounts.
 2. The certificate is still requested outside CloudFormation and validated by a reviewed change batch in `infra/dns/`. CloudFormation-managed DNS validation would write records using the CDK execution role's full permissions, and the records would belong to a stack. Out-of-band validation limits DNS writes to the exact validation names and keeps the zone independent of the stacks.
-3. The web ACL can become a CloudFormation resource once CloudFormation is allowed in us-east-1. That is decided in milestone 7.
+3. Now that CloudFormation is allowed in us-east-1, the web ACL can be a CloudFormation resource. That is decided in milestone 7.
 
 ## Evidence
 
@@ -21,17 +21,19 @@ All checks were run on 2026-10-11, after activation, as `AccountFullAccessRole` 
 
 These results match the `UsEast1Partitional` statement that AWS [publishes](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html) for projects with advanced features. That statement is a `Deny` on `NotAction` (a list of global services), with `StringEquals aws:RequestedRegion = us-east-1`. The list excludes `cloudformation`, most of `s3`, `ssm`, `ecr`, and `pricingplanmanager`.
 
-## Blocker and proposed adjustment
+## Resolution (applied 2026-10-12)
 
-The smallest change that unblocks the decision: add these to the `NotAction` list of `UsEast1Partitional` in `p-ie47xwqg`.
+The live policy, read from the management account, confirmed the cause. `p-ie47xwqg` (`AdvancedModeRegionRestrictionSecurityControlPolicy`) is customer-managed and attached at the root `r-58a9`. Its `UsEast1Partitional` statement omits `cloudformation`, `ssm`, `ecr`, and `pricingplanmanager`, and allows only 17 account-level `s3` actions. The policy was 5,104 of the allowed 5,120 characters, so it couldn't simply grow. Because it is attached at the root, editing its list in place would also have loosened the Identity Delegated Admin account.
 
-```json
-"cloudformation:*", "s3:*", "ssm:*", "ecr:*", "pricingplanmanager:*"
-```
+With approval, the change was scoped to the Website account:
 
-- `cloudformation`, `s3`, `ssm`, `ecr`: the CDK bootstrap (staging bucket, version parameter, and the container repository in the default template) and stack deployments. `s3` also covers the site bucket and uploads.
-- `pricingplanmanager`: the milestone 7 subscription. This one is needed regardless of where the stacks live.
+1. `RegionFloor` moved verbatim into a new root SCP, `ZachverseRegionFloor` (`p-xwdm4cce`).
+2. A new SCP attached only to `426499248998`, `ZachverseWebsiteUsEast1` (`p-1mpgzmjr`). It holds the same us-east-1 deny, with the `s3` entries replaced by `s3:*` and `cloudformation:*`, `ecr:*`, `pricingplanmanager:*`, and `ssm:*` added.
+3. `UsEast1Partitional` gained `StringNotEquals aws:PrincipalAccount = 426499248998`.
 
-Every other service stays denied in us-east-1, and the other statements are unchanged. If the policy is attached above the Website account (at the root or an OU), limit the exemption to `426499248998` so the administrative accounts keep the original control. To do that, add `"StringNotEquals": {"aws:PrincipalAccount": "426499248998"}` to the existing statement, and add a copy of the statement with the expanded list conditioned on that account.
+Before applying, a local evaluation (`docs/org-policy/compare.cjs`) showed 6 changed decisions, all for the Website account in us-east-1, and 0 for the Identity account. Afterwards, from the Website account:
 
-Before applying this, read the live policy, its attachment targets, and whether AWS manages it, from the management account.
+- Real us-east-1 calls to CloudFormation, ECR, S3, and Pricing Plan Manager succeeded.
+- The simulator allows the needed actions. Lambda, EC2, DynamoDB, and SQS are still explicitly denied in us-east-1.
+
+Backup, exact apply commands, and rollback commands are in `docs/org-policy/`.

@@ -13,6 +13,11 @@ export interface GitHubDeployConfig {
   readonly repoId: number;
   /** GitHub environment the deploy job runs in; its deployment branches are limited to main. */
   readonly environment: string;
+  /**
+   * Git ref the deploy job must run from. An environment subject names no
+   * branch, so the trust policy also checks the `ref` claim (AWS IAM guidance).
+   */
+  readonly deployRef: string;
   /** Fixed so the site stack can grant permissions to the role by name. */
   readonly deployRoleName: string;
 }
@@ -59,6 +64,7 @@ export const production: SiteConfig = {
     repoName: 'zachverse',
     repoId: 1414719760,
     environment: 'production',
+    deployRef: 'refs/heads/main',
     deployRoleName: 'zachverse-github-site-deploy',
   },
 };

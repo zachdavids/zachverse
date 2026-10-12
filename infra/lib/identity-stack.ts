@@ -36,6 +36,7 @@ export class IdentityStack extends Stack {
         StringEquals: {
           'token.actions.githubusercontent.com:aud': GITHUB_OIDC_AUDIENCE,
           'token.actions.githubusercontent.com:sub': githubOidcSubject(github),
+          'token.actions.githubusercontent.com:ref': github.deployRef,
         },
       }),
     });

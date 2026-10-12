@@ -37,7 +37,7 @@ describe.each(Object.entries(modes))('every stack (%s)', (_mode, config) => {
   });
 
   it.each(each)('%s trusts GitHub only for the production environment subject', (_name, s) => {
-    expect(githubTrustViolations(s.json, githubOidcSubject(production.github))).toEqual([]);
+    expect(githubTrustViolations(s.json, githubOidcSubject(production.github), production.github.deployRef)).toEqual([]);
   });
 
   it('gives the GitHub deploy role only website publishing permissions', () => {

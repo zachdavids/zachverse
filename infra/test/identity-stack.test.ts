@@ -26,7 +26,7 @@ describe('identity stack', () => {
     });
   });
 
-  it('lets only production-environment jobs from this repository assume the deploy role', () => {
+  it('lets only production-environment jobs on main in this repository assume the deploy role', () => {
     expect(resources[ROLE]!.Properties!.AssumeRolePolicyDocument).toEqual({
       Version: '2012-10-17',
       Statement: [
@@ -39,6 +39,8 @@ describe('identity stack', () => {
               'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
               'token.actions.githubusercontent.com:sub':
                 'repo:zachdavids@43345768/zachverse@1414719760:environment:production',
+              // The environment subject names no branch, so the ref is checked separately.
+              'token.actions.githubusercontent.com:ref': 'refs/heads/main',
             },
           },
         },

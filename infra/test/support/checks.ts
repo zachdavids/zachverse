@@ -167,10 +167,10 @@ function isGitHubOidcPrincipal(template: CfnTemplate, federated: Json): boolean 
 }
 
 /**
- * Every role trusting GitHub's OIDC provider must require the STS audience and
- * exactly the expected subject (no wildcards, no StringLike).
+ * Every role trusting GitHub's OIDC provider must require the STS audience,
+ * exactly the expected subject, and the expected ref (no wildcards, no StringLike).
  */
-export function githubTrustViolations(template: CfnTemplate, expectedSubject: string): string[] {
+export function githubTrustViolations(template: CfnTemplate, expectedSubject: string, expectedRef: string): string[] {
   const out: string[] = [];
   for (const [id, role] of resourcesOf(template, (r) => r.Type === 'AWS::IAM::Role')) {
     for (const statement of asArray<Json>(role.Properties?.AssumeRolePolicyDocument?.Statement)) {
@@ -189,6 +189,7 @@ export function githubTrustViolations(template: CfnTemplate, expectedSubject: st
       if (equals[`${GITHUB_OIDC_HOST}:sub`] !== expectedSubject) {
         out.push(`${id}: subject must be exactly ${expectedSubject}`);
       }
+      if (equals[`${GITHUB_OIDC_HOST}:ref`] !== expectedRef) out.push(`${id}: ref must be exactly ${expectedRef}`);
     }
   }
   return out;
