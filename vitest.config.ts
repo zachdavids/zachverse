@@ -8,8 +8,15 @@ export default defineConfig({
     environment: 'node',
     coverage: {
       provider: 'v8',
-      // Every source file counts, including ones no test imports.
-      include: ['src/**/*.{ts,tsx}', 'scripts/**/*.ts'],
+      // Every source file counts, including ones no test imports, in any
+      // extension tsc, Vite or Node accepts. tests/repo-policy.test.ts requires
+      // the first two globs as written.
+      include: [
+        'src/**/*.{ts,tsx}',
+        'scripts/**/*.ts',
+        'src/**/*.{mts,cts,js,jsx,mjs,cjs}',
+        'scripts/**/*.{tsx,mts,cts,js,jsx,mjs,cjs}',
+      ],
       exclude: ['**/*.test.{ts,tsx}'],
       reporter: ['text', 'json-summary'],
       thresholds: { 100: true },

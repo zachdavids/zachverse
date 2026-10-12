@@ -4,15 +4,25 @@ import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { prerender, prerenderPages, renderDocument } from './prerender-lib.ts';
+import { escapeHtml, prerender, prerenderPages, renderDocument } from './prerender-lib.ts';
 
 const template = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const [home, notFound] = prerenderPages;
 
+describe('escapeHtml', () => {
+  it('escapes the characters React escapes in text and attribute values', () => {
+    expect(escapeHtml(`Tom & "Jerry's" <Show>`)).toBe('Tom &amp; &quot;Jerry&#x27;s&quot; &lt;Show&gt;');
+    expect(escapeHtml('&lt;')).toBe('&amp;lt;');
+  });
+});
+
 describe('renderDocument', () => {
-  it('fills the title, head, page id, and markup for the home page', () => {
+  it('fills the title, description, head, page id, and markup for the home page', () => {
     const html = renderDocument(template, home!, '<main>hello</main>');
     expect(html).toContain('<title>Zachverse — Zach Davids</title>');
+    expect(html).toContain(
+      '<meta name="description" content="Zach Davids, Senior Software Engineer at Amazon. Interactive portfolio coming soon." />',
+    );
     expect(html).toContain('<link rel="canonical" href="https://zachdavids.com/" />');
     expect(html).toContain('<div id="root" data-page="home"><main>hello</main></div>');
     expect(html).not.toContain('<!--app-');
@@ -25,6 +35,12 @@ describe('renderDocument', () => {
     expect(html).toContain('<meta name="robots" content="noindex" />');
     expect(html).toContain('data-page="not-found"');
     expect(html).not.toContain('rel="canonical"');
+  });
+
+  it("replaces the template's description with the page's, escaped for the attribute", () => {
+    const html = renderDocument(template, { ...home!, description: `Zach's "notes" & <demos>` }, '<main />');
+    expect(html).toContain('<meta name="description" content="Zach&#x27;s &quot;notes&quot; &amp; &lt;demos&gt;" />');
+    expect(html.match(/<meta name="description"/g)).toHaveLength(1);
   });
 
   it('rejects empty markup and templates without the expected markers', () => {
@@ -47,10 +63,25 @@ describe('renderDocument', () => {
     expect(() => renderDocument(twoHeadMarkers, home!, '<main />')).toThrow(
       'Expected exactly one <!--app-head--> in the HTML template, found 2',
     );
+    const withoutDescription = template.replace(/<meta name="description"[^>]*>/, '');
+    expect(() => renderDocument(withoutDescription, home!, '<main />')).toThrow(
+      'Expected exactly one /<meta name="description" content="[^"]*" \\/>/ in the HTML template, found 0',
+    );
   });
 
   it('does not interpret $ patterns in rendered markup', () => {
     expect(renderDocument(template, home!, '<p>$& $1</p>')).toContain('<p>$& $1</p>');
+  });
+
+  // An accessible SVG icon has a <title> of its own; only the template's markers count.
+  it.each(prerenderPages)('inserts markup that repeats the template markers verbatim into $file', (page) => {
+    const markup =
+      '<main><svg role="img"><title>GitHub</title></svg><!--app-head--><p data-page="home"></p>' +
+      '<meta name="description" content="" /></main>';
+    const html = renderDocument(template, page, markup);
+    expect(html).toContain(`<div id="root" data-page="${page.id}">${markup}</div>`);
+    expect(html).toContain(`<title>${page.title}</title>`);
+    expect(html).toContain(page.head);
   });
 });
 

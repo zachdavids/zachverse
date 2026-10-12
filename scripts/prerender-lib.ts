@@ -5,6 +5,7 @@ export interface PrerenderPage {
   id: 'home' | 'not-found';
   file: string;
   title: string;
+  description: string;
   head: string;
 }
 
@@ -13,12 +14,14 @@ export const prerenderPages: readonly PrerenderPage[] = [
     id: 'home',
     file: 'index.html',
     title: site.title,
+    description: site.description,
     head: `<link rel="canonical" href="${site.origin}/" />`,
   },
   {
     id: 'not-found',
     file: '404.html',
     title: site.notFoundTitle,
+    description: site.description,
     head: '<meta name="robots" content="noindex" />',
   },
 ];
@@ -28,7 +31,14 @@ const markers = {
   html: '<!--app-html-->',
   page: 'data-page="home"',
   title: /<title>[^<]*<\/title>/,
+  description: /<meta name="description" content="[^"]*" \/>/,
 };
+
+// Escapes text or an attribute value the way React's server renderer does.
+export function escapeHtml(value: string): string {
+  const entities: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
+  return value.replace(/[&<>"']/g, (char) => entities[char]!);
+}
 
 function replaceOnce(source: string, search: string | RegExp, value: string): string {
   const count =
@@ -39,9 +49,12 @@ function replaceOnce(source: string, search: string | RegExp, value: string): st
 
 export function renderDocument(template: string, page: PrerenderPage, appHtml: string): string {
   if (!appHtml.trim()) throw new Error(`Prerendered markup for "${page.id}" is empty`);
+  const description = escapeHtml(page.description);
   let html = replaceOnce(template, markers.title, `<title>${page.title}</title>`);
+  html = replaceOnce(html, markers.description, `<meta name="description" content="${description}" />`);
   html = replaceOnce(html, markers.head, page.head);
   html = replaceOnce(html, markers.page, `data-page="${page.id}"`);
+  // Last, so the marker counts never see the markup, such as an SVG <title>.
   return replaceOnce(html, markers.html, appHtml);
 }
 

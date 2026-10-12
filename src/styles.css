@@ -56,6 +56,11 @@ body {
   background: var(--card);
 }
 
+/* Keeps the bottom padding even with the top, whatever element ends the card. */
+.card > :last-child {
+  margin-bottom: 0;
+}
+
 .eyebrow {
   margin: 0 0 0.5rem;
   color: var(--muted);

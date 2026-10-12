@@ -15,4 +15,6 @@ export const site = {
   origin: 'https://zachdavids.com',
   title: 'Zachverse — Zach Davids',
   notFoundTitle: 'Page not found — Zachverse',
+  // The meta description, which search results and link previews show.
+  description: `${profile.name}, ${profile.role}. ${profile.status}`,
 } as const;

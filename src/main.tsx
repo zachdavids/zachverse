@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { hydrateRoot } from 'react-dom/client';
+import { createRoot, hydrateRoot } from 'react-dom/client';
 import { App, isPageId } from './App.tsx';
 import './styles.css';
 
@@ -8,10 +8,12 @@ if (!root) throw new Error('Missing #root element');
 
 // The prerender step records which page it rendered so hydration matches it.
 const page = isPageId(root.dataset.page) ? root.dataset.page : 'home';
-
-hydrateRoot(
-  root,
+const app = (
   <StrictMode>
     <App page={page} />
-  </StrictMode>,
+  </StrictMode>
 );
+
+// `npm run dev` serves the template unrendered, so there is nothing to hydrate.
+if (root.firstElementChild) hydrateRoot(root, app);
+else createRoot(root).render(app);

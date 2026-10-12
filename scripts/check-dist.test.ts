@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const checkDist = vi.hoisted(() => vi.fn<(dist: URL) => string[]>());
+const checkDist = vi.hoisted(() => vi.fn<(rootDir: URL) => string[]>());
 vi.mock('./check-dist-lib.ts', () => ({ checkDist }));
 
 describe('check-dist script', () => {
@@ -25,15 +25,15 @@ describe('check-dist script', () => {
   // Each import runs the script once, as `node scripts/check-dist.ts` does.
   const run = () => import('./check-dist.ts');
 
-  it('checks the repository dist directory and reports success', async () => {
+  it("checks the repository's build and reports success", async () => {
     checkDist.mockReturnValue([]);
     const { exit, error, log } = captureOutput();
 
     await run();
 
-    expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../dist/', import.meta.url));
+    expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url));
     expect(log).toHaveBeenCalledExactlyOnceWith(
-      'dist check passed: prerendered content, 404 page, robots.txt, sitemap.xml, hashed assets',
+      'dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets',
     );
     expect(error).not.toHaveBeenCalled();
     expect(exit).not.toHaveBeenCalled();
