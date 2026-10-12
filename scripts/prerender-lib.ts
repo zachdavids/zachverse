@@ -1,3 +1,4 @@
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { site } from '../src/content.ts';
 
 export interface PrerenderPage {
@@ -42,4 +43,23 @@ export function renderDocument(template: string, page: PrerenderPage, appHtml: s
   html = replaceOnce(html, markers.head, page.head);
   html = replaceOnce(html, markers.page, `data-page="${page.id}"`);
   return replaceOnce(html, markers.html, appHtml);
+}
+
+// Renders every page into rootDir's dist/ with the SSR bundle in dist-ssr/,
+// then deletes dist-ssr/. rootDir is a directory URL ending in "/".
+export async function prerender(rootDir: URL): Promise<void> {
+  const distDir = new URL('dist/', rootDir);
+  const ssrDir = new URL('dist-ssr/', rootDir);
+
+  const template = await readFile(new URL('index.html', distDir), 'utf8');
+  const { render } = (await import(new URL('entry-server.js', ssrDir).href)) as {
+    render: (page: string) => string;
+  };
+
+  for (const page of prerenderPages) {
+    await writeFile(new URL(page.file, distDir), renderDocument(template, page, render(page.id)));
+    console.log(`prerendered ${page.id} -> dist/${page.file}`);
+  }
+
+  await rm(ssrDir, { recursive: true, force: true });
 }

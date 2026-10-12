@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   dnsWriteViolations,
   freePlanViolations,
@@ -6,6 +7,9 @@ import {
   retentionViolations,
 } from './support/checks';
 import { productionConfig, synthesizeAll, TEST_WEB_ACL_ARN } from './support/synth';
+
+// CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
+afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const modes = {
   'pay-as-you-go': productionConfig(),

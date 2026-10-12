@@ -31,8 +31,8 @@ jobs:
       - run: npm ci
       - name: Typecheck
         run: npm run typecheck
-      - name: Unit tests
-        run: npm test
+      - name: Unit tests (100% coverage required)
+        run: npm run test:coverage
       - name: Build and prerender
         run: npm run build
       - name: Check prerendered output
@@ -57,5 +57,5 @@ jobs:
       - run: npm ci
       - name: Typecheck
         run: npm run typecheck
-      - name: Synthesized template checks
-        run: npm test
+      - name: Synthesized template checks (100% coverage required)
+        run: npm run test:coverage

@@ -22,6 +22,7 @@ npm ci
 npm run dev          # local dev server
 npm run typecheck
 npm test             # Vitest
+npm run test:coverage  # Vitest with the 100% coverage gate CI enforces
 npm run build        # client build, SSR build, prerender into dist/
 npm run check:dist   # verify prerendered HTML, 404 page, robots.txt, sitemap, assets
 
@@ -29,4 +30,5 @@ cd infra
 npm ci
 npm run typecheck
 npm test             # synthesizes the stacks and runs the guardrail checks
+npm run test:coverage  # the same, with the 100% coverage gate CI enforces
 ```

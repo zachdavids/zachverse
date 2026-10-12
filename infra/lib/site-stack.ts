@@ -105,6 +105,9 @@ export class SiteStack extends Stack {
   }
 }
 
+// ACM certificate IDs are UUIDs.
+const CERTIFICATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 function requireCertificateArn(config: SiteConfig): string {
   const arn = config.certificateArn;
   if (!arn) {
@@ -120,6 +123,10 @@ function requireCertificateArn(config: SiteConfig): string {
     parsed.account !== config.account
   ) {
     throw new Error(`certificateArn must be an ACM certificate in us-east-1 owned by ${config.account}: ${arn}`);
+  }
+  // A truncated or padded paste would otherwise synthesize and fail only at deploy time.
+  if (!CERTIFICATE_ID.test(parsed.resourceName ?? '')) {
+    throw new Error(`certificateArn must end in the certificate ID (a UUID): ${arn}`);
   }
   return arn;
 }

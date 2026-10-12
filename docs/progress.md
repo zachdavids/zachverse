@@ -4,7 +4,7 @@ One branch and one pull request per milestone (milestones 1 and 2 share PR #2). 
 
 | # | Milestone | Status | PR / evidence |
 | --- | --- | --- | --- |
-| 1–2 | Repository skeleton; infrastructure checks | In review; CI green | [#2](https://github.com/zachdavids/zachverse/pull/2) |
+| 1–2 | Repository skeleton; infrastructure checks | In review; CI requires 100% unit-test coverage in both packages | [#2](https://github.com/zachdavids/zachverse/pull/2) |
 | 3 | CDK bootstrap and GitHub OIDC identity stack | Blocked on SCP `p-ie47xwqg` (ADR 0002) | GitHub `production` environment created 2026-10-11: `main` only, no admin bypass |
 | 4 | Initial site deployment (no WAF or plan) | Not started | — |
 | 5 | GitHub environment variables and deploy workflow | Not started | — |

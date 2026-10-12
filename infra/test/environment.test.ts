@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { afterAll, describe, expect, it } from 'vitest';
 import { productionConfig, synthesizeAll, TEST_WEB_ACL_ARN } from './support/synth';
+
+// CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
+afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const EXPECTED_ACCOUNT = '426499248998';
 // Every stack and regional resource lives in us-east-1 (docs/adr/0002).
@@ -20,6 +24,13 @@ describe('stack environments', () => {
       expect(stack.terminationProtection).toBe(true);
     },
   );
+
+  it('describes the site stack by its domain', () => {
+    const [site] = stacks;
+    expect(site!.template.toJSON().Description).toBe(
+      'Zachverse website hosting for zachdavids.com: S3 origin and CloudFront distribution',
+    );
+  });
 });
 
 // Changing a logical ID makes CloudFormation replace the resource (for the

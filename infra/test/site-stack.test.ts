@@ -1,13 +1,17 @@
-import { Match } from 'aws-cdk-lib/assertions';
-import { describe, expect, it } from 'vitest';
-import { production } from '../lib/config';
+import { Annotations, Match } from 'aws-cdk-lib/assertions';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { afterAll, describe, expect, it } from 'vitest';
 import { productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+
+// CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
+afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
 const BUCKET = 'SiteBucket397A1860';
+const VIEWER_REQUEST_FUNCTION = 'ViewerRequestFunction48E73F66';
 
 describe('site stack (pay-as-you-go)', () => {
-  const { template, json } = synthesizeSite();
+  const { stack, template, json } = synthesizeSite();
   const distributionConfig = () => json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
 
   it('keeps the bucket private: Block Public Access on, no static website hosting', () => {
@@ -20,6 +24,18 @@ describe('site stack (pay-as-you-go)', () => {
       },
       OwnershipControls: { Rules: [{ ObjectOwnership: 'BucketOwnerEnforced' }] },
       WebsiteConfiguration: Match.absent(),
+    });
+  });
+
+  it('encrypts objects with S3-managed keys and expires only noncurrent versions, after 90 days', () => {
+    // Exact matches: a partial match would accept a rule that also expires the live site.
+    const bucket = json.Resources[BUCKET]!.Properties!;
+    expect(bucket.BucketEncryption).toEqual({
+      ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }],
+    });
+    expect(bucket.VersioningConfiguration).toEqual({ Status: 'Enabled' });
+    expect(bucket.LifecycleConfiguration).toEqual({
+      Rules: [{ Id: 'ExpireOldVersions', NoncurrentVersionExpiration: { NoncurrentDays: 90 }, Status: 'Enabled' }],
     });
   });
 
@@ -60,7 +76,7 @@ describe('site stack (pay-as-you-go)', () => {
     expect(behavior.ViewerProtocolPolicy).toBe('redirect-to-https');
     expect(behavior.AllowedMethods).toEqual(['GET', 'HEAD']);
     expect(behavior.FunctionAssociations).toEqual([
-      { EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': ['ViewerRequestFunction48E73F66', 'FunctionARN'] } },
+      { EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': [VIEWER_REQUEST_FUNCTION, 'FunctionARN'] } },
     ]);
     template.hasResourceProperties('AWS::CloudFront::Function', {
       AutoPublish: true,
@@ -69,14 +85,23 @@ describe('site stack (pay-as-you-go)', () => {
     });
   });
 
-  it('serves both hostnames with the us-east-1 certificate over TLS 1.2+', () => {
+  it('caches GET and HEAD with CachingOptimized, compresses, and adds the managed security headers', () => {
+    const behavior = distributionConfig().DefaultCacheBehavior;
+    expect(behavior.CachedMethods).toEqual(['GET', 'HEAD']);
+    expect(behavior.CachePolicyId).toBe('658327ea-f89d-4fab-a63d-7e88639e58f6'); // CachingOptimized
+    expect(behavior.ResponseHeadersPolicyId).toBe('67f7725c-6f97-4210-82d7-5512b31e9d03'); // SecurityHeadersPolicy
+    expect(behavior.Compress).toBe(true);
+  });
+
+  it('serves both hostnames with the us-east-1 certificate over TLS 1.2+, HTTP/2 and HTTP/3, and IPv6', () => {
     const config = distributionConfig();
     expect(config.Aliases).toEqual(['zachdavids.com', 'www.zachdavids.com']);
     expect(config.ViewerCertificate).toEqual({
-      AcmCertificateArn: TEST_CERTIFICATE_ARN,
+      AcmCertificateArn: productionConfig().certificateArn,
       MinimumProtocolVersion: 'TLSv1.2_2021',
       SslSupportMethod: 'sni-only',
     });
+    expect(config.HttpVersion).toBe('http2and3');
     expect(config.IPV6Enabled).toBe(true);
   });
 
@@ -85,15 +110,34 @@ describe('site stack (pay-as-you-go)', () => {
     template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
   });
 
+  it('tags the bucket, distribution, and function with the project', () => {
+    for (const id of [BUCKET, DISTRIBUTION, VIEWER_REQUEST_FUNCTION]) {
+      expect(json.Resources[id]!.Properties!.Tags ?? [], id).toContainEqual({ Key: 'project', Value: 'zachverse' });
+    }
+  });
+
   it('exports the values the deploy workflow needs', () => {
-    expect(Object.keys(json.Outputs ?? {}).sort()).toEqual(['DistributionDomainName', 'DistributionId', 'SiteBucketName']);
+    expect(json.Outputs).toEqual({
+      SiteBucketName: { Value: { Ref: BUCKET } },
+      DistributionId: { Value: { Ref: DISTRIBUTION } },
+      DistributionDomainName: { Value: { 'Fn::GetAtt': [DISTRIBUTION, 'DomainName'] } },
+    });
+  });
+
+  // Error annotations already fail synthesis (@aws-cdk/core:annotationsInValidationReport in cdk.json).
+  it('synthesizes without warnings (the bucket-listing warning is acknowledged)', () => {
+    expect(Annotations.fromStack(stack).findWarning('*', Match.anyValue())).toEqual([]);
   });
 });
 
 describe('site stack (Free flat-rate plan enabled)', () => {
-  const { template, json } = synthesizeSite(
+  const { stack, template, json } = synthesizeSite(
     productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
   );
+
+  it('synthesizes without warnings', () => {
+    expect(Annotations.fromStack(stack).findWarning('*', Match.anyValue())).toEqual([]);
+  });
 
   it('attaches the intended web ACL to the distribution', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
@@ -110,22 +154,77 @@ describe('site stack (Free flat-rate plan enabled)', () => {
       ResourceArns: [
         { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: DISTRIBUTION }]] },
         TEST_WEB_ACL_ARN,
-        `arn:aws:route53:::hostedzone/${production.hostedZoneId}`,
+        // The existing zone from docs/adr/0002.
+        'arn:aws:route53:::hostedzone/Z03492543O0YEY0RDZZ0J',
       ],
     });
   });
 });
 
 describe('site stack configuration errors', () => {
-  it('refuses to synthesize without a certificate', () => {
-    expect(() => synthesizeSite({ ...production, certificateArn: undefined })).toThrow(/certificateArn is not set/);
+  // toThrow('text') only checks for a substring, so pass the whole message.
+  const error = (message: unknown) => expect.objectContaining({ message });
+  const synthesizeWith = (certificateArn: string | undefined) => () =>
+    synthesizeSite(productionConfig({ certificateArn }));
+
+  it.each([
+    ['missing', undefined],
+    ['empty', ''],
+  ])('refuses to synthesize when the certificate ARN is %s', (_case, certificateArn) => {
+    expect(synthesizeWith(certificateArn)).toThrow(
+      error(
+        'certificateArn is not set. Request the us-east-1 ACM certificate and add its ARN to infra/lib/config.ts (docs/adr/0002).',
+      ),
+    );
+  });
+
+  // Each ARN changes one part of TEST_CERTIFICATE_ARN, which every other test synthesizes successfully.
+  it.each([
+    ['another service', TEST_CERTIFICATE_ARN.replace(':acm:', ':acm-pca:')],
+    ['another ACM resource type', TEST_CERTIFICATE_ARN.replace(':certificate/', ':certificate-authority/')],
+    ['another Region', TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:')],
+    ['another account', TEST_CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:')],
+  ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
+    expect(certificateArn).not.toBe(TEST_CERTIFICATE_ARN);
+    expect(synthesizeWith(certificateArn)).toThrow(
+      error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
+    );
+  });
+
+  // Paste errors that CloudFront would otherwise reject only at deploy time.
+  it.each([
+    ['no certificate ID', TEST_CERTIFICATE_ARN.replace(/\/.*$/, '')],
+    ['an empty certificate ID', TEST_CERTIFICATE_ARN.replace(/\/.*$/, '/')],
+    ['a truncated certificate ID', TEST_CERTIFICATE_ARN.slice(0, -1)],
+    ['a trailing newline', `${TEST_CERTIFICATE_ARN}\n`],
+    ['an extra path segment', `${TEST_CERTIFICATE_ARN}/extra`],
+    ['the ARN pasted twice', TEST_CERTIFICATE_ARN.repeat(2)],
+  ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
+    expect(certificateArn).not.toBe(TEST_CERTIFICATE_ARN);
+    expect(synthesizeWith(certificateArn)).toThrow(
+      error(`certificateArn must end in the certificate ID (a UUID): ${certificateArn}`),
+    );
   });
 
   it.each([
-    ['another Region', TEST_CERTIFICATE_ARN.replace('us-east-1', 'us-east-2')],
-    ['another account', TEST_CERTIFICATE_ARN.replace(production.account, '111111111111')],
-    ['another service', TEST_WEB_ACL_ARN],
-  ])('rejects a certificate from %s', (_case, certificateArn) => {
-    expect(() => synthesizeSite(productionConfig({ certificateArn }))).toThrow(/must be an ACM certificate in us-east-1/);
+    ['a bare certificate ID', '00000000-0000-0000-0000-000000000000'],
+    ['an ARN cut off before the resource', 'arn:aws:acm:us-east-1:426499248998'],
+  ])('rejects %s as malformed, naming it', (_case, certificateArn) => {
+    // aws-cdk-lib's ARN parser words these errors, so pin only the value they name.
+    expect(synthesizeWith(certificateArn)).toThrow(error(expect.stringContaining(certificateArn)));
+  });
+
+  it('checks ownership against the configured account', () => {
+    const otherAccount = productionConfig({ account: '111111111111', certificateArn: TEST_CERTIFICATE_ARN });
+    expect(() => synthesizeSite(otherAccount)).toThrow(
+      error(`certificateArn must be an ACM certificate in us-east-1 owned by 111111111111: ${TEST_CERTIFICATE_ARN}`),
+    );
+  });
+
+  it('requires a us-east-1 certificate even when the stack targets another Region', () => {
+    const certificateArn = TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
+    expect(() => synthesizeSite(productionConfig({ region: 'us-east-2', certificateArn }))).toThrow(
+      error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
+    );
   });
 });

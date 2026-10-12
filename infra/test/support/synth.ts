@@ -31,6 +31,7 @@ export interface CfnResource {
 }
 
 export interface CfnTemplate {
+  Transform?: unknown;
   Resources: Record<string, CfnResource>;
   Outputs?: Record<string, unknown>;
 }

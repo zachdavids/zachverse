@@ -1,6 +1,7 @@
 // Guardrail checks over synthesized CloudFormation templates. Each returns a
 // list of human-readable violations (empty = pass), so the same functions can
 // be pointed at deliberately bad templates to prove they detect problems.
+import { ACM_VALIDATION_NAME } from './dns-batch';
 import type { CfnResource, CfnTemplate } from './synth';
 
 type Json = any;
@@ -16,10 +17,15 @@ function resourcesOf(template: CfnTemplate, predicate: (r: CfnResource) => boole
 // Prohibited resources
 // ---------------------------------------------------------------------------
 
+// The first matching rule gives the reason.
 const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
   {
     matches: (t) => t.startsWith('AWS::Route53::') || t.startsWith('AWS::Route53Domains::'),
     reason: 'hosted zones, DNS records, and domains are managed outside CDK (reviewed batches in infra/dns/)',
+  },
+  {
+    matches: (t) => t === 'AWS::Amplify::Domain' || t.startsWith('AWS::ServiceDiscovery::'),
+    reason: 'Amplify domains and Cloud Map write DNS records themselves, bypassing the reviewed batches in infra/dns/',
   },
   {
     matches: (t) => t.startsWith('Custom::') || t === 'AWS::CloudFormation::CustomResource',
@@ -34,11 +40,27 @@ const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
     reason: 'the CloudFront certificate lives in us-east-1 and is managed outside CloudFormation (ADR 0002)',
   },
   { matches: (t) => t === 'AWS::CloudFormation::StackSet', reason: 'StackSets are not allowed in this project' },
+  {
+    matches: (t) => t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application',
+    reason: 'nested stacks are not checked by these guardrails',
+  },
+  {
+    // Registry extensions: third-party types such as Cloudflare::Dns::Record, private types, and modules.
+    matches: (t) => !t.startsWith('AWS::'),
+    reason: 'resource types outside the AWS namespace are not checked by these guardrails',
+  },
 ];
 
+const TRANSFORMED = 'transforms and macros rewrite the template during deployment, so these guardrails cannot see the result';
+
+/** Prohibited resources, and transforms that would hide what is actually deployed. */
 export function prohibitedResourceViolations(template: CfnTemplate): string[] {
   const violations: string[] = [];
+  if (template.Transform !== undefined) violations.push(`Transform ${JSON.stringify(template.Transform)}: ${TRANSFORMED}`);
+  // Fn::Transform (AWS::Include or a macro) can appear at any level, including in place of a resource.
+  if (JSON.stringify(template).includes('"Fn::Transform":')) violations.push(`Fn::Transform: ${TRANSFORMED}`);
   for (const [id, resource] of Object.entries(template.Resources ?? {})) {
+    if (id === 'Fn::Transform') continue;
     const rule = PROHIBITED.find((r) => r.matches(resource.Type));
     if (rule) violations.push(`${id} (${resource.Type}): ${rule.reason}`);
   }
@@ -58,58 +80,146 @@ export function retentionViolations(template: CfnTemplate): string[] {
 
 export interface DnsWriteAllowance {
   hostedZoneId: string;
-  /** Exact ACM validation record names (lower case, trailing dot optional). */
+  /** ACM validation record names, in any case, trailing dot optional. Any other name is ignored. */
   validationRecordNames: string[];
 }
 
+/** IAM action matching: case-insensitive; `*` matches any run of characters and `?` any one character. */
 function wildcardMatches(pattern: string, action: string): boolean {
-  const regex = new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i');
-  return regex.test(action);
+  const source = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${source}$`, 'i').test(action);
 }
 
+// Every Route 53 and Route 53 Domains API action except the reads (Get*, List*, Check*, TestDNSAnswer,
+// ViewBilling), from the API Reference operation lists, read 2026-10-12. Add new write actions here so
+// wildcards find them too; one granted by name already counts as a write (isUnlistedRoute53Write).
 const ROUTE53_WRITE_PROBES = [
-  'route53:ChangeResourceRecordSets',
-  'route53:CreateHostedZone',
-  'route53:DeleteHostedZone',
-  'route53:ChangeTagsForResource',
-  'route53:UpdateHostedZoneComment',
-  'route53domains:TransferDomain',
-  'route53domains:UpdateDomainNameservers',
+  ...[
+    'ActivateKeySigningKey', 'AssociateVPCWithHostedZone', 'ChangeCidrCollection', 'ChangeResourceRecordSets',
+    'ChangeTagsForResource', 'CreateCidrCollection', 'CreateHealthCheck', 'CreateHostedZone', 'CreateKeySigningKey',
+    'CreateQueryLoggingConfig', 'CreateReusableDelegationSet', 'CreateTrafficPolicy', 'CreateTrafficPolicyInstance',
+    'CreateTrafficPolicyVersion', 'CreateVPCAssociationAuthorization', 'DeactivateKeySigningKey', 'DeleteCidrCollection',
+    'DeleteHealthCheck', 'DeleteHostedZone', 'DeleteKeySigningKey', 'DeleteQueryLoggingConfig',
+    'DeleteReusableDelegationSet', 'DeleteTrafficPolicy', 'DeleteTrafficPolicyInstance',
+    'DeleteVPCAssociationAuthorization', 'DisableHostedZoneDNSSEC', 'DisassociateVPCFromHostedZone',
+    'EnableHostedZoneDNSSEC', 'UpdateHealthCheck', 'UpdateHostedZoneComment', 'UpdateHostedZoneFeatures',
+    'UpdateTrafficPolicyComment', 'UpdateTrafficPolicyInstance',
+  ].map((action) => `route53:${action}`),
+  ...[
+    'AcceptDomainTransferFromAnotherAwsAccount', 'AssociateDelegationSignerToDomain',
+    'CancelDomainTransferToAnotherAwsAccount', 'DeleteDomain', 'DeleteTagsForDomain', 'DisableDomainAutoRenew',
+    'DisableDomainTransferLock', 'DisassociateDelegationSignerFromDomain', 'EnableDomainAutoRenew',
+    'EnableDomainTransferLock', 'PushDomain', 'RegisterDomain', 'RejectDomainTransferFromAnotherAwsAccount',
+    'RenewDomain', 'ResendContactReachabilityEmail', 'ResendOperationAuthorization', 'RetrieveDomainAuthCode',
+    'TransferDomain', 'TransferDomainToAnotherAwsAccount', 'UpdateDomainContact', 'UpdateDomainContactPrivacy',
+    'UpdateDomainNameservers', 'UpdateTagsForDomain',
+  ].map((action) => `route53domains:${action}`),
 ];
+const ROUTE53_ACTION = /^route53(?:domains)?:/i;
+const ROUTE53_READ = /^route53(?:domains)?:(?:Get|List|Check|Test|View)/i;
+
+/** An action named exactly in either service that is neither a read nor listed above, such as one added since. */
+function isUnlistedRoute53Write(action: string): boolean {
+  return (
+    !/[*?]/.test(action) &&
+    ROUTE53_ACTION.test(action) &&
+    !ROUTE53_READ.test(action) &&
+    !ROUTE53_WRITE_PROBES.some((probe) => wildcardMatches(action, probe))
+  );
+}
+
+/** Resources whose PolicyDocument grants permissions to IAM identities. */
+const POLICY_DOCUMENT_TYPES = new Set([
+  'AWS::IAM::Policy',
+  'AWS::IAM::ManagedPolicy',
+  'AWS::IAM::RolePolicy',
+  'AWS::IAM::UserPolicy',
+  'AWS::IAM::GroupPolicy',
+]);
+const IDENTITY_TYPES = new Set(['AWS::IAM::Role', 'AWS::IAM::User', 'AWS::IAM::Group']);
 
 function policyDocuments(template: CfnTemplate): { where: string; document: Json }[] {
   const docs: { where: string; document: Json }[] = [];
   for (const [id, r] of Object.entries(template.Resources ?? {})) {
     const props = r.Properties ?? {};
-    if (r.Type === 'AWS::IAM::Policy' || r.Type === 'AWS::IAM::ManagedPolicy') {
-      docs.push({ where: id, document: props.PolicyDocument });
-    }
-    if (r.Type === 'AWS::IAM::Role' || r.Type === 'AWS::IAM::User' || r.Type === 'AWS::IAM::Group') {
-      for (const p of asArray<Json>(props.Policies)) docs.push({ where: `${id}/${p.PolicyName}`, document: p.PolicyDocument });
+    if (POLICY_DOCUMENT_TYPES.has(r.Type)) docs.push({ where: id, document: props.PolicyDocument });
+    if (IDENTITY_TYPES.has(r.Type)) {
+      for (const p of asArray<Json>(props.Policies)) {
+        // An entry (or the whole list) wrapped in Fn::If has no literal name.
+        const name = typeof p.PolicyName === 'string' ? p.PolicyName : '(computed)';
+        docs.push({ where: `${id}/${name}`, document: p.PolicyDocument });
+      }
     }
   }
   return docs;
 }
 
 /**
+ * Permissions granted from outside the template cannot be inspected: AWS managed or
+ * imported managed policies, groups defined elsewhere, and IAM Identity Center.
+ */
+function unverifiableGrantViolations(template: CfnTemplate): string[] {
+  const resources = template.Resources ?? {};
+  const definedHere = (value: Json, type: string) => typeof value?.Ref === 'string' && resources[value.Ref]?.Type === type;
+  const out: string[] = [];
+  for (const [id, r] of Object.entries(resources)) {
+    const props = r.Properties ?? {};
+    if (IDENTITY_TYPES.has(r.Type)) {
+      for (const arn of asArray<Json>(props.ManagedPolicyArns)) {
+        if (!definedHere(arn, 'AWS::IAM::ManagedPolicy')) {
+          out.push(`${id}: managed policy ${JSON.stringify(arn)} is not defined in this stack, so it cannot be verified`);
+        }
+      }
+    }
+    // A user also gets the permissions of every group it joins.
+    const groups =
+      r.Type === 'AWS::IAM::User' ? props.Groups : r.Type === 'AWS::IAM::UserToGroupAddition' ? props.GroupName : undefined;
+    for (const group of asArray<Json>(groups)) {
+      if (!definedHere(group, 'AWS::IAM::Group')) {
+        out.push(`${id}: group ${JSON.stringify(group)} is not defined in this stack, so it cannot be verified`);
+      }
+    }
+    if (/^AWS::SSO::/.test(r.Type)) out.push(`${id} (${r.Type}): IAM Identity Center permissions cannot be verified`);
+  }
+  return out;
+}
+
+/**
  * Any IAM permission that can change DNS must be limited to UPSERT/CREATE of
  * CNAMEs with the exact ACM validation names in the one existing zone. With
- * no allowance (the current design) any Route 53 write is a violation.
+ * no allowance (the current design) any Route 53 write is a violation, and so
+ * is any permission the check cannot read: NotAction, computed actions or
+ * documents, and managed policies, groups, or Identity Center permissions from
+ * outside the stack. It does not model privilege escalation, such as
+ * iam:PutRolePolicy or sts:AssumeRole into a role that can write DNS.
  */
 export function dnsWriteViolations(template: CfnTemplate, allowance?: DnsWriteAllowance): string[] {
-  const violations: string[] = [];
+  const violations = unverifiableGrantViolations(template);
   for (const { where, document } of policyDocuments(template)) {
-    for (const statement of asArray<Json>(document?.Statement)) {
-      if (statement.Effect !== 'Allow') continue;
+    // A document wrapped in Fn::If, or given as a JSON string, has no readable Statement.
+    if (document?.Statement === undefined) {
+      violations.push(`${where}: a computed or missing PolicyDocument cannot be verified`);
+      continue;
+    }
+    for (const statement of asArray<Json>(document.Statement)) {
+      // Only a literal Deny is skipped: a computed Effect may resolve to Allow.
+      if (statement.Effect === 'Deny') continue;
       if (statement.NotAction !== undefined) {
         violations.push(`${where}: Allow with NotAction is too broad to verify`);
         continue;
       }
-      const actions = asArray<string>(statement.Action).filter((a) => typeof a === 'string');
-      const grants = ROUTE53_WRITE_PROBES.filter((probe) => actions.some((a) => wildcardMatches(a, probe)));
+      const actions = asArray<Json>(statement.Action);
+      if (actions.length === 0 || actions.some((a) => typeof a !== 'string')) {
+        violations.push(`${where}: Allow with a computed or missing Action is too broad to verify`);
+        continue;
+      }
+      const grants = [
+        ...ROUTE53_WRITE_PROBES.filter((probe) => actions.some((a) => wildcardMatches(a, probe))),
+        ...actions.filter(isUnlistedRoute53Write),
+      ].sort();
       if (grants.length === 0) continue;
       const onlyRecordChanges = grants.every((g) => g === 'route53:ChangeResourceRecordSets');
-      const exactActions = actions.every((a) => a === 'route53:ChangeResourceRecordSets' || !a.startsWith('route53'));
+      const exactActions = actions.every((a) => a === 'route53:ChangeResourceRecordSets' || !ROUTE53_ACTION.test(a));
       if (!allowance || !onlyRecordChanges || !exactActions) {
         violations.push(`${where}: grants Route 53 write access (${grants.join(', ')})`);
         continue;
@@ -127,10 +237,12 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
   if (resources.length !== 1 || resources[0] !== zoneArn) out.push(`${where}: Resource must be exactly ${zoneArn}`);
 
   const conditions = statement.Condition?.['ForAllValues:StringEquals'] ?? {};
-  const normalize = (n: string) => n.toLowerCase().replace(/\.$/, '');
-  const allowedNames = new Set(allowance.validationRecordNames.map(normalize));
+  // IAM compares normalized names (lower case, no trailing dot) case-sensitively, so only that form can match.
+  const allowedNames = new Set(
+    allowance.validationRecordNames.map((n) => n.toLowerCase().replace(/\.$/, '')).filter((n) => ACM_VALIDATION_NAME.test(n)),
+  );
   const names = asArray<string>(conditions['route53:ChangeResourceRecordSetsNormalizedRecordNames']);
-  if (names.length === 0 || names.some((n) => n.includes('*') || !allowedNames.has(normalize(n)))) {
+  if (names.length === 0 || names.some((n) => !allowedNames.has(n))) {
     out.push(`${where}: record names must be limited to the exact ACM validation names`);
   }
   const types = asArray<string>(conditions['route53:ChangeResourceRecordSetsRecordTypes']);
@@ -310,11 +422,18 @@ export function freePlanWebAclViolations(acl: Json): string[] {
   }
   for (const rule of rules) {
     const name = rule.Name ?? '(unnamed rule)';
-    if (rule.Action?.Captcha !== undefined) out.push(`${name}: CAPTCHA needs Pro or higher`);
-    if (rule.Action?.Challenge !== undefined) out.push(`${name}: JavaScript challenge needs Business or higher`);
-    if (rule.Action?.Block?.CustomResponse !== undefined) out.push(`${name}: custom WAF responses need Pro or higher`);
-    out.push(...statementViolations(rule.Statement ?? {}).map((v) => `${name}: ${v}`));
+    const ruleViolations = [...ruleActionViolations(rule.Action), ...statementViolations(rule.Statement ?? {})];
+    out.push(...ruleViolations.map((v) => `${name}: ${v}`));
   }
+  return out;
+}
+
+/** A rule's Action, or a rule group's ActionToUse override. */
+function ruleActionViolations(action: Json): string[] {
+  const out: string[] = [];
+  if (action?.Captcha !== undefined) out.push('CAPTCHA needs Pro or higher');
+  if (action?.Challenge !== undefined) out.push('JavaScript challenge needs Business or higher');
+  if (action?.Block?.CustomResponse !== undefined) out.push('custom WAF responses need Pro or higher');
   return out;
 }
 
@@ -323,6 +442,7 @@ function statementViolations(node: Json): string[] {
   const out: string[] = [];
   for (const [key, value] of Object.entries<Json>(node)) {
     if (key === 'RuleGroupReferenceStatement') out.push('rule groups are unsupported on pricing plans');
+    if (key === 'ActionToUse') out.push(...ruleActionViolations(value));
     if (key === 'RegexMatchStatement' || key === 'RegexPatternSetReferenceStatement') {
       out.push('regex-based filtering needs Business or higher');
     }

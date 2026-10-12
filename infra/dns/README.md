@@ -4,7 +4,7 @@ The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CD
 
 Website DNS changes are committed here as Route 53 change batches (the JSON for `aws route53 change-resource-record-sets --change-batch file://...`). Applying one is an administrative step; no stack or deploy role has DNS write access.
 
-Rules, enforced by `infra/test/dns-batches.test.ts` for every `*.json` file in this directory:
+Rules, enforced by `infra/test/dns-batches.test.ts` for every file in this directory and its subfolders except this README (the AWS CLI applies any file it is given, whatever its name):
 
 - Only two kinds of record may change: ACM validation CNAMEs (`_<32 hex>.zachdavids.com` / `_<32 hex>.www.zachdavids.com` pointing at `*.acm-validations.aws`), and website routing (apex `A`/`AAAA`, `www` `A`/`AAAA`/`CNAME`).
 - Aliases must target CloudFront (`Z2FDTNDATAQYW2`, `*.cloudfront.net`).
