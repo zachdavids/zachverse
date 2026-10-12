@@ -1,6 +1,7 @@
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as pricingplanmanager from 'aws-cdk-lib/aws-pricingplanmanager';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Annotations, Arn, ArnFormat, CfnOutput, Duration, RemovalPolicies, Stack, type StackProps, Tags } from 'aws-cdk-lib/core';
@@ -95,6 +96,31 @@ export class SiteStack extends Stack {
         ],
       });
     }
+
+    // The GitHub deploy role lives in the identity stack (deployed first); its
+    // permissions are defined here so they reference only this bucket and
+    // distribution and come into existence together with them (ADR 0004).
+    // No delete: routine releases never remove objects, and versioning keeps
+    // overwritten files recoverable.
+    new iam.Policy(this, 'SiteDeployPolicy', {
+      roles: [iam.Role.fromRoleName(this, 'SiteDeployRole', config.github.deployRoleName)],
+      statements: [
+        new iam.PolicyStatement({ actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn] }),
+        new iam.PolicyStatement({
+          actions: ['s3:GetObject', 's3:PutObject'],
+          resources: [this.bucket.arnForObjects('*')],
+        }),
+        new iam.PolicyStatement({
+          actions: [
+            'cloudfront:CreateInvalidation',
+            'cloudfront:GetInvalidation',
+            'cloudfront:ListInvalidations',
+            'cloudfront:GetDistribution',
+          ],
+          resources: [this.distribution.distributionArn],
+        }),
+      ],
+    });
 
     RemovalPolicies.of(this).retain();
     Tags.of(this).add('project', 'zachverse');

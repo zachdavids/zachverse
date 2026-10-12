@@ -9,15 +9,19 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Template } from 'aws-cdk-lib/assertions';
 import { App, RemovalPolicy, Stack } from 'aws-cdk-lib/core';
 import { describe, expect, it } from 'vitest';
+import { githubOidcSubject, production } from '../lib/config';
 import {
+  deployRoleViolations,
   dnsWriteViolations,
   freePlanViolations,
   freePlanWebAclViolations,
+  githubTrustViolations,
   prohibitedResourceViolations,
   retentionViolations,
+  WEBSITE_DEPLOY_ACTIONS,
 } from './support/checks';
 import type { CfnTemplate } from './support/synth';
-import { synthesizeSite } from './support/synth';
+import { synthesizeAll, synthesizeSite } from './support/synth';
 
 const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -258,5 +262,94 @@ describe('freePlanWebAclViolations', () => {
     const violations = freePlanViolations(template);
     expect(violations).toContain('Acl: Scope must be CLOUDFRONT');
     expect(violations.some((v) => v.startsWith('AclLogs'))).toBe(true);
+  });
+});
+
+describe('githubTrustViolations', () => {
+  const subject = githubOidcSubject(production.github);
+  const roleTrusting = (conditions: Record<string, unknown>, actions = ['sts:AssumeRoleWithWebIdentity']) =>
+    synth((s) => {
+      const provider = new iam.OidcProviderNative(s, 'GitHub', {
+        url: 'https://token.actions.githubusercontent.com',
+        clientIds: ['sts.amazonaws.com'],
+      });
+      const role = new iam.Role(s, 'Role', { assumedBy: new iam.WebIdentityPrincipal(provider.oidcProviderArn, conditions) });
+      if (actions.length > 1) {
+        (role.assumeRolePolicy as iam.PolicyDocument).addStatements(
+          new iam.PolicyStatement({ actions: ['sts:TagSession'], principals: [new iam.FederatedPrincipal(provider.oidcProviderArn)] }),
+        );
+      }
+    });
+
+  it('accepts the exact production-environment subject with the STS audience', () => {
+    const template = roleTrusting({
+      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': subject },
+    });
+    expect(githubTrustViolations(template, subject)).toEqual([]);
+  });
+
+  it.each([
+    ['a repository-wide wildcard', {
+      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com' },
+      StringLike: { 'token.actions.githubusercontent.com:sub': 'repo:zachdavids@43345768/zachverse@1414719760:*' },
+    }],
+    ['the old name-only subject format', {
+      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': 'repo:zachdavids/zachverse:environment:production' },
+    }],
+    ['a branch subject instead of the environment', {
+      StringEquals: { 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com', 'token.actions.githubusercontent.com:sub': 'repo:zachdavids@43345768/zachverse@1414719760:ref:refs/heads/main' },
+    }],
+    ['a missing audience', { StringEquals: { 'token.actions.githubusercontent.com:sub': subject } }],
+  ])('flags %s', (_case, conditions) => {
+    expect(githubTrustViolations(roleTrusting(conditions), subject).length).toBeGreaterThan(0);
+  });
+
+  it('flags trust statements that allow more than AssumeRoleWithWebIdentity', () => {
+    const template = roleTrusting({}, ['sts:AssumeRoleWithWebIdentity', 'sts:TagSession']);
+    expect(githubTrustViolations(template, subject).some((v) => v.includes('only sts:AssumeRoleWithWebIdentity'))).toBe(true);
+  });
+});
+
+describe('deployRoleViolations', () => {
+  const roleName = production.github.deployRoleName;
+  const withGrant = (statement: iam.PolicyStatement, managed = false) =>
+    synth((s) => {
+      const role = new iam.Role(s, 'Role', { roleName, assumedBy: new iam.AccountRootPrincipal() });
+      role.addToPolicy(statement);
+      if (managed) role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonS3FullAccess'));
+    });
+
+  it('passes the real stacks', () => {
+    const templates = synthesizeAll().map((s) => s.json);
+    expect(deployRoleViolations(templates, roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([]);
+  });
+
+  it.each([
+    ['s3:* on the bucket', new iam.PolicyStatement({ actions: ['s3:*'], resources: ['arn:aws:s3:::bucket/*'] })],
+    ['object deletion', new iam.PolicyStatement({ actions: ['s3:DeleteObject'], resources: ['arn:aws:s3:::bucket/x'] })],
+    ['a wildcard resource', new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: ['*'] })],
+    ['DNS changes', new iam.PolicyStatement({ actions: ['route53:ChangeResourceRecordSets'], resources: ['arn:aws:route53:::hostedzone/Z1'] })],
+    ['IAM administration', new iam.PolicyStatement({ actions: ['iam:PassRole'], resources: ['arn:aws:iam::426499248998:role/x'] })],
+    ['assuming the CDK roles', new iam.PolicyStatement({ actions: ['sts:AssumeRole'], resources: ['arn:aws:iam::426499248998:role/cdk-x'] })],
+    ['stack changes', new iam.PolicyStatement({ actions: ['cloudformation:UpdateStack'], resources: ['arn:aws:cloudformation:us-east-1:426499248998:stack/x/*'] })],
+  ])('flags %s', (_case, statement) => {
+    expect(deployRoleViolations([withGrant(statement)], roleName, WEBSITE_DEPLOY_ACTIONS).length).toBeGreaterThan(0);
+  });
+
+  it('flags managed policies on the role', () => {
+    const template = withGrant(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: ['arn:aws:s3:::bucket/x'] }), true);
+    expect(deployRoleViolations([template], roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([
+      expect.stringContaining('managed policies are not allowed'),
+    ]);
+  });
+
+  it('flags grants made from another stack by role name', () => {
+    const template = synth((s) => {
+      new iam.Policy(s, 'Elsewhere', {
+        roles: [iam.Role.fromRoleName(s, 'Imported', roleName)],
+        statements: [new iam.PolicyStatement({ actions: ['iam:CreateRole'], resources: ['*'] })],
+      });
+    });
+    expect(deployRoleViolations([template], roleName, WEBSITE_DEPLOY_ACTIONS).length).toBe(2);
   });
 });

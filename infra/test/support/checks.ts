@@ -143,6 +143,105 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
 }
 
 // ---------------------------------------------------------------------------
+// GitHub deploy role: trust and permissions
+// ---------------------------------------------------------------------------
+
+const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
+
+/** Everything routine website publishing needs: no delete, IAM, DNS, or stack actions. */
+export const WEBSITE_DEPLOY_ACTIONS: ReadonlySet<string> = new Set([
+  's3:ListBucket',
+  's3:GetObject',
+  's3:PutObject',
+  'cloudfront:CreateInvalidation',
+  'cloudfront:GetInvalidation',
+  'cloudfront:ListInvalidations',
+  'cloudfront:GetDistribution',
+]);
+
+function isGitHubOidcPrincipal(template: CfnTemplate, federated: Json): boolean {
+  if (typeof federated === 'string') return federated.includes(GITHUB_OIDC_HOST);
+  const ref = federated?.Ref;
+  const provider = typeof ref === 'string' ? template.Resources[ref] : undefined;
+  return provider?.Type === 'AWS::IAM::OIDCProvider' && String(provider.Properties?.Url).includes(GITHUB_OIDC_HOST);
+}
+
+/**
+ * Every role trusting GitHub's OIDC provider must require the STS audience and
+ * exactly the expected subject (no wildcards, no StringLike).
+ */
+export function githubTrustViolations(template: CfnTemplate, expectedSubject: string): string[] {
+  const out: string[] = [];
+  for (const [id, role] of resourcesOf(template, (r) => r.Type === 'AWS::IAM::Role')) {
+    for (const statement of asArray<Json>(role.Properties?.AssumeRolePolicyDocument?.Statement)) {
+      if (!isGitHubOidcPrincipal(template, statement.Principal?.Federated)) continue;
+      const actions = asArray<string>(statement.Action);
+      if (actions.length !== 1 || actions[0] !== 'sts:AssumeRoleWithWebIdentity') {
+        out.push(`${id}: GitHub trust must allow only sts:AssumeRoleWithWebIdentity`);
+      }
+      const condition = statement.Condition ?? {};
+      const operators = Object.keys(condition);
+      if (operators.length !== 1 || operators[0] !== 'StringEquals') {
+        out.push(`${id}: GitHub trust must use only StringEquals conditions (found ${operators.join(', ') || 'none'})`);
+      }
+      const equals = condition.StringEquals ?? {};
+      if (equals[`${GITHUB_OIDC_HOST}:aud`] !== 'sts.amazonaws.com') out.push(`${id}: audience must be sts.amazonaws.com`);
+      if (equals[`${GITHUB_OIDC_HOST}:sub`] !== expectedSubject) {
+        out.push(`${id}: subject must be exactly ${expectedSubject}`);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Collects every permission granted to the named role across all templates
+ * (attached policies, inline policies, managed policies) and flags anything
+ * beyond the allowed actions or any wildcard resource.
+ */
+export function deployRoleViolations(
+  templates: CfnTemplate[],
+  roleName: string,
+  allowedActions: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  const checkDocument = (where: string, document: Json) => {
+    for (const statement of asArray<Json>(document?.Statement)) {
+      if (statement.Effect !== 'Allow') continue;
+      if (statement.NotAction !== undefined || statement.NotResource !== undefined) {
+        out.push(`${where}: NotAction/NotResource grants are too broad`);
+      }
+      for (const action of asArray<string>(statement.Action)) {
+        if (!allowedActions.has(action)) out.push(`${where}: ${action} is not an allowed deploy action`);
+      }
+      for (const resource of asArray<Json>(statement.Resource)) {
+        if (typeof resource === 'string' && resource.includes('*')) out.push(`${where}: wildcard resource ${resource}`);
+      }
+    }
+  };
+
+  for (const template of templates) {
+    const roleIds = resourcesOf(template, (r) => r.Type === 'AWS::IAM::Role' && r.Properties?.RoleName === roleName).map(
+      ([id]) => id,
+    );
+    for (const id of roleIds) {
+      const props = template.Resources[id]!.Properties ?? {};
+      if (asArray(props.ManagedPolicyArns).length > 0) out.push(`${id}: managed policies are not allowed on the deploy role`);
+      for (const p of asArray<Json>(props.Policies)) checkDocument(`${id}/${p.PolicyName}`, p.PolicyDocument);
+    }
+    const targetsRole = (roles: Json) =>
+      asArray<Json>(roles).some((r) => r === roleName || (typeof r?.Ref === 'string' && roleIds.includes(r.Ref)));
+    for (const [id, r] of resourcesOf(
+      template,
+      (r) => (r.Type === 'AWS::IAM::Policy' || r.Type === 'AWS::IAM::ManagedPolicy') && targetsRole(r.Properties?.Roles),
+    )) {
+      checkDocument(id, r.Properties?.PolicyDocument);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // CloudFront flat-rate Free plan compatibility
 // Source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html
 // (feature table and "Unsupported features"), read 2026-10-11.

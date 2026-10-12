@@ -38,7 +38,7 @@ export interface CfnTemplate {
 /** Synthesizes every stack in the app for the given configuration. */
 export function synthesizeAll(config: SiteConfig = productionConfig()): SynthesizedStack[] {
   const app = new App({ context: cdkContext });
-  const stacks = Object.values(createStacks(app, config));
+  const stacks = Object.values(createStacks(app, config)).filter((s): s is Stack => s !== undefined);
   return stacks.map((stack) => {
     const template = Template.fromStack(stack);
     return { stack, template, json: template.toJSON() as CfnTemplate };

@@ -1,6 +1,8 @@
 import { Match } from 'aws-cdk-lib/assertions';
+import { App } from 'aws-cdk-lib/core';
 import { describe, expect, it } from 'vitest';
 import { production } from '../lib/config';
+import { SiteStack } from '../lib/site-stack';
 import { productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
@@ -88,6 +90,34 @@ describe('site stack (pay-as-you-go)', () => {
   it('exports the values the deploy workflow needs', () => {
     expect(Object.keys(json.Outputs ?? {}).sort()).toEqual(['DistributionDomainName', 'DistributionId', 'SiteBucketName']);
   });
+
+  it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
+    expect(json.Resources['SiteDeployPolicyEEC9A210']!.Properties).toEqual({
+      PolicyName: 'SiteDeployPolicyEEC9A210',
+      Roles: ['zachverse-github-site-deploy'],
+      PolicyDocument: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [BUCKET, 'Arn'] } },
+          {
+            Effect: 'Allow',
+            Action: ['s3:GetObject', 's3:PutObject'],
+            Resource: { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/*']] },
+          },
+          {
+            Effect: 'Allow',
+            Action: [
+              'cloudfront:CreateInvalidation',
+              'cloudfront:GetDistribution',
+              'cloudfront:GetInvalidation',
+              'cloudfront:ListInvalidations',
+            ],
+            Resource: { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: DISTRIBUTION }]] },
+          },
+        ],
+      },
+    });
+  });
 });
 
 describe('site stack (Free flat-rate plan enabled)', () => {
@@ -118,7 +148,10 @@ describe('site stack (Free flat-rate plan enabled)', () => {
 
 describe('site stack configuration errors', () => {
   it('refuses to synthesize without a certificate', () => {
-    expect(() => synthesizeSite({ ...production, certificateArn: undefined })).toThrow(/certificateArn is not set/);
+    const config = { ...production, certificateArn: undefined };
+    expect(() => new SiteStack(new App(), 'Site', { env: { account: config.account, region: config.region }, config })).toThrow(
+      /certificateArn is not set/,
+    );
   });
 
   it.each([

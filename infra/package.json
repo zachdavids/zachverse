@@ -10,6 +10,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "bootstrap": "cdk bootstrap aws://426499248998/us-east-1 --termination-protection",
     "cdk": "cdk"
   },
   "dependencies": {
