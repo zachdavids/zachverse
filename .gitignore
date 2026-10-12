@@ -148,4 +148,8 @@ vite.config.ts.timestamp-*
 # Turbo Repo
 .turbo
 
+# Zachverse build output
+dist-ssr/
+cdk.out/
+
 CLAUDE.md
