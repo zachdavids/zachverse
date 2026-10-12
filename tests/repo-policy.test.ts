@@ -1,12 +1,12 @@
-import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { posix } from 'node:path';
+import { isAbsolute, posix, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { site } from '../src/content.ts';
+import { files, git, read, readJson, root, tsc } from './support/repo.ts';
 
 // jsdom ships no type declarations; these checks only need its window's DOMParser.
 const { JSDOM } = createRequire(import.meta.url)('jsdom') as {
@@ -26,6 +26,7 @@ type Step = Conditions & {
 type Job = Conditions & {
   uses?: string;
   needs?: unknown;
+  'runs-on'?: unknown;
   environment?: string | { name?: string };
   steps?: Step[];
   permissions?: string | Record<string, string>;
@@ -37,18 +38,14 @@ type Workflow = {
   defaults?: Defaults;
   jobs: Record<string, Job>;
 };
-
-const root = new URL('../', import.meta.url);
-const read = (path: string) => readFileSync(new URL(path, root), 'utf8');
-const readJson = <T>(path: string) => JSON.parse(read(path)) as T;
-
-// Runs git at the repo root and returns its output lines; any other exit status fails with git's error.
-function git(args: string[], statuses = [0]) {
-  const result = spawnSync('git', args, { cwd: fileURLToPath(root), encoding: 'utf8' });
-  expect(result.error, 'git').toBeUndefined();
-  expect(statuses, `git ${args[0]} exited ${result.status}: ${result.stderr.trim()}`).toContain(result.status);
-  return result.stdout.split(/\r?\n/).filter(Boolean);
-}
+// The parts of a Vitest config these checks read.
+type VitestConfig = {
+  test?: {
+    include?: string[];
+    passWithNoTests?: boolean;
+    coverage?: { include?: string[]; exclude?: string[]; thresholds?: unknown };
+  };
+};
 
 const workflows = readdirSync(new URL('.github/workflows/', root))
   .filter((file) => /\.ya?ml$/.test(file))
@@ -134,12 +131,37 @@ function expectRequiredSteps(jobId: string, required: string[]) {
   ).toEqual(required);
 }
 
-// setup-node installs the newest release matching .nvmrc, so its missing version parts are unbounded.
+// A package's tsconfig files: solution files, and the projects tsc checks. A solution file ("files": [] plus
+// "references") checks nothing itself; it lets editors find the projects.
+function tsconfigs(dir: string) {
+  const configs = readdirSync(new URL(dir, root)).filter((file) => /^tsconfig\b.*\.json$/.test(file));
+  const solutions = configs.filter((file) => {
+    const { files: roots, references, ...rest } = readJson<Record<string, unknown>>(`${dir}${file}`);
+    return isDeepStrictEqual(roots, []) && references !== undefined && Object.keys(rest).length === 0;
+  });
+  return { solutions, projects: configs.filter((file) => !solutions.includes(file)) };
+}
+
+// Without --config, Vitest loads the first of these it finds in a package.
+const vitestConfigFiles = ['vitest.config', 'vite.config'].flatMap((name) =>
+  ['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs'].map((extension) => name + extension),
+);
+
+// The test settings of the config Vitest loads in a package. A computed specifier keeps tsc from checking
+// infra's config against the root package's dependencies.
+async function vitestSettings(dir: string) {
+  const file = vitestConfigFiles.find((name) => existsSync(new URL(dir + name, root)));
+  const { default: config } = (await import(new URL(`${dir}${file}`, root).href)) as { default: VitestConfig };
+  return config.test ?? {};
+}
+
+// Whether an engines range accepts a Node version. Parts the version leaves out are unbounded, so .nvmrc's "24"
+// stands for the newest 24.x release, which a fresh install of that line gets.
 // As in npm, a partial bound stands for its whole line: >24 means >=25.0.0, and <=24.11 means <24.12.0.
-function acceptsNewest(range: string, nvmrc: string) {
-  const newest = [0, 1, 2].map((i) => Number(nvmrc.replace(/^v/, '').split('.')[i] ?? Infinity));
-  const compare = (version: number[]) =>
-    Math.sign(newest.map((part, i) => part - version[i]!).find((diff) => diff !== 0) ?? 0);
+function accepts(range: string, version: string) {
+  const target = [0, 1, 2].map((i) => Number(version.replace(/^v/, '').split('.')[i] ?? Infinity));
+  const compare = (other: number[]) =>
+    Math.sign(target.map((part, i) => part - other[i]!).find((diff) => diff !== 0) ?? 0);
   return range
     .trim()
     .split(/\s+/)
@@ -166,17 +188,18 @@ describe('GitHub Actions workflows', () => {
         return match ? [{ ref: match[2]!, comment: match[3] ?? '' }] : [];
       });
       // The text scan must see exactly the uses: entries the YAML defines, or a comment could go unchecked.
-      const declared = Object.values(workflow.jobs).flatMap((job) => [
-        job.uses,
-        ...(job.steps ?? []).map((step) => step.uses),
-      ]);
-      expect(found.map(({ ref }) => ref), file).toEqual(declared.filter((uses) => uses !== undefined));
+      // A YAML alias reuses its anchor's object, whose one uses: line the scan already sees.
+      const declared = new Set(
+        Object.values(workflow.jobs).flatMap((job): (Job | Step)[] => [job, ...(job.steps ?? [])]),
+      );
+      expect(found.map(({ ref }) => ref), file).toEqual([...declared].flatMap(({ uses }) => uses ?? []));
       return found.map(({ ref, comment }) => `${ref} ${comment}`.trim());
     });
     expect(lines).not.toHaveLength(0);
     expect(lines.filter((line) => !pinned.test(line))).toEqual([]);
 
-    // A commit keeps one version label and a label one commit, so the comment cannot drift from the SHA.
+    // Copies of a pin agree: a commit keeps one version label and a label one commit. Whether a label names its
+    // commit's release cannot be checked offline; compare it with the upstream tag whenever a pin changes.
     const versions = new Map<string, string>();
     const commits = new Map<string, string>();
     for (const line of lines) {
@@ -201,19 +224,27 @@ describe('GitHub Actions workflows', () => {
     }
   });
 
-  it('grant the token read-only access, and an OIDC token only to production deploys', () => {
+  it('grant the token only contents: read, and an OIDC token only to production deploys', () => {
     for (const { file, workflow } of workflows) expect(workflow.permissions, file).toEqual({ contents: 'read' });
     for (const { where, workflow, job } of jobs) {
       const grants =
         typeof job.permissions === 'string'
           ? [job.permissions]
           : Object.entries(job.permissions ?? {}).map(([scope, access]) => `${scope}: ${access}`);
-      const allowed = deploysToProduction(workflow, job) ? ['id-token: write'] : [];
-      expect(grants.filter((grant) => /write/i.test(grant) && !allowed.includes(grant)), where).toEqual([]);
+      // A job's permissions replace the workflow's, so read-all or any other read scope would widen its token.
+      const allowed = ['contents: read', ...(deploysToProduction(workflow, job) ? ['id-token: write'] : [])];
+      expect(grants.filter((grant) => !allowed.includes(grant) && !grant.endsWith(': none')), where).toEqual([]);
     }
   });
 
-  it('obtain AWS credentials only in production deploys, never from secrets or access keys', () => {
+  it('run every job on a GitHub-hosted runner', () => {
+    // A self-hosted or CodeBuild runner can hold an AWS role and lends it to every job it runs, PR code included.
+    const hosted = /^ubuntu-(?:latest|\d+\.\d+)(?:-arm)?$/;
+    const others = jobs.filter(({ job }) => typeof job['runs-on'] !== 'string' || !hosted.test(job['runs-on']));
+    expect(others.map(({ where, job }) => `${where}: ${JSON.stringify(job['runs-on'])}`)).toEqual([]);
+  });
+
+  it('obtain AWS credentials only in production deploys, never from secrets, variables, or access keys', () => {
     const configured = steps.filter(
       ({ workflow, job, step }) =>
         actionName(step.uses) === 'aws-actions/configure-aws-credentials' && !deploysToProduction(workflow, job),
@@ -226,6 +257,17 @@ describe('GitHub Actions workflows', () => {
       expect(references.filter((reference) => /\bsecrets\b/i.test(reference)), file).toEqual([]);
       expect(text.match(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g) ?? [], file).toEqual([]);
     }
+    // Variables are stored as plain text; only a production deploy may read one, such as its role ARN.
+    const outsideDeploys = [
+      ...workflows.map(({ file, workflow }) => ({ where: file, settings: { ...workflow, jobs: {} } })),
+      ...jobs
+        .filter(({ workflow, job }) => !deploysToProduction(workflow, job))
+        .map(({ where, job }) => ({ where, settings: job })),
+    ];
+    const readingVariables = outsideDeploys.filter(({ settings }) =>
+      expressions(JSON.stringify(settings)).some((expression) => /\bvars\b/i.test(expression)),
+    );
+    expect(readingVariables.map(({ where }) => where)).toEqual([]);
   });
 
   it('check out without persisting the token', () => {
@@ -258,6 +300,8 @@ describe('CI workflow', () => {
       // A branches filter on pull_request skips stacked PRs, whose base is another PR's branch.
       if (event === 'pull_request') expect(branches, event).toBeUndefined();
       else expect([branches ?? 'main'].flat(), event).toContain('main');
+      // A "!" pattern drops the branches it matches from those before it, so [main, "!m*"] never runs for main.
+      expect([branches ?? []].flat().filter((branch) => branch.startsWith('!')), event).toEqual([]);
       expect(types, event).toEqual(expect.arrayContaining(activity));
       // paths, paths-ignore, branches-ignore, or tags would skip CI for some changes to main.
       expect(narrowing, event).toEqual({});
@@ -289,13 +333,7 @@ describe('CI workflow', () => {
   it('typechecks every TypeScript project with tsc and runs Vitest with coverage', () => {
     for (const dir of ['', 'infra/']) {
       const { scripts } = readJson<{ scripts: Record<string, string | undefined> }>(`${dir}package.json`);
-      const configs = readdirSync(new URL(dir, root)).filter((file) => /^tsconfig\b.*\.json$/.test(file));
-      // A solution file ("files": [] plus "references") checks nothing itself; it lets editors find the projects.
-      const solutions = configs.filter((file) => {
-        const { files, references, ...rest } = readJson<Record<string, unknown>>(`${dir}${file}`);
-        return isDeepStrictEqual(files, []) && references !== undefined && Object.keys(rest).length === 0;
-      });
-      const projects = configs.filter((file) => !solutions.includes(file));
+      const { solutions, projects } = tsconfigs(dir);
       for (const file of solutions) {
         const { references } = readJson<{ references: { path: string }[] }>(`${dir}${file}`);
         expect(references.map(({ path }) => posix.normalize(path)).sort(), `${dir}${file}`).toEqual(projects.sort());
@@ -309,47 +347,157 @@ describe('CI workflow', () => {
     }
   });
 
+  it('typechecks every TypeScript file strictly', () => {
+    // strict only sets these flags' defaults (tsc --all lists each as "true, unless strict is false"), so a project
+    // can still turn one off.
+    const strictFamily = [
+      'noImplicitAny',
+      'noImplicitThis',
+      'strictBindCallApply',
+      'strictBuiltinIteratorReturn',
+      'strictFunctionTypes',
+      'strictNullChecks',
+      'strictPropertyInitialization',
+      'useUnknownInCatchVariables',
+    ];
+    for (const dir of ['', 'infra/']) {
+      const checked = tsconfigs(dir).projects.flatMap((project) => {
+        // --showConfig resolves each project's root files and the options it sets, including inherited ones.
+        const config = JSON.parse(tsc(['-p', `${dir}${project}`, '--showConfig'])) as {
+          compilerOptions: Record<string, unknown>;
+          files: string[];
+        };
+        // noCheck turns type checking off while the tsc command stays the same.
+        const { strict, noEmit, noCheck } = config.compilerOptions;
+        expect({ strict, noEmit, noCheck }, `${dir}${project}`).toEqual({ strict: true, noEmit: true });
+        expect(strictFamily.filter((flag) => config.compilerOptions[flag] === false), `${dir}${project}`).toEqual([]);
+        return config.files.map((file) => posix.join(dir, file));
+      });
+      // Vitest, Vite, and Node only strip types, so a file that no project includes is never type-checked.
+      const sources = files(['ts', 'tsx', 'mts', 'cts'].map((extension) => `${dir}*.${extension}`));
+      const unchecked = sources.filter((file) => !checked.includes(file) && (dir !== '' || !file.startsWith('infra/')));
+      expect(unchecked, `${dir}tsconfig*.json`).toEqual([]);
+    }
+  });
+
+  it("typechecks the web package without reading infra's files", () => {
+    // Imports in infra's files resolve to infra/node_modules where it is installed, but to the root's packages in
+    // CI's web job, so the same typecheck could pass locally and fail in CI.
+    const infra = fileURLToPath(new URL('infra/', root));
+    const inInfra = (file: string) => !relative(infra, file).startsWith('..') && !isAbsolute(relative(infra, file));
+    for (const project of tsconfigs('').projects) {
+      const program = tsc(['-p', project, '--listFilesOnly']).split(/\r?\n/).filter(Boolean);
+      expect(program.filter(inInfra), project).toEqual([]);
+    }
+  });
+
+  it('builds, prerenders, and checks the site with fixed commands', () => {
+    const { scripts } = readJson<{ scripts: Record<string, string | undefined> }>('package.json');
+    // CI runs both by name, so another body, or "|| true", would leave the prerendered pages unchecked.
+    expect(scripts.build).toBe(
+      'vite build && vite build --ssr src/entry-server.tsx --outDir dist-ssr && node scripts/prerender.ts',
+    );
+    expect(scripts['check:dist']).toBe('node scripts/check-dist.ts');
+  });
+
+  it('runs every test file in each package', async () => {
+    // Other settings, such as exclude, changed, dir, or projects, can leave test files unrun.
+    const allowed = ['include', 'environment', 'testTimeout', 'passWithNoTests', 'coverage'];
+    for (const [dir, tests, required] of [
+      ['', 'tests/', ['src/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts', 'tests/**/*.test.ts']],
+      ['infra/', 'test/', ['test/**/*.test.ts']],
+    ] as const) {
+      const settings = await vitestSettings(dir);
+      expect(Object.keys(settings).filter((key) => !allowed.includes(key)), dir).toEqual([]);
+      // More test files may run, but none may drop out; a "!" glob drops the files it matches.
+      expect(settings.include, dir).toEqual(expect.arrayContaining([...required]));
+      expect(settings.include?.filter((glob) => glob.startsWith('!')), dir).toEqual([]);
+      // On CI's clean checkout, changed selects no tests and turns passWithNoTests on unless it is set to false.
+      expect(settings.passWithNoTests, dir).toBe(false);
+      // Coverage does not notice a suite that stops running, such as one renamed to *.spec.ts.
+      const unrun = readdirSync(new URL(dir + tests, root), { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map(({ name }) => tests + name)
+        .filter((file) => !settings.include?.some((glob) => posix.matchesGlob(file, glob)));
+      expect(unrun, dir).toEqual([]);
+    }
+    // These suites run the template checks on the synthesized stacks; the 100% gate passes without them.
+    for (const suite of ['guardrails', 'environment']) {
+      expect(existsSync(new URL(`infra/test/${suite}.test.ts`, root)), suite).toBe(true);
+    }
+  });
+
   it("requires 100% coverage of each package's source", async () => {
-    const web = (await import('../vitest.config.ts')).default.test?.coverage;
-    const infra = (await import('../infra/vitest.config.mts')).default.test?.coverage;
+    const web = (await vitestSettings('')).coverage;
+    const infra = (await vitestSettings('infra/')).coverage;
     // Any other key, such as a per-glob threshold, could lower the bar for some files.
     expect(web?.thresholds).toEqual({ 100: true });
     expect(infra?.thresholds).toEqual({ 100: true });
-    // More files may be measured, but none may drop out.
-    expect(web?.include).toEqual(expect.arrayContaining(['src/**/*.{ts,tsx}', 'scripts/**/*.ts']));
+    // More files may be measured, but none may drop out. tests/support is this suite's own code, so measuring it
+    // also fails the gate if this suite stops running.
+    expect(web?.include).toEqual(
+      expect.arrayContaining([
+        'src/**/*.{ts,tsx}',
+        'scripts/**/*.ts',
+        'src/**/*.{mts,cts,js,jsx,mjs,cjs}',
+        'scripts/**/*.{tsx,mts,cts,js,jsx,mjs,cjs}',
+        'tests/support/**/*.ts',
+      ]),
+    );
     expect(web?.exclude).toEqual(['**/*.test.{ts,tsx}']);
     expect(infra?.include).toEqual(
       expect.arrayContaining(['lib/**/*.ts', 'bin/**/*.ts', 'functions/**/*.js', 'test/support/**/*.ts']),
     );
     expect(infra?.exclude).toBeUndefined();
+    // A "!" glob drops the files it matches, and other options, such as changed, can measure fewer files.
+    const allowed = ['provider', 'include', 'exclude', 'reporter', 'thresholds'];
+    for (const [dir, coverage] of [['', web], ['infra/', infra]] as const) {
+      expect(coverage?.include?.filter((glob) => glob.startsWith('!')), dir).toEqual([]);
+      expect(Object.keys(coverage ?? {}).filter((key) => !allowed.includes(key)), dir).toEqual([]);
+    }
+  });
+
+  it('lets no source file opt out of type checking or coverage', () => {
+    // Coverage-ignore hints (istanbul, c8, v8, or node:coverage, then "ignore") pass untested code at 100%, even
+    // inside a string; the ts-nocheck pragma skips a file's type check (its name is split so this file passes).
+    const optOut = new RegExp(String.raw`(?:istanbul|[cv]8|node:coverage)\s+ignore\b|@ts-${'no'}check`, 'i');
+    const sources = files(['ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs'].map((extension) => `*.${extension}`));
+    expect(sources.filter((file) => optOut.test(read(file)))).toEqual([]);
   });
 });
 
 describe('Dependabot', () => {
-  it('updates the pinned GitHub Actions', () => {
-    type Update = {
-      'package-ecosystem': string;
-      directory?: string;
-      directories?: string[];
-      'open-pull-requests-limit'?: number;
-      ignore?: { 'dependency-name'?: string; versions?: unknown; 'update-types'?: unknown }[];
-    };
+  it('updates every pinned GitHub Action on main', () => {
+    type Update = { 'package-ecosystem': string; directory?: string; directories?: string[]; [key: string]: unknown };
     const config = parse(read('.github/dependabot.yml')) as { version: number; updates: Update[] };
     expect(config.version).toBe(2);
     const actions = config.updates.filter((update) => update['package-ecosystem'] === 'github-actions');
     // "/" is where Dependabot finds .github/workflows.
     expect(actions.flatMap((update) => [update.directory, ...(update.directories ?? [])])).toContain('/');
+    // SHA-pinned actions get no Dependabot alerts, so these PRs are how their fixes arrive. allow, ignore,
+    // exclude-paths, and target-branch can each keep some updates off main; these options only time and shape PRs.
+    const shaping = [
+      'package-ecosystem',
+      'directory',
+      'directories',
+      'schedule',
+      'cooldown',
+      'open-pull-requests-limit',
+      'groups',
+      'commit-message',
+      'labels',
+      'assignees',
+    ];
     for (const update of actions) {
-      // A limit of 0 turns version updates off, and so does ignoring a dependency outright.
-      expect(update['open-pull-requests-limit']).not.toBe(0);
-      const outright = update.ignore?.filter((rule) => rule.versions === undefined && rule['update-types'] === undefined);
-      expect(outright ?? []).toEqual([]);
+      expect(Object.keys(update).filter((key) => !shaping.includes(key))).toEqual([]);
+      // A limit of 0 turns version updates off; the default is 5.
+      expect(update['open-pull-requests-limit'] ?? 5).toBeGreaterThan(0);
     }
   });
 });
 
 describe('Node version', () => {
-  it('shares one engines range that accepts the newest release of the .nvmrc line', () => {
+  it('shares one engines range that accepts the newest release of the .nvmrc line and the Node running', () => {
     const [web, infra] = ['package.json', 'infra/package.json'].map(
       (path) => readJson<{ engines?: { node?: string } }>(path).engines?.node,
     );
@@ -357,7 +505,9 @@ describe('Node version', () => {
     expect(infra).toBe(web);
     const nvmrc = read('.nvmrc').trim();
     expect(nvmrc).toMatch(/^v?\d+(?:\.\d+){0,2}$/);
-    expect(acceptsNewest(web!, nvmrc), `${nvmrc} vs ${web}`).toBe(true);
+    expect(accepts(web!, nvmrc), `${nvmrc} vs ${web}`).toBe(true);
+    // CI's setup-node takes the newest matching release cached on the runner, which can trail the newest release.
+    expect(accepts(web!, process.version), `${process.version} vs ${web}`).toBe(true);
   });
 });
 
@@ -392,7 +542,6 @@ describe('npm settings', () => {
 
 describe('lockfiles', () => {
   type Entry = {
-    name?: string;
     version?: string;
     resolved?: string;
     integrity?: string;
@@ -419,15 +568,22 @@ describe('lockfiles', () => {
         ([key, entry]) => key !== '' && !(entry.inBundle && entry.resolved === undefined),
       );
       expect(fetched).not.toHaveLength(0);
-      // The install path names the package, unless an npm: alias records its real name.
-      const tarball = (key: string, { name = key.split('node_modules/').pop()!, version }: Entry) =>
-        `https://registry.npmjs.org/${name}/-/${name.split('/').pop()}-${version}.tgz`;
-      const misplaced = fetched.filter(([key, entry]) => entry.resolved !== tarball(key, entry));
+      // The install path names the package. A name field marks an npm: alias, which neither package uses, and
+      // trusting one would let an entry fetch another package's tarball.
+      const tarball = (key: string, version?: string) => {
+        const name = key.split('node_modules/').pop()!;
+        return `https://registry.npmjs.org/${name}/-/${name.split('/').pop()}-${version}.tgz`;
+      };
+      const misplaced = fetched.filter(([key, entry]) => entry.resolved !== tarball(key, entry.version));
       const unhashed = fetched.filter(([, entry]) => !entry.integrity?.startsWith('sha512-'));
       expect(misplaced.map(([key, entry]) => `${key} ${entry.resolved}`)).toEqual([]);
       expect(unhashed.map(([key]) => key)).toEqual([]);
     },
   );
+
+  it('have no npm-shrinkwrap.json beside them, which npm would install from instead', () => {
+    for (const dir of ['', 'infra/']) expect(existsSync(new URL(`${dir}npm-shrinkwrap.json`, root)), dir).toBe(false);
+  });
 });
 
 describe('.gitignore', () => {
@@ -447,10 +603,13 @@ describe('.gitignore', () => {
     // --verbose names the deciding rule (a negation starts with !); --non-matching prints "::" for the rest.
     // Exit status 1 means no path matched, which the checks below report path by path.
     const output = git(['check-ignore', '--verbose', '--non-matching', '--no-index', ...paths], [0, 1]);
-    // Each line reads "<source>:<line>:<pattern>\t<path>".
+    // Each line reads "<source>:<line>:<pattern>\t<path>". Any of the repo's own .gitignore files may decide, but
+    // not .git/info/exclude or a developer's global excludes.
     const rules = new Map(output.map((line) => line.split('\t').reverse() as [string, string]));
+    const sources = git(['ls-files', '--', '.gitignore', ':(glob)**/.gitignore']);
     for (const path of paths) {
-      expect(rules.get(path) ?? '', path).toMatch(/^\.gitignore:\d+:[^!]/);
+      const [, source = '', pattern = ''] = /^(.*?):\d+:(.*)$/.exec(rules.get(path) ?? '') ?? [];
+      expect(sources.includes(source) && !pattern.startsWith('!'), `${path}: ${rules.get(path)}`).toBe(true);
     }
   });
 
@@ -462,31 +621,10 @@ describe('.gitignore', () => {
 });
 
 describe('crawler files', () => {
-  it('robots.txt points at the sitemap on the site origin', () => {
-    const sitemaps = read('public/robots.txt')
-      .split(/\r?\n/)
-      .flatMap((line) => /^\s*sitemap\s*:\s*(\S+)/i.exec(line)?.[1] ?? []);
-    expect(sitemaps).toEqual([new URL('/sitemap.xml', site.origin).href]);
-  });
-
-  it('robots.txt lets crawlers in general fetch the site root', () => {
-    // A group is a run of User-agent lines and the rules after it; "*" is for crawlers without a group of their own.
-    let agents: string[] = [];
-    let inRules = false;
-    const blocking: string[] = [];
-    for (const line of read('public/robots.txt').split(/\r?\n/)) {
-      const [, field = '', value = ''] = /^\s*([\w-]+)\s*:\s*([^#\s]*)/.exec(line) ?? [];
-      if (/^user-agent$/i.test(field)) {
-        agents = inRules ? [value] : [...agents, value];
-        inRules = false;
-      } else if (/^(?:allow|disallow)$/i.test(field)) {
-        inRules = true;
-        // A rule's path matches as a prefix, where * matches anything and a final $ ends the match.
-        const pattern = new RegExp(`^${value.replace(/[.+?^{}()|[\]\\]/g, '\\$&').replaceAll('*', '.*')}`);
-        if (/^disallow$/i.test(field) && value !== '' && agents.includes('*') && pattern.test('/')) blocking.push(line);
-      }
-    }
-    expect(blocking).toEqual([]);
+  it('robots.txt lets every crawler fetch the whole site and points at the sitemap on the site origin', () => {
+    // Pinned whole: Google also obeys misspelled keys, missing colons, and a Googlebot-only group.
+    const sitemap = new URL('/sitemap.xml', site.origin).href;
+    expect(read('public/robots.txt')).toBe(`User-agent: *\nAllow: /\n\nSitemap: ${sitemap}\n`);
   });
 
   it('sitemap.xml is well-formed XML listing exactly the origin root', () => {

@@ -4,6 +4,8 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     environment: 'node',
+    // A run that selects no tests fails, even where `changed` would default this to true.
+    passWithNoTests: false,
     // Synthesizing CDK stacks is CPU-bound; the default 5 s is tight on CI runners.
     testTimeout: 30_000,
     coverage: {
