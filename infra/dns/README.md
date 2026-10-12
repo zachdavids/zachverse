@@ -2,9 +2,9 @@
 
 The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CDK. It also carries Google Workspace email records (MX, SPF, DKIM, and later DMARC), which must never change as part of website work.
 
-Website DNS changes are committed here as Route 53 change batches (the JSON for `aws route53 change-resource-record-sets --change-batch file://...`). Applying one is an administrative step; no stack or deploy role has DNS write access.
+Website DNS changes are committed here as Route 53 change batches (the JSON for `aws route53 change-resource-record-sets --change-batch file://...`). Applying one is an administrative step. No stack may define DNS resources or grant DNS write access: the guardrail tests (`infra/test/guardrails.test.ts`) reject both, in CI and before every CDK CLI synth, diff, and deploy. These are template checks, not access controls: CloudFormation deploys stacks through the CDK execution role, which can write DNS, so deploy only reviewed commits (ADR 0003, "Limits").
 
-`infra/test/dns-batches.test.ts` checks every file in this directory and its subfolders except this README (the AWS CLI applies any file it is given, whatever its name):
+`infra/test/dns-batches.test.ts` checks every file in this directory and its subfolders except this README, since the AWS CLI applies any file it is given, whatever its name. Dot-files and dot-folders count, symlinks are read through to their targets, and a linked folder is itself flagged. The rules:
 
 - Only two kinds of record may change: ACM validation CNAMEs (`_<32 hex>.zachdavids.com` / `_<32 hex>.www.zachdavids.com` pointing at `*.acm-validations.aws`), and website routing (apex `A`/`AAAA`, `www` `A`/`AAAA`/`CNAME`).
 - Aliases must target CloudFront (`Z2FDTNDATAQYW2`, `*.cloudfront.net`).

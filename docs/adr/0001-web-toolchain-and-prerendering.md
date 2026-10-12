@@ -1,7 +1,7 @@
 # ADR 0001: Web toolchain and prerendering
 
 - Status: Accepted
-- Date: 2026-10-11
+- Date: 2026-10-11, revised 2026-10-12 after review
 
 ## Context
 
@@ -11,7 +11,7 @@ Phase 1 ships a placeholder page; the later 3D portfolio will use React Three Fi
 
 | Package | Version | Compatibility evidence |
 | --- | --- | --- |
-| Node.js | 24 LTS (`.nvmrc`; 24.20.0 locally) | Vitest 5 engines `^22.12 \|\| ^24 \|\| >=26`; Vite 8 `>=22.12` |
+| Node.js | 24 LTS (`.nvmrc`; engines `>=24.11.0 <25`; 24.20.0 locally) | Vitest 5 engines `^22.12 \|\| ^24 \|\| >=26`; Vite 8 `^20.19 \|\| >=22.12`; jsdom 30.1.1 (tests only) and three of its dependencies `^22.22.2 \|\| ^24.15.0 \|\| >=26` |
 | react, react-dom | 19.3.0 | `@react-three/fiber` 9.8.1 peers `react >=19 <19.4` |
 | vite | 8.3.4 | — |
 | @vitejs/plugin-react | 6.1.2 | peers `vite ^8.0.0` |
@@ -19,11 +19,15 @@ Phase 1 ships a placeholder page; the later 3D portfolio will use React Three Fi
 | typescript | ~7.0.2 | same range `cdk init` (aws-cdk 2.1145.0) generates |
 | aws-cdk-lib / aws-cdk CLI | 2.273.0 / 2.1145.0 | `aws-cdk-lib` peers `constructs ^10.5.0` |
 
+The engines floor stays at 24.11.0, the first Node 24 LTS release, although jsdom's range makes npm warn on 24.11–24.14. Engines are advisory (npm still installs), and CI and local development run a current 24.x release; the repository policy requires the Node running the tests to satisfy engines.
+
 Three.js and React Three Fiber are not installed in Phase 1.
 
 The website (repo root) and the CDK app (`infra/`) are separate npm projects with separate lockfiles, so routine website builds never install infrastructure tooling.
 
-Prerendering uses Vite's own SSR build, not a plugin. The steps are `vite build`, then `vite build --ssr src/entry-server.tsx`, then `scripts/prerender.ts`. That last step runs on Node's built-in type stripping and writes `index.html` and `404.html` with the rendered markup, and the client hydrates the page named in `data-page`. `npm run check:dist` fails the build if the HTML lacks the expected content or references missing or unhashed assets.
+Prerendering uses Vite's own SSR build, not a plugin. The steps, which `npm run build` runs, are `vite build`, then `vite build --ssr src/entry-server.tsx --outDir dist-ssr` (its own directory, because Vite empties the output directory before building), then `node scripts/prerender.ts`. That last step runs on Node's built-in type stripping, writes `index.html` and `404.html` with the rendered markup and each page's title and meta description from `src/content.ts`, and deletes `dist-ssr/`. The client hydrates the page named in `data-page`, or renders it on the client when nothing was prerendered, as under `npm run dev`.
+
+`npm run check:dist` then checks the output; `scripts/check-dist-lib.ts` has the full list. Both pages must carry their prerendered content and shared head, use no relative URL (one breaks where `/404.html` is served on nested paths), and reference only site files that exist. Every `/assets/` file they reference must have a hash-like suffix and not be a copy from `public/`. An unhashed name that happens to end that way, such as `three-renderer.js`, passes, so `tests/repo-policy.test.ts` separately requires `[hash]` in every client and web worker output name the Vite config sets.
 
 ## Consequences
 
