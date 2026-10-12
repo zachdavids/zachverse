@@ -67,11 +67,17 @@ export function prohibitedResourceViolations(template: CfnTemplate): string[] {
   return violations;
 }
 
-/** Every resource must survive stack deletion and replacement. */
+/**
+ * Every resource must survive stack deletion and replacement. RetainExceptOnCreate also counts: it
+ * differs from Retain only by deleting a resource when the operation that created it rolls back.
+ */
 export function retentionViolations(template: CfnTemplate): string[] {
   return Object.entries(template.Resources ?? {})
-    .filter(([, r]) => r.DeletionPolicy !== 'Retain' || r.UpdateReplacePolicy !== 'Retain')
-    .map(([id, r]) => `${id} (${r.Type}) must have DeletionPolicy and UpdateReplacePolicy Retain`);
+    .filter(
+      ([, r]) =>
+        (r.DeletionPolicy !== 'Retain' && r.DeletionPolicy !== 'RetainExceptOnCreate') || r.UpdateReplacePolicy !== 'Retain',
+    )
+    .map(([id, r]) => `${id} (${r.Type}) must have DeletionPolicy Retain or RetainExceptOnCreate, and UpdateReplacePolicy Retain`);
 }
 
 // ---------------------------------------------------------------------------

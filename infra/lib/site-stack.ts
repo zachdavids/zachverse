@@ -24,6 +24,7 @@ export class SiteStack extends Stack {
     super(scope, id, props);
     const { config } = props;
     const certificateArn = requireCertificateArn(config);
+    if (config.pricingPlan) checkWebAclArn(config.pricingPlan.webAclArn, config.account);
 
     this.bucket = new s3.Bucket(this, 'SiteBucket', {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -32,7 +33,12 @@ export class SiteStack extends Stack {
       enforceSSL: true,
       // Versioning keeps overwritten release files recoverable (milestone 6).
       versioned: true,
-      lifecycleRules: [{ id: 'ExpireOldVersions', noncurrentVersionExpiration: Duration.days(90) }],
+      lifecycleRules: [
+        { id: 'ExpireOldVersions', noncurrentVersionExpiration: Duration.days(90) },
+        // A cancelled or timed-out deploy job kills the AWS CLI before it can abort its multipart uploads,
+        // and S3 bills their parts until they are aborted.
+        { id: 'AbortIncompleteMultipartUploads', abortIncompleteMultipartUploadAfter: Duration.days(7) },
+      ],
     });
 
     const originAccessControl = new cloudfront.S3OriginAccessControl(this, 'SiteOriginAccessControl', {
@@ -96,7 +102,9 @@ export class SiteStack extends Stack {
       });
     }
 
-    RemovalPolicies.of(this).retain();
+    // Kept on stack deletion and replacement. Only a rolled-back create deletes what it made, so a failed
+    // first deploy leaves no orphaned, fixed-name function or OAC to block the retry.
+    RemovalPolicies.of(this).retainOnUpdateOrDelete();
     Tags.of(this).add('project', 'zachverse');
 
     new CfnOutput(this, 'SiteBucketName', { value: this.bucket.bucketName });
@@ -107,6 +115,8 @@ export class SiteStack extends Stack {
 
 // ACM certificate IDs are UUIDs.
 const CERTIFICATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// webacl/<name>/<ID>: the name is 1-128 letters, digits, hyphens, or underscores, and the ID is a UUID.
+const WEB_ACL_RESOURCE_NAME = /^webacl\/[\w-]{1,128}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function requireCertificateArn(config: SiteConfig): string {
   const arn = config.certificateArn;
@@ -117,6 +127,7 @@ function requireCertificateArn(config: SiteConfig): string {
   }
   const parsed = Arn.split(arn, ArnFormat.SLASH_RESOURCE_NAME);
   if (
+    parsed.partition !== 'aws' ||
     parsed.service !== 'acm' ||
     parsed.resource !== 'certificate' ||
     parsed.region !== 'us-east-1' ||
@@ -128,5 +139,32 @@ function requireCertificateArn(config: SiteConfig): string {
   if (!CERTIFICATE_ID.test(parsed.resourceName ?? '')) {
     throw new Error(`certificateArn must end in the certificate ID (a UUID): ${arn}`);
   }
+  // Arn.split also accepts certificate:<ID> and :/certificate/<ID>, which ACM never issues.
+  if (parsed.arnFormat !== ArnFormat.SLASH_RESOURCE_NAME) {
+    throw new Error(`certificateArn must have the form arn:aws:acm:us-east-1:<account>:certificate/<ID>: ${arn}`);
+  }
   return arn;
+}
+
+/** The web ACL is created outside this stack, so a bad paste would otherwise fail only at deploy time. */
+function checkWebAclArn(arn: string, account: string): void {
+  if (!arn) {
+    throw new Error('pricingPlan.webAclArn is empty. Set it to the ARN of the CLOUDFRONT-scope web ACL (docs/adr/0002).');
+  }
+  const parsed = Arn.split(arn, ArnFormat.SLASH_RESOURCE_NAME);
+  // CLOUDFRONT-scope web ACLs have the scope "global" and always live in us-east-1.
+  if (
+    parsed.partition !== 'aws' ||
+    parsed.service !== 'wafv2' ||
+    parsed.resource !== 'global' ||
+    parsed.region !== 'us-east-1' ||
+    parsed.account !== account
+  ) {
+    throw new Error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by ${account}: ${arn}`);
+  }
+  if (!WEB_ACL_RESOURCE_NAME.test(parsed.resourceName ?? '') || parsed.arnFormat !== ArnFormat.SLASH_RESOURCE_NAME) {
+    throw new Error(
+      `pricingPlan.webAclArn must have the form arn:aws:wafv2:us-east-1:<account>:global/webacl/<name>/<ID>: ${arn}`,
+    );
+  }
 }

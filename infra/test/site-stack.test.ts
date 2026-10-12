@@ -8,11 +8,22 @@ afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
 const BUCKET = 'SiteBucket397A1860';
+const ORIGIN_ACCESS_CONTROL = 'SiteOriginAccessControl4DD454FF';
 const VIEWER_REQUEST_FUNCTION = 'ViewerRequestFunction48E73F66';
+const CACHING_OPTIMIZED = '658327ea-f89d-4fab-a63d-7e88639e58f6';
+const SECURITY_HEADERS_POLICY = '67f7725c-6f97-4210-82d7-5512b31e9d03';
+const VIEWER_REQUEST = { EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': [VIEWER_REQUEST_FUNCTION, 'FunctionARN'] } };
 
-describe('site stack (pay-as-you-go)', () => {
-  const { stack, template, json } = synthesizeSite();
+// Enabling the plan may add only the web ACL and the subscription, so the design is checked with it off and on.
+const modes = {
+  'pay-as-you-go': productionConfig({ pricingPlan: undefined }),
+  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
+};
+
+describe.each(Object.entries(modes))('site stack design (%s)', (_mode, siteConfig) => {
+  const { stack, template, json } = synthesizeSite(siteConfig);
   const distributionConfig = () => json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
+  const bucketPolicyStatements = () => json.Resources['SiteBucketPolicy3AC1D0F8']!.Properties!.PolicyDocument.Statement as any[];
 
   it('keeps the bucket private: Block Public Access on, no static website hosting', () => {
     template.hasResourceProperties('AWS::S3::Bucket', {
@@ -27,7 +38,7 @@ describe('site stack (pay-as-you-go)', () => {
     });
   });
 
-  it('encrypts objects with S3-managed keys and expires only noncurrent versions, after 90 days', () => {
+  it('encrypts with S3-managed keys, expires only noncurrent versions, and aborts incomplete uploads after 7 days', () => {
     // Exact matches: a partial match would accept a rule that also expires the live site.
     const bucket = json.Resources[BUCKET]!.Properties!;
     expect(bucket.BucketEncryption).toEqual({
@@ -35,30 +46,78 @@ describe('site stack (pay-as-you-go)', () => {
     });
     expect(bucket.VersioningConfiguration).toEqual({ Status: 'Enabled' });
     expect(bucket.LifecycleConfiguration).toEqual({
-      Rules: [{ Id: 'ExpireOldVersions', NoncurrentVersionExpiration: { NoncurrentDays: 90 }, Status: 'Enabled' }],
+      Rules: [
+        { Id: 'ExpireOldVersions', NoncurrentVersionExpiration: { NoncurrentDays: 90 }, Status: 'Enabled' },
+        { Id: 'AbortIncompleteMultipartUploads', AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }, Status: 'Enabled' },
+      ],
     });
   });
 
+  it('sets only the bucket properties checked here', () => {
+    // A new one may be create-only, such as BucketName, and replace the bucket (environment.test.ts).
+    expect(Object.keys(json.Resources[BUCKET]!.Properties!).sort()).toEqual([
+      'BucketEncryption',
+      'LifecycleConfiguration',
+      'OwnershipControls',
+      'PublicAccessBlockConfiguration',
+      'Tags',
+      'VersioningConfiguration',
+    ]);
+  });
+
   it('lets only this distribution read and list the bucket, with no write access', () => {
-    const statements = json.Resources['SiteBucketPolicy3AC1D0F8']!.Properties!.PolicyDocument.Statement as any[];
-    const allows = statements.filter((s) => s.Effect === 'Allow');
+    const allows = bucketPolicyStatements().filter((s) => s.Effect === 'Allow');
     expect(allows).toHaveLength(1);
     expect(allows[0].Principal).toEqual({ Service: 'cloudfront.amazonaws.com' });
     expect([...allows[0].Action].sort()).toEqual(['s3:GetObject', 's3:ListBucket']);
     expect(JSON.stringify(allows[0].Condition.StringEquals['AWS:SourceArn'])).toContain(`"Ref":"${DISTRIBUTION}"`);
-
-    const denyInsecure = statements.find((s) => s.Effect === 'Deny');
-    expect(denyInsecure.Condition).toEqual({ Bool: { 'aws:SecureTransport': 'false' } });
   });
 
-  it('reaches S3 through its REST endpoint with origin access control', () => {
+  it('denies every request that does not use TLS, to the bucket and its objects', () => {
+    // Exact: a narrower action, principal, or resource would let some plain-HTTP requests through.
+    const bucketArn = { 'Fn::GetAtt': [BUCKET, 'Arn'] };
+    expect(bucketPolicyStatements().filter((s) => s.Effect === 'Deny')).toEqual([
+      {
+        Effect: 'Deny',
+        Principal: { AWS: '*' },
+        Action: 's3:*',
+        Resource: [bucketArn, { 'Fn::Join': ['', [bucketArn, '/*']] }],
+        Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+      },
+    ]);
+  });
+
+  it('reaches S3 through its REST endpoint with origin access control, and through nothing else', () => {
     template.hasResourceProperties('AWS::CloudFront::OriginAccessControl', {
       OriginAccessControlConfig: { OriginAccessControlOriginType: 's3', SigningBehavior: 'always', SigningProtocol: 'sigv4' },
     });
-    const [origin] = distributionConfig().Origins;
-    expect(origin.DomainName).toEqual({ 'Fn::GetAtt': [BUCKET, 'RegionalDomainName'] });
-    expect(origin.S3OriginConfig).toEqual({ OriginAccessIdentity: '' });
-    expect(origin.OriginAccessControlId).toEqual({ 'Fn::GetAtt': ['SiteOriginAccessControl4DD454FF', 'Id'] });
+    // Exact: an origin path, Origin Shield, or another origin would change what every request fetches.
+    expect(distributionConfig().Origins).toEqual([
+      {
+        Id: expect.any(String),
+        DomainName: { 'Fn::GetAtt': [BUCKET, 'RegionalDomainName'] },
+        OriginAccessControlId: { 'Fn::GetAtt': [ORIGIN_ACCESS_CONTROL, 'Id'] },
+        S3OriginConfig: { OriginAccessIdentity: '' },
+      },
+    ]);
+  });
+
+  it('is enabled, with only the settings checked here', () => {
+    expect(distributionConfig().Enabled).toBe(true);
+    // A new setting, such as a geo restriction, a price class, or another behavior, needs its own test first.
+    expect(Object.keys(distributionConfig()).sort()).toEqual([
+      'Aliases',
+      'Comment',
+      'CustomErrorResponses',
+      'DefaultCacheBehavior',
+      'DefaultRootObject',
+      'Enabled',
+      'HttpVersion',
+      'IPV6Enabled',
+      'Origins',
+      'ViewerCertificate',
+      ...(siteConfig.pricingPlan ? ['WebACLId'] : []),
+    ]);
   });
 
   it('serves index.html at the root', () => {
@@ -71,13 +130,16 @@ describe('site stack (pay-as-you-go)', () => {
     ]);
   });
 
-  it('redirects HTTP to HTTPS and runs the viewer-request function on cloudfront-js-2.0', () => {
-    const behavior = distributionConfig().DefaultCacheBehavior;
-    expect(behavior.ViewerProtocolPolicy).toBe('redirect-to-https');
-    expect(behavior.AllowedMethods).toEqual(['GET', 'HEAD']);
-    expect(behavior.FunctionAssociations).toEqual([
-      { EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': [VIEWER_REQUEST_FUNCTION, 'FunctionARN'] } },
-    ]);
+  it('redirects HTTP to HTTPS, runs the viewer-request function, and adds the security headers on every behavior', () => {
+    const { DefaultCacheBehavior, CacheBehaviors = [] } = distributionConfig();
+    for (const behavior of [DefaultCacheBehavior, ...CacheBehaviors]) {
+      expect(behavior.ViewerProtocolPolicy).toBe('redirect-to-https');
+      expect(behavior.FunctionAssociations).toEqual([VIEWER_REQUEST]);
+      expect(behavior.ResponseHeadersPolicyId).toBe(SECURITY_HEADERS_POLICY);
+    }
+  });
+
+  it('publishes the viewer-request function on cloudfront-js-2.0 with the site hostnames', () => {
     template.hasResourceProperties('AWS::CloudFront::Function', {
       AutoPublish: true,
       FunctionConfig: Match.objectLike({ Runtime: 'cloudfront-js-2.0' }),
@@ -86,11 +148,19 @@ describe('site stack (pay-as-you-go)', () => {
   });
 
   it('caches GET and HEAD with CachingOptimized, compresses, and adds the managed security headers', () => {
-    const behavior = distributionConfig().DefaultCacheBehavior;
-    expect(behavior.CachedMethods).toEqual(['GET', 'HEAD']);
-    expect(behavior.CachePolicyId).toBe('658327ea-f89d-4fab-a63d-7e88639e58f6'); // CachingOptimized
-    expect(behavior.ResponseHeadersPolicyId).toBe('67f7725c-6f97-4210-82d7-5512b31e9d03'); // SecurityHeadersPolicy
-    expect(behavior.Compress).toBe(true);
+    // Exact: an origin request policy that forwards Host (AllViewer) breaks the S3 origin, and trusted key
+    // groups would turn every visitor away.
+    const config = distributionConfig();
+    expect(config.DefaultCacheBehavior).toEqual({
+      AllowedMethods: ['GET', 'HEAD'],
+      CachedMethods: ['GET', 'HEAD'],
+      CachePolicyId: CACHING_OPTIMIZED,
+      Compress: true,
+      FunctionAssociations: [VIEWER_REQUEST],
+      ResponseHeadersPolicyId: SECURITY_HEADERS_POLICY,
+      TargetOriginId: config.Origins[0].Id,
+      ViewerProtocolPolicy: 'redirect-to-https',
+    });
   });
 
   it('serves both hostnames with the us-east-1 certificate over TLS 1.2+, HTTP/2 and HTTP/3, and IPv6', () => {
@@ -105,14 +175,16 @@ describe('site stack (pay-as-you-go)', () => {
     expect(config.IPV6Enabled).toBe(true);
   });
 
-  it('has no web ACL or pricing-plan subscription before the plan is enabled', () => {
-    expect(distributionConfig().WebACLId).toBeUndefined();
-    template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
-  });
-
   it('tags the bucket, distribution, and function with the project', () => {
     for (const id of [BUCKET, DISTRIBUTION, VIEWER_REQUEST_FUNCTION]) {
       expect(json.Resources[id]!.Properties!.Tags ?? [], id).toContainEqual({ Key: 'project', Value: 'zachverse' });
+    }
+  });
+
+  it('retains every resource on stack deletion and replacement, deleting only what a failed first create made', () => {
+    // RetainExceptOnCreate: a rolled-back first deploy leaves no fixed-name function or OAC to block the retry.
+    for (const [id, resource] of Object.entries(json.Resources)) {
+      expect([resource.DeletionPolicy, resource.UpdateReplacePolicy], id).toEqual(['RetainExceptOnCreate', 'Retain']);
     }
   });
 
@@ -130,14 +202,17 @@ describe('site stack (pay-as-you-go)', () => {
   });
 });
 
-describe('site stack (Free flat-rate plan enabled)', () => {
-  const { stack, template, json } = synthesizeSite(
-    productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
-  );
+describe('site stack (pay-as-you-go)', () => {
+  const { template, json } = synthesizeSite(modes['pay-as-you-go']);
 
-  it('synthesizes without warnings', () => {
-    expect(Annotations.fromStack(stack).findWarning('*', Match.anyValue())).toEqual([]);
+  it('has no web ACL or pricing-plan subscription before the plan is enabled', () => {
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
+    template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
   });
+});
+
+describe('site stack (Free flat-rate plan enabled)', () => {
+  const { template, json } = synthesizeSite(modes['Free flat-rate plan']);
 
   it('attaches the intended web ACL to the distribution', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
@@ -161,9 +236,12 @@ describe('site stack (Free flat-rate plan enabled)', () => {
   });
 });
 
+// toThrow('text') only checks for a substring, so pass the whole message.
+const error = (message: unknown) => expect.objectContaining({ message });
+// Any lowercase UUID; ACM and WAF issue IDs in this form.
+const ANY_ID = 'abcdef01-2345-4789-8bcd-ef0123456789';
+
 describe('site stack configuration errors', () => {
-  // toThrow('text') only checks for a substring, so pass the whole message.
-  const error = (message: unknown) => expect.objectContaining({ message });
   const synthesizeWith = (certificateArn: string | undefined) => () =>
     synthesizeSite(productionConfig({ certificateArn }));
 
@@ -180,6 +258,7 @@ describe('site stack configuration errors', () => {
 
   // Each ARN changes one part of TEST_CERTIFICATE_ARN, which every other test synthesizes successfully.
   it.each([
+    ['another partition', TEST_CERTIFICATE_ARN.replace('arn:aws:', 'arn:aws-cn:')],
     ['another service', TEST_CERTIFICATE_ARN.replace(':acm:', ':acm-pca:')],
     ['another ACM resource type', TEST_CERTIFICATE_ARN.replace(':certificate/', ':certificate-authority/')],
     ['another Region', TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:')],
@@ -199,11 +278,29 @@ describe('site stack configuration errors', () => {
     ['a trailing newline', `${TEST_CERTIFICATE_ARN}\n`],
     ['an extra path segment', `${TEST_CERTIFICATE_ARN}/extra`],
     ['the ARN pasted twice', TEST_CERTIFICATE_ARN.repeat(2)],
+    ['a letter that is not hex in the certificate ID', TEST_CERTIFICATE_ARN.replace(/0{8}-/, '0000000o-')],
+    ['an uppercase certificate ID', TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID.toUpperCase())],
+    ['a misplaced dash in the certificate ID', TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
   ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
     expect(certificateArn).not.toBe(TEST_CERTIFICATE_ARN);
     expect(synthesizeWith(certificateArn)).toThrow(
       error(`certificateArn must end in the certificate ID (a UUID): ${certificateArn}`),
     );
+  });
+
+  it.each([
+    ['a colon before the certificate ID', TEST_CERTIFICATE_ARN.replace(':certificate/', ':certificate:')],
+    ['a slash before the resource type', TEST_CERTIFICATE_ARN.replace(':certificate/', ':/certificate/')],
+  ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
+    expect(synthesizeWith(certificateArn)).toThrow(
+      error(`certificateArn must have the form arn:aws:acm:us-east-1:<account>:certificate/<ID>: ${certificateArn}`),
+    );
+  });
+
+  it('accepts a certificate ID with any lowercase hex digit', () => {
+    const certificateArn = TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID);
+    const { json } = synthesizeWith(certificateArn)();
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.ViewerCertificate.AcmCertificateArn).toBe(certificateArn);
   });
 
   it.each([
@@ -225,6 +322,73 @@ describe('site stack configuration errors', () => {
     const certificateArn = TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
     expect(() => synthesizeSite(productionConfig({ region: 'us-east-2', certificateArn }))).toThrow(
       error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
+    );
+  });
+});
+
+describe('web ACL configuration errors', () => {
+  const synthesizeWith = (webAclArn: string) => () =>
+    synthesizeSite(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn } }));
+
+  it('refuses to synthesize when the web ACL ARN is empty', () => {
+    expect(synthesizeWith('')).toThrow(
+      error('pricingPlan.webAclArn is empty. Set it to the ARN of the CLOUDFRONT-scope web ACL (docs/adr/0002).'),
+    );
+  });
+
+  // Each ARN changes one part of TEST_WEB_ACL_ARN, which the Free-plan tests synthesize successfully.
+  it.each([
+    ['another partition', TEST_WEB_ACL_ARN.replace('arn:aws:', 'arn:aws-cn:')],
+    ['another service', TEST_WEB_ACL_ARN.replace(':wafv2:', ':waf-regional:')],
+    ['the REGIONAL scope', TEST_WEB_ACL_ARN.replace(':global/', ':regional/')],
+    ['another Region', TEST_WEB_ACL_ARN.replace(':us-east-1:', ':us-east-2:')],
+    ['another account', TEST_WEB_ACL_ARN.replace(':426499248998:', ':111111111111:')],
+  ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
+    expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
+    expect(synthesizeWith(webAclArn)).toThrow(
+      error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by 426499248998: ${webAclArn}`),
+    );
+  });
+
+  // Paste errors that CloudFront or the pricing plan would otherwise reject only at deploy time.
+  it.each([
+    ['nothing after the scope', TEST_WEB_ACL_ARN.replace(/\/.*$/, '')],
+    ['another WAF resource type', TEST_WEB_ACL_ARN.replace('/webacl/', '/ipset/')],
+    ['no web ACL ID', TEST_WEB_ACL_ARN.replace(/\/[^/]*$/, '')],
+    ['a truncated web ACL ID', TEST_WEB_ACL_ARN.slice(0, -1)],
+    ['a trailing newline', `${TEST_WEB_ACL_ARN}\n`],
+    ['an extra path segment', `${TEST_WEB_ACL_ARN}/extra`],
+    ['the ARN pasted twice', TEST_WEB_ACL_ARN.repeat(2)],
+    ['a colon after the scope', TEST_WEB_ACL_ARN.replace(':global/', ':global:')],
+  ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
+    expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
+    expect(synthesizeWith(webAclArn)).toThrow(
+      error(`pricingPlan.webAclArn must have the form arn:aws:wafv2:us-east-1:<account>:global/webacl/<name>/<ID>: ${webAclArn}`),
+    );
+  });
+
+  it('accepts a web ACL name with hyphens and underscores and an ID with any lowercase hex digit', () => {
+    const webAclArn = TEST_WEB_ACL_ARN.replace(/zachverse\/[0-9a-f-]{36}$/, `zachverse_site-1/${ANY_ID}`);
+    const { json } = synthesizeWith(webAclArn)();
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(webAclArn);
+  });
+
+  it.each([
+    ['a WAF Classic web ACL ID', '00000000-0000-0000-0000-000000000000'],
+    ['an ARN with a leading space', ` ${TEST_WEB_ACL_ARN}`],
+  ])('rejects %s as malformed, naming it', (_case, webAclArn) => {
+    // aws-cdk-lib's ARN parser words these errors, so pin only the value they name.
+    expect(synthesizeWith(webAclArn)).toThrow(error(expect.stringContaining(webAclArn)));
+  });
+
+  it('checks ownership against the configured account', () => {
+    const otherAccount = productionConfig({
+      account: '111111111111',
+      certificateArn: TEST_CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:'),
+      pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN },
+    });
+    expect(() => synthesizeSite(otherAccount)).toThrow(
+      error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by 111111111111: ${TEST_WEB_ACL_ARN}`),
     );
   });
 });

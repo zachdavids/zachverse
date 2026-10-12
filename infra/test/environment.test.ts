@@ -9,8 +9,14 @@ const EXPECTED_ACCOUNT = '426499248998';
 // Every stack and regional resource lives in us-east-1 (docs/adr/0002).
 const EXPECTED_REGION = 'us-east-1';
 
-describe('stack environments', () => {
-  const stacks = synthesizeAll();
+// Production deploys one of these, so both are checked whichever production.pricingPlan selects.
+const modes = {
+  'pay-as-you-go': productionConfig({ pricingPlan: undefined }),
+  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
+};
+
+describe.each(Object.entries(modes))('stack environments (%s)', (_mode, config) => {
+  const stacks = synthesizeAll(config);
 
   it('defines the expected stacks', () => {
     expect(stacks.map((s) => s.stack.stackName)).toEqual(['ZachverseSite']);
@@ -44,21 +50,44 @@ const SITE_RESOURCES = {
   SiteDistribution3FF9535D: 'AWS::CloudFront::Distribution',
 };
 
+// So does changing a create-only property ("Update requires: Replacement" in the CloudFormation template
+// reference), with the same rule. Those left unset are pinned as undefined, so setting one fails too.
+const SITE_CREATE_ONLY_PROPERTIES = {
+  SiteBucket397A1860: { BucketName: undefined, BucketNamePrefix: undefined, BucketNamespace: undefined },
+  SiteBucketPolicy3AC1D0F8: { Bucket: { Ref: 'SiteBucket397A1860' } },
+  ViewerRequestFunction48E73F66: { Name: 'us-east-1ZachverseSiteVierRequestFunctionF2C3C812' },
+};
+
 function logicalIds(resources: Record<string, { Type: string }>) {
   return Object.fromEntries(Object.entries(resources).map(([id, r]) => [id, r.Type]));
 }
 
 describe('logical ID stability', () => {
   it('keeps site resource logical IDs fixed', () => {
-    const [site] = synthesizeAll();
+    const [site] = synthesizeAll(modes['pay-as-you-go']);
     expect(logicalIds(site!.json.Resources)).toEqual(SITE_RESOURCES);
   });
 
   it('enabling the Free plan only adds the subscription; nothing is replaced', () => {
-    const [site] = synthesizeAll(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }));
+    const [site] = synthesizeAll(modes['Free flat-rate plan']);
     expect(logicalIds(site!.json.Resources)).toEqual({
       ...SITE_RESOURCES,
       PricingPlanSubscription: 'AWS::PricingPlanManager::Subscription',
     });
+  });
+
+  it.each(Object.entries(modes))('keeps every create-only property fixed (%s)', (_mode, config) => {
+    const [site] = synthesizeAll(config);
+    const expected: Record<string, Record<string, unknown>> = {
+      ...SITE_CREATE_ONLY_PROPERTIES,
+      ...(config.pricingPlan && { PricingPlanSubscription: { PlanFamily: 'CloudFront' } }),
+    };
+    const actual = Object.fromEntries(
+      Object.entries(expected).map(([id, properties]) => {
+        const values = site!.json.Resources[id]?.Properties ?? {};
+        return [id, Object.fromEntries(Object.keys(properties).map((name) => [name, values[name]]))];
+      }),
+    );
+    expect(actual).toEqual(expected);
   });
 });

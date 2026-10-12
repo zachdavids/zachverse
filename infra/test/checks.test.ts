@@ -148,17 +148,22 @@ describe('retentionViolations', () => {
   it.each([
     ['no retention policies', {}],
     ['only DeletionPolicy Retain', { DeletionPolicy: 'Retain' }],
+    ['only DeletionPolicy RetainExceptOnCreate', { DeletionPolicy: 'RetainExceptOnCreate' }],
     ['only UpdateReplacePolicy Retain', { UpdateReplacePolicy: 'Retain' }],
   ])('flags a resource with %s', (_case, policies) => {
     expect(retentionViolations({ Resources: { Bucket: { Type: 'AWS::S3::Bucket', ...policies } } })).toEqual([
-      'Bucket (AWS::S3::Bucket) must have DeletionPolicy and UpdateReplacePolicy Retain',
+      'Bucket (AWS::S3::Bucket) must have DeletionPolicy Retain or RetainExceptOnCreate, and UpdateReplacePolicy Retain',
     ]);
   });
 
-  it('accepts a resource retained on both deletion and replacement', () => {
-    const bucket = { Type: 'AWS::S3::Bucket', DeletionPolicy: 'Retain', UpdateReplacePolicy: 'Retain' };
-    expect(retentionViolations({ Resources: { Bucket: bucket } })).toEqual([]);
-  });
+  // RetainExceptOnCreate differs from Retain only when the operation that created the resource rolls back.
+  it.each(['Retain', 'RetainExceptOnCreate'])(
+    'accepts a resource with DeletionPolicy %s and UpdateReplacePolicy Retain',
+    (deletionPolicy) => {
+      const bucket = { Type: 'AWS::S3::Bucket', DeletionPolicy: deletionPolicy, UpdateReplacePolicy: 'Retain' };
+      expect(retentionViolations({ Resources: { Bucket: bucket } })).toEqual([]);
+    },
+  );
 });
 
 // Operation lists from the Amazon Route 53 API Reference ("Amazon Route 53" and "Amazon Route 53
