@@ -23,7 +23,7 @@ const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
 
 function synth(build: (stack: Stack) => void): CfnTemplate {
-  const stack = new Stack(new App(), 'Offending', { env: { account: '426499248998', region: 'us-east-2' } });
+  const stack = new Stack(new App(), 'Offending', { env: { account: '426499248998', region: 'us-east-1' } });
   build(stack);
   return Template.fromStack(stack).toJSON() as CfnTemplate;
 }

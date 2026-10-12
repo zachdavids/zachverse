@@ -1,14 +1,14 @@
 export interface PricingPlanConfig {
   /** Only the no-cost tier is modelled; a paid tier must be a deliberate code change. */
   readonly tier: 'FREE';
-  /** CLOUDFRONT-scope web ACL in us-east-1, created outside CloudFormation (ADR 0002). */
+  /** CLOUDFRONT-scope web ACL (us-east-1); how it is created is decided in milestone 7. */
   readonly webAclArn: string;
 }
 
 export interface SiteConfig {
-  /** AWS project account that owns the existing hosted zone. */
+  /** Website account (426499248998), which owns the existing hosted zone. Never an administrative account. */
   readonly account: string;
-  /** Project Region. Every stack deploys here; the managed SCP denies CloudFormation in us-east-1. */
+  /** Region for every stack and regional resource (ADR 0002). */
   readonly region: string;
   /** Existing public hosted zone. Referenced only; never created or modified by CDK. */
   readonly hostedZoneId: string;
@@ -27,7 +27,7 @@ export interface SiteConfig {
 
 export const production: SiteConfig = {
   account: '426499248998',
-  region: 'us-east-2',
+  region: 'us-east-1',
   hostedZoneId: 'Z03492543O0YEY0RDZZ0J',
   domainName: 'zachdavids.com',
   wwwDomainName: 'www.zachdavids.com',

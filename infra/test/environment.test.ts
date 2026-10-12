@@ -2,9 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { productionConfig, synthesizeAll, TEST_WEB_ACL_ARN } from './support/synth';
 
 const EXPECTED_ACCOUNT = '426499248998';
-// The managed SCP denies CloudFormation in us-east-1, so every stack lives in
-// the project Region (docs/adr/0002).
-const EXPECTED_REGION = 'us-east-2';
+// Every stack and regional resource lives in us-east-1 (docs/adr/0002).
+const EXPECTED_REGION = 'us-east-1';
 
 describe('stack environments', () => {
   const stacks = synthesizeAll();

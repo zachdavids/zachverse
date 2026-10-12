@@ -5,7 +5,7 @@
 
 ## Decision
 
-`ZachverseSite` (us-east-2) contains a private S3 bucket, an origin access control, one CloudFront Function, and one distribution. When `pricingPlan` is configured it also contains a pricing-plan subscription.
+`ZachverseSite` (us-east-1) contains a private S3 bucket, an origin access control, one CloudFront Function, and one distribution. When `pricingPlan` is configured it also contains a pricing-plan subscription.
 
 - **Bucket:** Block Public Access on, bucket-owner-enforced ownership, SSE-S3, a TLS-only policy, no static website hosting. Versioning is on, and noncurrent versions expire after 90 days, so files overwritten by a release can be recovered.
 - **Origin access:** the S3 REST endpoint through OAC (SigV4, always). The bucket policy allows only `s3:GetObject` and `s3:ListBucket` to `cloudfront.amazonaws.com`, conditioned on this distribution's ARN. `ListBucket` makes S3 return 404 rather than 403 for missing keys.
@@ -22,7 +22,7 @@ These checks run on every stack, with the pricing plan both off and on:
 
 - No hosted zones, Route 53 records or domains, custom resources, Lambda functions, CloudFormation-managed certificates, or StackSets.
 - No IAM permission that can change DNS, unless it is limited to the exact ACM validation names, CNAME, CREATE/UPSERT, and this zone.
-- Every resource retained; account `426499248998`, Region `us-east-2`, and termination protection on every stack.
+- Every resource retained; account `426499248998`, Region `us-east-1`, and termination protection on every stack.
 - Free-plan compatibility, per the [plan feature table](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html):
   - at most 5 cache behaviors, and only AWS-managed cache, origin-request, and response-header policy IDs;
   - no legacy cache settings, OAI, logging, real-time logs, Origin Shield, origin groups, staging, Lambda@Edge, or KeyValueStore;

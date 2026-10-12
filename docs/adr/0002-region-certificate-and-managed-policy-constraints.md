@@ -1,29 +1,37 @@
-# ADR 0002: Project Region, certificate, and managed-policy constraints
+# ADR 0002: Region, certificate, and organization-policy constraints
 
-- Status: Accepted (decisions); open blockers listed below
-- Date: 2026-10-11
-
-## Context
-
-The AWS project uses the new AWS experience. The account is `426499248998`, and it owns hosted zone `Z03492543O0YEY0RDZZ0J`. The project Region is `us-east-2`, per `~/.aws/config`; confirm it in AWS Settings › View all projects › Overview › Additional info › Region. AWS manages the organization's SCPs ([published policies](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html), read 2026-10-11).
-
-Read-only calls on 2026-10-11 as `AccountFullAccessRole` returned these explicit SCP denials:
-
-| Call | Region | Denied by |
-| --- | --- | --- |
-| `cloudformation:ListStacks`, `ssm:GetParameter` | us-east-1 | `p-jx3i24et` (Region policy; us-east-1 allows only global services such as CloudFront, ACM, IAM, Route 53, WAF) |
-| `iam:ListOpenIDConnectProviders` | global | `p-ri5x5l1l` (Paid-plan policy, `iam:*Provider*` deny) |
-| `pricingplanmanager:ListSubscriptions` | us-east-1 / us-east-2 | `p-ri5x5l1l` / `p-jx3i24et` |
-
-The same calls in us-east-2 succeeded: CloudFormation has no stacks there, and the CDK bootstrap parameter is absent.
+- Status: Accepted. Deployment is blocked by SCP `p-ie47xwqg` (see "Blocker")
+- Date: 2026-10-11, revised after AWS advanced features were activated
 
 ## Decision
 
-1. Every stack deploys to `us-east-2`, and CDK is bootstrapped there. This replaces the original plan's us-east-1 bootstrap, which the Region policy blocks.
-2. The CloudFront certificate must live in us-east-1, so it is requested with the AWS CLI rather than CloudFormation. It is validated by a reviewed change batch in `infra/dns/` that contains exactly the ACM validation CNAMEs, and its ARN goes in `infra/lib/config.ts`. No stack, custom resource, or deploy role gets Route 53 write access. The site stack refuses to synthesize without an ARN that is in us-east-1 and owned by the project account.
-3. A CLOUDFRONT-scope web ACL is also us-east-1-only, so it cannot be a CloudFormation resource here either. The site stack takes its ARN as configuration; how the ACL is created is decided in milestone 7.
+1. All regional Zachverse infrastructure lives in **us-east-1** in the Website account `426499248998`, which owns hosted zone `Z03492543O0YEY0RDZZ0J`. That covers the CDK bootstrap, every stack, the S3 bucket, the ACM certificate, and the CLOUDFRONT-scope WAF ACL. CloudFront, Route 53, and IAM are global. Nothing is deployed to us-east-2 (the project's originally selected Region), or to the Management (`969788248923`) or Identity Delegated Admin accounts.
+2. The certificate is still requested outside CloudFormation and validated by a reviewed change batch in `infra/dns/`. CloudFormation-managed DNS validation would write records using the CDK execution role's full permissions, and the records would belong to a stack. Out-of-band validation limits DNS writes to the exact validation names and keeps the zone independent of the stacks.
+3. The web ACL can become a CloudFormation resource once CloudFormation is allowed in us-east-1. That is decided in milestone 7.
 
-## Open blockers
+## Evidence
 
-- **Milestone 3, GitHub OIDC:** `iam:*Provider*` is denied, so the project cannot create or reuse the GitHub OIDC provider. The documented policy that applies after activating advanced features has no such deny, but that is unverified until activation, which is the project owner's decision in AWS Settings.
-- **Milestone 7, flat-rate plan:** `pricingplanmanager:*` is not allowed by the Paid-plan policy. It is also missing from the documented post-activation us-east-1 allow-list, so `AWS::PricingPlanManager::Subscription` may stay blocked even after activation. Verify this before relying on the Free plan.
+All checks were run on 2026-10-11, after activation, as `AccountFullAccessRole` in `426499248998`. The organization is `o-zo739dr2bx`, with management account `969788248923`. The Website account cannot read SCP contents (`organizations:DescribePolicy` is denied).
+
+| Check | us-east-1 result |
+| --- | --- |
+| Real calls: `cloudformation:ListStacks`, `ssm:GetParameter`, `ecr:DescribeRepositories`, `pricingplanmanager:ListSubscriptions` (the last one is global, so it is denied from any Region) | explicit deny, SCP `p-ie47xwqg` |
+| Real call: `iam:ListOpenIDConnectProviders` | allowed (the earlier `iam:*Provider*` deny is gone) |
+| `iam:SimulatePrincipalPolicy`, `aws:RequestedRegion=us-east-1`, Organizations decision | **denied:** CloudFormation (CreateStack, Create/ExecuteChangeSet, DescribeStacks, UpdateTerminationProtection), S3 (CreateBucket, PutBucketPolicy, PutBucketVersioning, PutObject), SSM (Get/PutParameter), ECR (CreateRepository, SetRepositoryPolicy), Pricing Plan Manager (Create/ListSubscriptions). **allowed:** IAM (CreateRole, PutRolePolicy, PassRole, CreateOpenIDConnectProvider), ACM, WAF, CloudFront, KMS, STS |
+
+These results match the `UsEast1Partitional` statement that AWS [publishes](https://docs.aws.amazon.com/accounts/latest/reference/scps-and-rcps-for-projects.html) for projects with advanced features. That statement is a `Deny` on `NotAction` (a list of global services), with `StringEquals aws:RequestedRegion = us-east-1`. The list excludes `cloudformation`, most of `s3`, `ssm`, `ecr`, and `pricingplanmanager`.
+
+## Blocker and proposed adjustment
+
+The smallest change that unblocks the decision: add these to the `NotAction` list of `UsEast1Partitional` in `p-ie47xwqg`.
+
+```json
+"cloudformation:*", "s3:*", "ssm:*", "ecr:*", "pricingplanmanager:*"
+```
+
+- `cloudformation`, `s3`, `ssm`, `ecr`: the CDK bootstrap (staging bucket, version parameter, and the container repository in the default template) and stack deployments. `s3` also covers the site bucket and uploads.
+- `pricingplanmanager`: the milestone 7 subscription. This one is needed regardless of where the stacks live.
+
+Every other service stays denied in us-east-1, and the other statements are unchanged. If the policy is attached above the Website account (at the root or an OU), limit the exemption to `426499248998` so the administrative accounts keep the original control. To do that, add `"StringNotEquals": {"aws:PrincipalAccount": "426499248998"}` to the existing statement, and add a copy of the statement with the expanded list conditioned on that account.
+
+Before applying this, read the live policy, its attachment targets, and whether AWS manages it, from the management account.
