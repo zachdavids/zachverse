@@ -9,7 +9,7 @@ Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) 
 | --- | --- |
 | `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML |
 | `scripts/` | Prerender step and post-build output check |
-| `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows and CI steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; crawler files. The suite's helpers in `tests/support/` count toward the web coverage gate, so the gate fails if the suite stops running |
+| `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows and CI steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
 | `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and synthesized-template checks |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
 | `docs/` | Architecture decisions (`docs/adr/`) and milestone status (`docs/progress.md`) |
