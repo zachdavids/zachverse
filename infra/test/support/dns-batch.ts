@@ -1,13 +1,16 @@
 // Validates Route 53 change batches (the JSON passed to
 // `aws route53 change-resource-record-sets --change-batch`) kept in infra/dns/.
-// Website batches may only touch website routing and ACM validation records.
+// Website batches may only touch website routing and ACM validation records,
+// may never delete a validation record, and may give the site certificate's
+// validation records no value but the one committed.
 import { readdirSync, readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { ACM_VALIDATION_NAME } from '../../lib/guardrails/checks';
+import type { Json } from '../../lib/guardrails/template';
 
-type Json = any;
-
-export const ACM_VALIDATION_NAME = /^_[0-9a-f]{32}\.(?:www\.)?zachdavids\.com$/;
 const ACM_VALIDATION_VALUE = /^_[0-9a-f]{32}\.[a-z0-9]+\.acm-validations\.aws$/;
+// Validation records stay while a certificate for these names is in use, which no batch can show, so no DELETE passes.
+const KEEP_VALIDATION = 'ACM validation records may not be deleted: ACM renews a certificate for these names only while they resolve';
 // A Map, so a record named "constructor" or "__proto__" cannot reach Object.prototype.
 const WEBSITE_RECORDS = new Map([
   ['zachdavids.com', ['A', 'AAAA']],
@@ -17,6 +20,16 @@ const WEBSITE_RECORDS = new Map([
 const CLOUDFRONT_ALIAS_ZONE = 'Z2FDTNDATAQYW2';
 
 const normalize = (name: string) => name.toLowerCase().replace(/\.$/, '');
+
+/**
+ * The site certificate's validation records, as its committed batch creates them: each name with its value, both
+ * normalized. While the certificate is in use no other value is right for these names, and ACM renews it only while
+ * they resolve.
+ */
+const SITE_CERTIFICATE_VALIDATION = new Map<string, string>(
+  JSON.parse(readFileSync(path.join(__dirname, '..', '..', 'dns', '2026-10-13-acm-validation.json'), 'utf8'))
+    .Changes.map(({ ResourceRecordSet: rrs }: Json) => [normalize(rrs.Name), normalize(rrs.ResourceRecords[0].Value)]),
+);
 
 export function dnsBatchViolations(batch: Json): string[] {
   const out: string[] = [];
@@ -30,13 +43,18 @@ export function dnsBatchViolations(batch: Json): string[] {
     if (!['CREATE', 'UPSERT', 'DELETE'].includes(change?.Action)) out.push(`${where}: unknown action`);
 
     if (ACM_VALIDATION_NAME.test(name)) {
+      if (change?.Action === 'DELETE') out.push(`${where}: ${KEEP_VALIDATION}`);
       if (rrs.Type !== 'CNAME') out.push(`${where}: ACM validation records must be CNAME`);
       const records: Json[] = Array.isArray(rrs.ResourceRecords) ? rrs.ResourceRecords : [];
       // An alias (or no value at all) would skip the value check below.
       if (records.length === 0) out.push(`${where}: ACM validation records need a value, not an alias`);
+      const committed = SITE_CERTIFICATE_VALIDATION.get(name);
       for (const record of records) {
-        if (!ACM_VALIDATION_VALUE.test(normalize(String(record?.Value)))) {
+        const value = normalize(String(record?.Value));
+        if (!ACM_VALIDATION_VALUE.test(value)) {
           out.push(`${where}: value is not an ACM validation target`);
+        } else if (committed !== undefined && value !== committed) {
+          out.push(`${where}: the site certificate validates through this record, so its value must stay ${committed}`);
         }
       }
       return;

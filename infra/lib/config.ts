@@ -40,9 +40,10 @@ export interface SiteConfig {
   readonly wwwDomainName: string;
   /**
    * us-east-1 ACM certificate for both hostnames, requested and DNS-validated
-   * outside CloudFormation (ADR 0002). Required to synthesize the site stack.
+   * outside CloudFormation (ADR 0002). The site stack refuses to synthesize
+   * without a valid one.
    */
-  readonly certificateArn?: string;
+  readonly certificateArn: string;
   /** CloudFront flat-rate plan. Omit for pay-as-you-go (the initial deployment). */
   readonly pricingPlan?: PricingPlanConfig;
   /** GitHub Actions identity allowed to publish the website. */
@@ -55,8 +56,8 @@ export const production: SiteConfig = {
   hostedZoneId: 'Z03492543O0YEY0RDZZ0J',
   domainName: 'zachdavids.com',
   wwwDomainName: 'www.zachdavids.com',
-  // Set after the certificate is issued (milestone 4).
-  certificateArn: undefined,
+  // Requested on 2026-10-13; infra/dns/2026-10-13-acm-validation.json holds its validation records.
+  certificateArn: 'arn:aws:acm:us-east-1:426499248998:certificate/f285dc12-6f64-4d9b-8309-043d5e90f354',
   pricingPlan: undefined,
   github: {
     ownerName: 'zachdavids',

@@ -10,8 +10,8 @@ import { createStacks } from '../lib/app';
 import { production } from '../lib/config';
 import { IdentityStack } from '../lib/identity-stack';
 import { SiteStack } from '../lib/site-stack';
-import { prohibitedResourceViolations } from './support/checks';
-import { productionConfig, synthesizeAll, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import { prohibitedResourceViolations } from '../lib/guardrails/checks';
+import { productionConfig, synthesizeAll, synthesizeSite, TEST_WEB_ACL_ARN } from './support/synth';
 
 // The real createStacks, wrapped so one test can make the app build a differently named stack.
 vi.mock('../lib/app', async (importOriginal) => {
@@ -20,31 +20,23 @@ vi.mock('../lib/app', async (importOriginal) => {
 });
 
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
-const originalCertificateArn = production.certificateArn;
 
 afterEach(() => {
   vi.mocked(createStacks).mockReset();
-  Object.assign(production, { certificateArn: originalCertificateArn });
 });
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 describe('productionConfig', () => {
-  it('is the production config with the placeholder certificate while none is configured', () => {
-    Object.assign(production, { certificateArn: undefined });
-    expect(productionConfig()).toEqual({ ...production, certificateArn: TEST_CERTIFICATE_ARN });
-  });
-
-  it('uses the configured certificate once it is set', () => {
-    const issued = TEST_CERTIFICATE_ARN.replace(/0{8}-/, '12345678-');
-    Object.assign(production, { certificateArn: issued });
-    expect(productionConfig()).toEqual({ ...production, certificateArn: issued });
+  it('is the production config, certificate included', () => {
+    expect(productionConfig()).toEqual(production);
   });
 
   it('applies overrides on top', () => {
     const pricingPlan = { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } as const;
-    const certificateArn = TEST_CERTIFICATE_ARN.replace(/0{8}-/, '87654321-');
+    const certificateArn = production.certificateArn.replace(/\/[0-9a-f]{8}-/, '/87654321-');
+    expect(certificateArn).not.toBe(production.certificateArn);
     expect(productionConfig({ pricingPlan, certificateArn })).toEqual({ ...production, pricingPlan, certificateArn });
   });
 });

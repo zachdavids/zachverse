@@ -24,6 +24,7 @@ import { githubOidcSubject, production } from '../lib/config';
 import {
   deployRoleViolations,
   dnsWriteViolations,
+  environmentViolations,
   freePlanViolations,
   freePlanWebAclViolations,
   githubTrustViolations,
@@ -33,9 +34,9 @@ import {
   prohibitedResourceViolations,
   retentionViolations,
   WEBSITE_DEPLOY_ACTIONS,
-} from './support/checks';
-import type { CfnResource, CfnTemplate } from './support/synth';
-import { PRICING_MODES, synthesizeAll, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+} from '../lib/guardrails/checks';
+import type { CfnResource, CfnTemplate } from '../lib/guardrails/template';
+import { PRICING_MODES, synthesizeAll, synthesizeSite, TEST_WEB_ACL_ARN } from './support/synth';
 
 const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -712,7 +713,7 @@ describe.each(Object.entries(PRICING_MODES))('freePlanViolations (%s)', (_mode, 
       `${DIST}: CacheTagConfig: cache-tag invalidation needs Pro or higher`],
     ['origin mutual TLS', (c) => c.Origins.push({
       ...API_ORIGIN,
-      CustomOriginConfig: { ...API_ORIGIN.CustomOriginConfig, OriginMtlsConfig: { ClientCertificateArn: TEST_CERTIFICATE_ARN } },
+      CustomOriginConfig: { ...API_ORIGIN.CustomOriginConfig, OriginMtlsConfig: { ClientCertificateArn: production.certificateArn } },
     }), `${DIST} origin Api: origin mutual TLS needs Business or higher`],
     ['more than five cache behaviors',
       (c) => (c.CacheBehaviors = Array.from({ length: 5 }, (_, i) => ({ ...c.DefaultCacheBehavior, PathPattern: `/p${i}/*` }))),
@@ -1623,5 +1624,33 @@ describe('deployRoleViolations', () => {
         `Policy: ${what} is not this stack's bucket, objects in it, or its distribution, so it cannot be verified`,
       ]);
     });
+  });
+});
+
+describe('environmentViolations', () => {
+  // Spelled out here rather than read from checks.ts, so changing the rule fails a test.
+  const website = { account: '426499248998', region: 'us-east-1', terminationProtection: true };
+
+  it('accepts a stack in the Website account and us-east-1 with termination protection', () => {
+    expect(environmentViolations(website)).toEqual([]);
+  });
+
+  it.each<[string, Partial<typeof website>, string]>([
+    ['the Management account', { account: '969788248923' }, 'account must be 426499248998, the Website account, not 969788248923'],
+    ['the Identity Delegated Admin account', { account: '796429457615' },
+      'account must be 426499248998, the Website account, not 796429457615'],
+    ["us-east-2, the default CLI profile's Region", { region: 'us-east-2' }, 'Region must be us-east-1, not us-east-2'],
+    ['termination protection turned off', { terminationProtection: false }, 'termination protection must be on'],
+  ])('flags %s', (_case, change, expected) => {
+    expect(environmentViolations({ ...website, ...change })).toEqual([expected]);
+  });
+
+  // Such a stack deploys wherever the CLI's credentials point, such as the default profile's us-east-2.
+  it('flags a stack without an environment, whose account and Region are left to deployment', () => {
+    expect(environmentViolations(new Stack(new App(), 'Anywhere'))).toEqual([
+      expect.stringMatching(/^account must be 426499248998, the Website account, not \$\{Token\[AWS\.AccountId\.\d+\]\}$/),
+      expect.stringMatching(/^Region must be us-east-1, not \$\{Token\[AWS\.Region\.\d+\]\}$/),
+      'termination protection must be on',
+    ]);
   });
 });

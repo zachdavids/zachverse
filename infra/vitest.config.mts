@@ -10,7 +10,8 @@ export default defineConfig({
     testTimeout: 30_000,
     coverage: {
       provider: 'v8',
-      // The guardrail checks in test/support are code under test too.
+      // The template guardrails (lib/guardrails/), and test/support's DNS batch checks and synthesis helpers, are code
+      // under test too.
       include: ['lib/**/*.ts', 'bin/**/*.ts', 'functions/**/*.js', 'test/support/**/*.ts'],
       reporter: ['text', 'json-summary'],
       thresholds: { 100: true },
