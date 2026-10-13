@@ -41,8 +41,17 @@ const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
   },
   { matches: (t) => t === 'AWS::CloudFormation::StackSet', reason: 'StackSets are not allowed in this project' },
   {
-    matches: (t) => t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application',
-    reason: 'nested stacks are not checked by these guardrails',
+    // Service Catalog products launch their own templates, and its other types exist only to serve products.
+    matches: (t) =>
+      t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application' || t.startsWith('AWS::ServiceCatalog::'),
+    reason: 'nested stacks and Service Catalog products launch templates these guardrails do not check',
+  },
+  {
+    // Last of the CloudFormation rules, so those above keep their reasons. Change sets carry their own templates;
+    // hooks, macros, modules, and registry types run code or rewrite templates during deployment; wait conditions
+    // take outside input.
+    matches: (t) => t.startsWith('AWS::CloudFormation::'),
+    reason: 'other CloudFormation resource types are not checked by these guardrails',
   },
   {
     // Registry extensions: third-party types such as Cloudflare::Dns::Record, private types, and modules.
@@ -70,7 +79,8 @@ export function prohibitedResourceViolations(template: CfnTemplate): string[] {
 /**
  * Every resource must survive stack deletion and replacement. RetainExceptOnCreate also counts: it
  * differs from Retain only by deleting a resource when the operation that created it rolls back.
- * AWS::CDK::Metadata, which CDK's version reporting adds, holds no data, so deleting it loses nothing.
+ * AWS::CDK::Metadata, which CDK's version reporting adds, creates nothing in the account (it carries only the
+ * version-reporting record), so deleting it loses nothing.
  */
 export function retentionViolations(template: CfnTemplate): string[] {
   return Object.entries(template.Resources ?? {})

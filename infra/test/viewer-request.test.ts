@@ -11,18 +11,26 @@ type Querystring = Record<string, { value: string; multiValue?: { value: string 
 type Handler = (event: unknown) => any;
 
 // cloudfront-js-2.0 is ES 5.1 plus the ES 6-12 features listed in functions-javascript-runtime-20.html (read
-// 2026-10-12). Node's V8 has far more, so these tests narrow it: runtimeContext deletes the built-ins outside
-// RUNTIME_BUILT_INS, so a test fails when the function calls one, and syntaxViolations rejects the syntax the page
-// does not list. Neither shows where the runtime and V8 differ in a feature both have (its regular expressions
-// are PCRE, for example), and built-ins are checked only on the paths the tests run.
+// 2026-10-12). Node's V8 has far more, so these tests narrow it. runtimeContext deletes the string-keyed members
+// that RUNTIME_BUILT_INS does not list from the objects it names, so calling one throws, unless the prototype chain
+// supplies a fallback, as Object.prototype.toString does for functions (as on njs); a deleted accessor reads as
+// undefined. Symbol-keyed members stay, as do the well-known symbols on Symbol, so code that uses them passes even on
+// a path the tests run, though the page lists only RegExp's [Symbol.replace] and [Symbol.split]: [Symbol.iterator]()
+// and the next of the iterator it returns (which Promise.all needs), or Symbol.asyncIterator, for example.
+// syntaxViolations rejects the syntax the page does not list, and async function declarations anywhere but the top
+// level. It reads the parsed tree, plus the source text between the last argument or parameter and the closing
+// parenthesis to find trailing commas, so it does not check escape sequences inside string or template literals.
+// Neither shows where the runtime and V8 differ in a feature both have (its regular expressions are PCRE, for
+// example), and built-ins are checked only on the paths the tests run.
 
 // What each object keeps: the ES 5.1 built-ins, which the page says the runtime complies with, plus the newer ones
-// it lists. ES 5.1 members that the page's lists leave out, such as charCodeAt, stay, so calls to them pass. The
-// exceptions are those that njs, whose compatibility list the page mirrors, also lacks (its source, read 2026-10-12):
-// the locale methods outside Date, and Function.prototype.toString. Other string-keyed members are deleted. Members
-// keyed by symbols stay, as do the well-known symbols on Symbol, which V8 will not delete. Listed globals that V8
-// lacks (atob, btoa, Buffer, TextEncoder, TextDecoder, InternalError, require) stay absent, so code using one fails
-// here until it is added.
+// it lists, and the iterators' next, which listed built-ins step through (see the iterator entries below). ES 5.1
+// members that the page's lists leave out, such as charCodeAt, stay, so calls to them pass. The exceptions are those
+// that njs, whose compatibility list the page mirrors, also lacks (its source, read 2026-10-12): the locale methods
+// outside Date, and Function.prototype.toString. Other string-keyed members are deleted. Members keyed by symbols
+// stay, as do the well-known symbols on Symbol, which V8 will not delete. Listed globals that V8 lacks (atob, btoa,
+// Buffer, TextEncoder, TextDecoder, InternalError, require) stay absent, so code using one fails here until it is
+// added.
 const RUNTIME_BUILT_INS: Record<string, string> = {
   globalThis:
     'globalThis NaN Infinity undefined eval parseInt parseFloat isNaN isFinite decodeURI decodeURIComponent encodeURI ' +
@@ -79,6 +87,17 @@ const RUNTIME_BUILT_INS: Record<string, string> = {
   'Object.getPrototypeOf(Int8Array.prototype)':
     'buffer byteLength byteOffset length copyWithin every fill filter find findIndex forEach includes indexOf join ' +
     'lastIndexOf map reduce reduceRight reverse set slice some sort subarray toString',
+  // The iterators that [Symbol.iterator]() returns. The page lists no iterator API, but Promise.all, allSettled, any,
+  // and race and %TypedArray%.from step through arrays, typed arrays, and strings with their next.
+  'Object.getPrototypeOf([][Symbol.iterator]())': 'next',
+  "Object.getPrototypeOf(''[Symbol.iterator]())": 'next',
+  // Nothing the page lists returns this one: it has neither String.prototype.matchAll nor
+  // RegExp.prototype[@@matchAll].
+  "Object.getPrototypeOf(/a/g[Symbol.matchAll](''))": '',
+  // %IteratorPrototype%, with V8's ES2025 helpers (map, toArray, ...), and Iterator, with its static from: the global
+  // is gone, but %IteratorPrototype%.constructor still reaches it.
+  'Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))': '',
+  'Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())).constructor': '',
   console: 'log',
 };
 // Every object keeps these: they describe functions and link constructors to prototypes.
@@ -360,6 +379,7 @@ describe('syntaxViolations', () => {
       'var year = /(?<year>\\d{4})/gy;',
       'try { throw new Error("x"); } catch (e) {} finally {}',
       'function pick(first /* , second */) { function inner() {} return inner(first, (1, 2)); } // a, b',
+      'pick(\n  label // first, then the rest\n);',
     ].join('\n');
     expect(syntaxViolations(code)).toEqual([]);
   });
@@ -391,6 +411,7 @@ describe('syntaxViolations', () => {
     ['function handler() { async function later() {} }', 'nested async function declaration'],
     ['parts.push(name,);', 'trailing comma after the last argument'],
     ['throw new Error(message,);', 'trailing comma after the last argument'],
+    ['f(a /* x */, /* y */);', 'trailing comma after the last argument'],
     ['function serialize(querystring,) {}', 'trailing comma after the last parameter'],
     ['var square = (x,) => x * x;', 'trailing comma after the last parameter'],
   ])('rejects %s', (code, violation) => {
@@ -422,9 +443,31 @@ describe('runtimeContext', () => {
     'Object.fromEntries', 'Object.hasOwn', 'String.raw', 'Promise.withResolvers', 'Map', 'Set', 'WeakMap', 'Proxy',
     'Reflect', 'BigInt', 'Intl', 'Iterator', 'escape', 'console.error', "''.localeCompare", "''.toLocaleLowerCase",
     "''.toLocaleUpperCase", '({}).toLocaleString', '[].toLocaleString', '(0).toLocaleString',
+    '[][Symbol.iterator]().toArray', '[][Symbol.iterator]().map', '[][Symbol.iterator]().constructor.from',
+    "/a/g[Symbol.matchAll]('').next",
   ])('removes %s, which V8 has but the runtime does not list', (expression) => {
     expect(vm.runInNewContext(`typeof ${expression}`)).not.toBe('undefined');
     expect(vm.runInContext(`typeof ${expression}`, context)).toBe('undefined');
+  });
+
+  // Listed built-ins that step through iterators with next or call RegExp's symbol-keyed methods.
+  it.each([
+    ['Promise.all', 'Promise.all([1, Promise.resolve(2)]).then(function (values) { return values.join(); })', '1,2'],
+    [
+      'Promise.allSettled',
+      'Promise.allSettled([Promise.reject(1)]).then(function (results) { return results[0].status; })',
+      'rejected',
+    ],
+    ['Promise.any', 'Promise.any([Promise.reject(1), 2])', 2],
+    ['Promise.race', 'Promise.race([1, Promise.resolve(2)])', 1],
+    ['%TypedArray%.from on an array', 'Uint8Array.from([1, 2]).join()', '1,2'],
+    ['%TypedArray%.from on a string', "Uint8Array.from('12').join()", '1,2'],
+    ['String.prototype.match', "'a-b'.match(/-/).index", 1],
+    ['String.prototype.replace', "'a-b'.replace(/-/, '+')", 'a+b'],
+    ['String.prototype.search', "'a-b'.search(/b/)", 2],
+    ['String.prototype.split', "'a-b'.split(/-/).join()", 'a,b'],
+  ])('keeps what %s relies on', async (_name, code, result) => {
+    expect(await vm.runInContext(code, context)).toBe(result);
   });
 
   it('removes Function.prototype.toString, so functions inherit Object.prototype.toString as on njs', () => {
@@ -456,6 +499,12 @@ describe('runtimeContext', () => {
       ['host === WWW_HOST', 'host.localeCompare(WWW_HOST) === 0'],
       viewerRequest('/', 'www.zachdavids.com'),
       'host.localeCompare is not a function',
+    ],
+    [
+      'an iterator helper on an iterator from Symbol.iterator',
+      ['param.multiValue || [param]', 'param.multiValue ? param.multiValue[Symbol.iterator]().toArray() : [param]'],
+      viewerRequest('/', 'www.zachdavids.com', { tag: { value: 'a', multiValue: [{ value: 'a' }] } }),
+      'param.multiValue[Symbol.iterator](...).toArray is not a function',
     ],
   ] as const)('fails a function that calls %s, though Node runs it', (_case, [from, to], event, message) => {
     const source = readFileSync(VIEWER_REQUEST_SOURCE, 'utf8');

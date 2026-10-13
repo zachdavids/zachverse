@@ -21,7 +21,7 @@ import {
   retentionViolations,
 } from './support/checks';
 import type { CfnResource, CfnTemplate } from './support/synth';
-import { synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import { PRICING_MODES, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -43,7 +43,8 @@ describe('prohibitedResourceViolations', () => {
   const CUSTOM = 'custom resources (bucket emptying, bucket deployment, cross-Region helpers) are not allowed';
   const LAMBDA = 'website stacks need no Lambda functions (and Lambda@Edge is not allowed in this project)';
   const CERTIFICATE = 'the CloudFront certificate lives in us-east-1 and is managed outside CloudFormation (ADR 0002)';
-  const NESTED = 'nested stacks are not checked by these guardrails';
+  const NESTED = 'nested stacks and Service Catalog products launch templates these guardrails do not check';
+  const CLOUDFORMATION = 'other CloudFormation resource types are not checked by these guardrails';
   const EXTENSION = 'resource types outside the AWS namespace are not checked by these guardrails';
   const TRANSFORMED = 'transforms and macros rewrite the template during deployment, so these guardrails cannot see the result';
   const include = { Name: 'AWS::Include', Parameters: { Location: 's3://zachverse-snippets/dns.yaml' } };
@@ -128,6 +129,13 @@ describe('prohibitedResourceViolations', () => {
     ['AWS::CloudFormation::StackSet', 'StackSets are not allowed in this project'],
     ['AWS::CloudFormation::Stack', NESTED],
     ['AWS::Serverless::Application', NESTED],
+    ['AWS::ServiceCatalog::CloudFormationProvisionedProduct', NESTED],
+    ['AWS::ServiceCatalog::CloudFormationProduct', NESTED],
+    ['AWS::ServiceCatalog::Portfolio', NESTED],
+    // Every other AWS::CloudFormation type, as of aws-cdk-lib 2.273.
+    ...['ChangeSet', 'GeneratedTemplate', 'GuardHook', 'HookDefaultVersion', 'HookTypeConfig', 'HookVersion', 'LambdaHook', 'Macro',
+      'ModuleDefaultVersion', 'ModuleVersion', 'PublicTypeVersion', 'Publisher', 'ResourceDefaultVersion', 'ResourceVersion',
+      'TypeActivation', 'WaitCondition', 'WaitConditionHandle'].map((name) => [`AWS::CloudFormation::${name}`, CLOUDFORMATION]),
     ['Cloudflare::Dns::Record', EXTENSION],
     ['Zachverse::Dns::Records::MODULE', EXTENSION],
   ])('flags %s with its reason', (type, reason) => {
@@ -641,8 +649,9 @@ describe('dnsWriteViolations', () => {
   });
 });
 
-describe('freePlanViolations', () => {
-  const site = synthesizeSite().json;
+// Both pricing modes, so no test depends on whether production has a web ACL yet.
+describe.each(Object.entries(PRICING_MODES))('freePlanViolations (%s)', (_mode, config) => {
+  const site = synthesizeSite(config).json;
   const DIST = 'SiteDistribution3FF9535D';
   const FN = 'ViewerRequestFunction48E73F66';
   const ORIGIN: string = site.Resources[DIST]!.Properties!.DistributionConfig.Origins[0].Id;
@@ -857,11 +866,15 @@ describe('freePlanViolations', () => {
   describe('with a second distribution', () => {
     const PREVIEW = 'PreviewDistribution';
     const shared = (what: string) => `${what} is shared by ${DIST}, ${PREVIEW}: a pricing-plan distribution cannot share its functions or web ACL`;
-    /** Adds a copy of the site distribution, as a preview distribution might be, then changes both configs. */
+    /**
+     * Adds a copy of the site distribution, as a preview distribution might be, then changes both configs. The copy
+     * starts without a web ACL, so each test sets the web ACLs it means to test.
+     */
     const withPreview = (change: (preview: any, config: any, template: CfnTemplate) => void = () => {}) =>
       mutate((c, t) => {
         const preview = clone(t.Resources[DIST]!);
         preview.Properties!.DistributionConfig.Aliases = ['preview.zachdavids.com'];
+        delete preview.Properties!.DistributionConfig.WebACLId;
         t.Resources[PREVIEW] = preview;
         change(preview.Properties!.DistributionConfig, c, t);
       });

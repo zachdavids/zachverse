@@ -42,7 +42,7 @@ const SITE_RESOURCES = {
   SiteOriginAccessControl4DD454FF: 'AWS::CloudFront::OriginAccessControl',
   ViewerRequestFunction48E73F66: 'AWS::CloudFront::Function',
   SiteDistribution3FF9535D: 'AWS::CloudFront::Distribution',
-  // Added by CDK's version reporting (cdk.json); it holds no data.
+  // Added by CDK's version reporting (cdk.json); it carries the version-reporting record and creates nothing in the account.
   CDKMetadata: 'AWS::CDK::Metadata',
 };
 

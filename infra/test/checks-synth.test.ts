@@ -99,7 +99,9 @@ describe('synthesizeAll', () => {
     const stacks = synthesizeAll();
     expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite']);
     expect(prohibitedResourceViolations(stacks[0]!.json)).toEqual([
-      expect.stringMatching(/^Nested\w+ \(AWS::CloudFormation::Stack\): nested stacks are not checked by these guardrails$/),
+      expect.stringMatching(
+        /^Nested\w+ \(AWS::CloudFormation::Stack\): nested stacks and Service Catalog products launch templates these guardrails do not check$/,
+      ),
     ]);
   });
 });

@@ -82,7 +82,7 @@ describe('batchDirectoryViolations', () => {
     const outside = path.join(root, 'outside');
     mkdirSync(outside);
     writeFileSync(path.join(outside, 'rollback.json'), JSON.stringify({ Changes: [deleteMx] }));
-    // A junction needs no extra privileges on Windows; other systems ignore the type and make a directory symlink.
+    // A junction needs no extra privileges on Windows; other systems ignore the type and make a plain symlink.
     symlinkSync(outside, path.join(dir, 'linked'), 'junction');
     expect(batchDirectoryViolations(dir)).toEqual(['linked: not readable as JSON', `linked/rollback.json: ${MX}`]);
   });

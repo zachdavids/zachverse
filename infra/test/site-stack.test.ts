@@ -179,7 +179,7 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
 
   it('retains every resource on stack deletion and replacement, deleting only what a failed first create made', () => {
     // RetainExceptOnCreate: a rolled-back first deploy leaves no fixed-name function or OAC to block the retry.
-    // CDK's version-reporting metadata holds no data, and retentionViolations exempts it.
+    // CDK's version-reporting metadata creates nothing in the account, and retentionViolations exempts it.
     const retained = Object.entries(json.Resources).filter(([, resource]) => resource.Type !== 'AWS::CDK::Metadata');
     expect(retained).toHaveLength(Object.keys(json.Resources).length - 1);
     for (const [id, resource] of retained) {
@@ -364,6 +364,7 @@ describe('web ACL configuration errors', () => {
     ['a misplaced dash in the web ACL ID', TEST_WEB_ACL_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
     ['an empty web ACL name', TEST_WEB_ACL_ARN.replace('/zachverse/', '//')],
     ['a web ACL name longer than 128 characters', TEST_WEB_ACL_ARN.replace('/zachverse/', `/${'a'.repeat(129)}/`)],
+    ['a character WAF does not allow in the web ACL name', TEST_WEB_ACL_ARN.replace('/zachverse/', '/zach.verse/')],
   ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
     expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
     expect(synthesizeWith(webAclArn)).toThrow(
