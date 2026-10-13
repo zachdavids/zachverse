@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { afterAll, describe, expect, it } from 'vitest';
 import { githubOidcSubject, production } from '../lib/config';
 import { synthesizeAll } from './support/synth';
+
+// CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
+afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
 const PROVIDER = 'GitHubOidcProvider7EBF861F';
 const ROLE = 'SiteDeployRoleE4618DD6';

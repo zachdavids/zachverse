@@ -1,9 +1,17 @@
-import { Annotations, Match } from 'aws-cdk-lib/assertions';
+import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
 import { App } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
 import { SiteStack } from '../lib/site-stack';
-import { PRICING_MODES, productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import type { CfnTemplate } from './support/synth';
+import {
+  cdkContext,
+  PRICING_MODES,
+  productionConfig,
+  synthesizeSite,
+  TEST_CERTIFICATE_ARN,
+  TEST_WEB_ACL_ARN,
+} from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -271,10 +279,13 @@ const error = (message: unknown) => expect.objectContaining({ message });
 const ANY_ID = 'abcdef01-2345-4789-8bcd-ef0123456789';
 
 describe('site stack configuration errors', () => {
-  // The site stack itself: createStacks leaves it out until certificateArn is set.
+  // The site stack's template, with cdk.json's context. It builds the stack itself: createStacks leaves it out until
+  // certificateArn is set.
   const synthesizeWith = (certificateArn: string | undefined) => () => {
     const config = productionConfig({ certificateArn });
-    return new SiteStack(new App(), 'ZachverseSite', { env: { account: config.account, region: config.region }, config });
+    const env = { account: config.account, region: config.region };
+    const stack = new SiteStack(new App({ context: cdkContext }), 'ZachverseSite', { env, config });
+    return Template.fromStack(stack).toJSON() as CfnTemplate;
   };
 
   it.each([
@@ -331,7 +342,7 @@ describe('site stack configuration errors', () => {
 
   it('accepts a certificate ID with any lowercase hex digit', () => {
     const certificateArn = TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID);
-    const { json } = synthesizeWith(certificateArn)();
+    const json = synthesizeWith(certificateArn)();
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.ViewerCertificate.AcmCertificateArn).toBe(certificateArn);
   });
 

@@ -3,7 +3,8 @@ import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createStacks } from '../lib/app';
 import { production } from '../lib/config';
-import { PRICING_MODES, synthesizeAll } from './support/synth';
+import type { CfnResource } from './support/synth';
+import { PRICING_MODES, productionConfig, synthesizeAll } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -46,6 +47,16 @@ it('synthesizes only the identity stack until the certificate ARN is configured'
   expect(site).toBeUndefined();
 });
 
+// The identity stack deploys alone until milestone 4 sets the certificate. Adding the site stack must not change it (a
+// cross-stack reference would add an export to it), which also lets the checks on the full app cover it as deployed.
+it('synthesizes the same identity stack with or without the site stack', () => {
+  const alone = synthesizeAll(productionConfig({ certificateArn: undefined }));
+  const [identity, site] = synthesizeAll(productionConfig());
+  expect(alone.map((s) => s.stack.stackName)).toEqual(['ZachverseIdentity']);
+  expect(site!.stack.stackName).toBe('ZachverseSite');
+  expect(alone[0]!.json).toEqual(identity!.json);
+});
+
 // Changing a logical ID makes CloudFormation replace the resource (for the
 // distribution: a new domain name, and alias conflicts). Update these lists
 // only for an intended, reviewed replacement.
@@ -67,6 +78,10 @@ const SITE_RESOURCES = {
 
 // So does changing a create-only property ("Update requires: Replacement" in the CloudFormation template
 // reference), with the same rule. Those left unset are pinned as undefined, so setting one fails too.
+const IDENTITY_CREATE_ONLY_PROPERTIES = {
+  GitHubOidcProvider7EBF861F: { Url: 'https://token.actions.githubusercontent.com' },
+  SiteDeployRoleE4618DD6: { RoleName: 'zachverse-github-site-deploy', Path: undefined },
+};
 const SITE_CREATE_ONLY_PROPERTIES = {
   SiteBucket397A1860: { BucketName: undefined, BucketNamePrefix: undefined, BucketNamespace: undefined },
   SiteBucketPolicy3AC1D0F8: { Bucket: { Ref: 'SiteBucket397A1860' } },
@@ -75,6 +90,16 @@ const SITE_CREATE_ONLY_PROPERTIES = {
 
 function logicalIds(resources: Record<string, { Type: string }>) {
   return Object.fromEntries(Object.entries(resources).map(([id, r]) => [id, r.Type]));
+}
+
+/** The values `resources` has for the properties `expected` names, in the same shape. */
+function propertiesNamed(resources: Record<string, CfnResource>, expected: Record<string, Record<string, unknown>>) {
+  return Object.fromEntries(
+    Object.entries(expected).map(([id, properties]) => {
+      const values = resources[id]?.Properties ?? {};
+      return [id, Object.fromEntries(Object.keys(properties).map((name) => [name, values[name]]))];
+    }),
+  );
 }
 
 describe('logical ID stability', () => {
@@ -94,17 +119,12 @@ describe('logical ID stability', () => {
   });
 
   it.each(Object.entries(PRICING_MODES))('keeps every create-only property fixed (%s)', (_mode, config) => {
-    const [, site] = synthesizeAll(config);
-    const expected: Record<string, Record<string, unknown>> = {
+    const [identity, site] = synthesizeAll(config);
+    const siteExpected: Record<string, Record<string, unknown>> = {
       ...SITE_CREATE_ONLY_PROPERTIES,
       ...(config.pricingPlan && { PricingPlanSubscription: { PlanFamily: 'CloudFront' } }),
     };
-    const actual = Object.fromEntries(
-      Object.entries(expected).map(([id, properties]) => {
-        const values = site!.json.Resources[id]?.Properties ?? {};
-        return [id, Object.fromEntries(Object.keys(properties).map((name) => [name, values[name]]))];
-      }),
-    );
-    expect(actual).toEqual(expected);
+    expect(propertiesNamed(identity!.json.Resources, IDENTITY_CREATE_ONLY_PROPERTIES)).toEqual(IDENTITY_CREATE_ONLY_PROPERTIES);
+    expect(propertiesNamed(site!.json.Resources, siteExpected)).toEqual(siteExpected);
   });
 });
