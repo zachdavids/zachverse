@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -241,6 +241,14 @@ describe('checkDist', () => {
       to: 'href="/favicon.svgg"',
       failure: 'dist/index.html references missing /favicon.svgg',
     },
+    // S3 matches keys by exact name, and so does the check, so this fails on NTFS too, which ignores case.
+    {
+      problem: 'an icon link in the wrong case',
+      file: 'index.html',
+      from: 'href="/favicon.svg"',
+      to: 'href="/FAVICON.SVG"',
+      failure: 'dist/index.html references missing /FAVICON.SVG',
+    },
     {
       problem: 'a relative icon link, which resolves elsewhere on nested paths',
       file: '404.html',
@@ -335,9 +343,69 @@ describe('checkDist', () => {
     expect(checkDist(await project(changes))).toEqual([]);
   });
 
+  // S3 decodes the request path to find a key: /100%25.svg names 100%.svg, /icon%402x.png names icon@2x.png
+  // (decodeURI would keep the %40), and /100%.svg names nothing.
+  it('decodes escapes to find a file, and reports a path with a malformed escape as missing', async () => {
+    const links = [
+      '<a href="/100%25.svg">Escaped</a>',
+      '<a href="/icon%402x.png">Escaped</a>',
+      '<a href="/100%.svg">Malformed</a>',
+    ].join('');
+    const changes = { ...edit('index.html', '</main>', `${links}</main>`), '100%.svg': '', 'icon@2x.png': '' };
+    expect(checkDist(await project(changes))).toEqual(['dist/index.html references missing /100%.svg']);
+  });
+
+  // The build never emits an encoded slash or backslash, and the CloudFront docs don't say whether S3 then reads
+  // one as a separator, so a path with either names no key, even where its decoded name is a file's.
+  it.each(['%2F', '%2f', '%5C', '%5c'])('reports a path with the encoded separator %s as missing', async (escape) => {
+    const path = `/assets${escape}index-mKM-b7Ju.js`;
+    // A file under the decoded name. For %5C that name holds a backslash, which Linux keeps in a file name and
+    // Windows reads as a separator.
+    const decoded = { [decodeURIComponent(path).slice(1)]: '' };
+    const changes = { ...edit('index.html', '</main>', `<a href="${path}">App</a></main>`), ...decoded };
+    expect(checkDist(await project(changes))).toEqual([`dist/index.html references missing ${path}`]);
+  });
+
+  // A browser resolves dot segments, %2E%2E too, against the site root, where '..' stops at '/': /../favicon.svg
+  // requests /favicon.svg, and /x/.. requests /. The site has no dist/ folder, nor public/ or DIST/, which NTFS
+  // would take for dist/.
+  it('looks up a path with dot segments, even one above the site root, where a browser requests it', async () => {
+    const links = [
+      '<a href="/../favicon.svg">Icon</a>',
+      '<a href="/x/..">Home</a>',
+      '<a href="/../dist/favicon.svg">Icon</a>',
+      '<a href="/%2E%2E/dist/favicon.svg">Icon</a>',
+      '<a href="/../public/favicon.svg">Icon</a>',
+      '<a href="/../DIST/favicon.svg">Icon</a>',
+    ].join('');
+    const changes = edit('index.html', '</main>', `${links}</main>`);
+    expect(checkDist(await project(changes, { 'favicon.svg': '' }))).toEqual([
+      'dist/index.html references missing /../dist/favicon.svg',
+      'dist/index.html references missing /%2E%2E/dist/favicon.svg',
+      'dist/index.html references missing /../public/favicon.svg',
+      'dist/index.html references missing /../DIST/favicon.svg',
+    ]);
+  });
+
   it('leaves protocol-relative URLs to their hosts', async () => {
     const preconnect = '<link rel="preconnect" href="//cdn.example.com"></head>';
     expect(checkDist(await project(edit('index.html', '</head>', preconnect)))).toEqual([]);
+  });
+
+  // A browser reads a backslash as a slash, so it takes /\other.invalid/favicon.svg to another host, not to the
+  // site's /favicon.svg, and finds no valid host in /\a b/favicon.svg.
+  it('reports a path that a browser takes to another host, or to none, as missing', async () => {
+    const links = '<a href="/\\other.invalid/favicon.svg">Icon</a><a href="/\\a b/favicon.svg">Icon</a></main>';
+    expect(checkDist(await project(edit('index.html', '</main>', links)))).toEqual([
+      'dist/index.html references missing /\\other.invalid/favicon.svg',
+      'dist/index.html references missing /\\a b/favicon.svg',
+    ]);
+  });
+
+  it("accepts a bare fragment, which resolves against the page's own URL, so it works on any path", async () => {
+    const skip = '<a href="#main">Skip to content</a><main';
+    const changes = { ...edit('index.html', '<main', skip), ...edit('404.html', '<main', skip) };
+    expect(checkDist(await project(changes))).toEqual([]);
   });
 
   // What Vite's base: './' does to a page: the bundle URLs in /404.html would
@@ -364,6 +432,38 @@ describe('checkDist', () => {
     expect(checkDist(await project(changes))).toEqual([`${asset} has no content hash in its name`]);
   });
 
+  // The asset checks apply to the key a browser's request names: /x/../assets/vendor.js and /%61ssets/vendor.js are
+  // an unhashed asset, /assets/../favicon.svg, which requests /favicon.svg, is no asset, although public/ has that
+  // file, and a copy from public/ is found however its reference is spelled.
+  it('checks the asset a path with dot segments or escapes requests', async () => {
+    const hrefs = [
+      '/x/../assets/vendor.js',
+      '/%61ssets/vendor.js',
+      '/assets/../favicon.svg',
+      '/x/../assets/background-gradient.svg',
+      '/%61ssets/background-gradient.svg',
+    ];
+    const links = hrefs.map((href) => `<link rel="prefetch" href="${href}">`).join('');
+    const copy = { 'assets/background-gradient.svg': '' };
+    const changes = { ...edit('index.html', '</head>', `${links}</head>`), 'assets/vendor.js': '', ...copy };
+    expect(checkDist(await project(changes, { 'favicon.svg': '', ...copy }))).toEqual([
+      '/x/../assets/vendor.js has no content hash in its name',
+      '/%61ssets/vendor.js has no content hash in its name',
+      '/x/../assets/background-gradient.svg is copied unhashed from public/',
+      '/%61ssets/background-gradient.svg is copied unhashed from public/',
+    ]);
+  });
+
+  // S3 decodes the name, so an escaped bundle and stylesheet are still hashed build outputs.
+  it('accepts a bundle and stylesheet whose names hold escapes', async () => {
+    const page = build['404.html']!
+      .replace('src="/assets/index-mKM-b7Ju.js"', 'src="/assets/index-mKM-b7Ju.j%73"')
+      .replace('href="/assets/index-Brn_qMvo.css"', 'href="/assets/index-Brn_qMvo.c%73s"');
+    expect(page).toContain('.j%73"');
+    expect(page).toContain('.c%73s"');
+    expect(checkDist(await project({ '404.html': page }))).toEqual([]);
+  });
+
   // Longer words pass the name check, so a copy from public/ is caught by its origin.
   it.each(['/assets/background-gradient.svg', '/assets/index-component.js'])(
     'reports %s as copied unhashed from public/',
@@ -373,6 +473,35 @@ describe('checkDist', () => {
       expect(checkDist(await project(changes, copy))).toEqual([`${asset} is copied unhashed from public/`]);
     },
   );
+
+  // Vite copies what a public/ symlink points at, so a linked file's copy is still unhashed.
+  it('reports a file symlinked into public/ as copied unhashed', async (ctx) => {
+    const asset = '/assets/vendor-component.js';
+    const prefetch = `<link rel="prefetch" href="${asset}"></head>`;
+    const root = await project({ ...edit('index.html', '</head>', prefetch), [asset.slice(1)]: '' });
+    // Outside public/, so only the link puts it there.
+    const target = new URL('vendor-component.js', root);
+    await writeFile(target, '');
+    await mkdir(new URL('public/assets/', root), { recursive: true });
+    try {
+      await symlink(target, new URL(`public${asset}`, root), 'file');
+    } catch (error) {
+      // Windows allows file symlinks only in Developer Mode or when elevated; CI on Linux always runs this.
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') ctx.skip('file symlinks are not permitted here');
+      throw error;
+    }
+    expect(checkDist(root)).toEqual([`${asset} is copied unhashed from public/`]);
+  });
+
+  // Vite keeps public/'s names, so a wrong-case name matches neither the copy nor its source on any host.
+  it('reports a wrong-case reference to a copy from public/ as missing, not as copied', async () => {
+    const copy = { 'assets/Background-Gradient.svg': '' };
+    const prefetch = '<link rel="prefetch" href="/assets/background-gradient.svg"></head>';
+    const changes = { ...edit('index.html', '</head>', prefetch), ...copy };
+    expect(checkDist(await project(changes, copy))).toEqual([
+      'dist/index.html references missing /assets/background-gradient.svg',
+    ]);
+  });
 
   it('accepts a hashed asset with a digit in its extension, such as a font', async () => {
     const preload = '<link rel="preload" href="/assets/inter-Q4_x-9Zb.woff2" as="font" crossorigin></head>';
@@ -400,5 +529,35 @@ describe('checkDist', () => {
       'missing dist/robots.txt',
       'missing dist/sitemap.xml',
     ]);
+  });
+
+  // A file where a folder belongs holds no files.
+  it('reports every file as missing when dist is a file', async () => {
+    const root = new URL('built-to-a-file/', await project());
+    await mkdir(root);
+    await writeFile(new URL('dist', root), '');
+    expect(checkDist(root).filter((failure) => failure.startsWith('missing '))).toEqual([
+      'missing dist/index.html',
+      'missing dist/404.html',
+      'missing dist/robots.txt',
+      'missing dist/sitemap.xml',
+    ]);
+  });
+
+  it('finds no copies in a public that is a file', async () => {
+    const root = await project();
+    await writeFile(new URL('public', root), '');
+    expect(checkDist(root)).toEqual([]);
+  });
+
+  // A link whose target is gone names no file, wherever it is. A junction needs no extra privileges on Windows;
+  // other systems ignore the type and make a plain symlink.
+  it('reports a reference to a dangling link as missing, and ignores unreferenced ones', async () => {
+    const changes = edit('index.html', '</main>', '<a href="/archive/">Archive</a></main>');
+    const root = await project(changes, { 'favicon.svg': '' });
+    for (const link of ['dist/archive', 'dist/assets/old', 'public/old']) {
+      await symlink(new URL('missing', root), new URL(link, root), 'junction');
+    }
+    expect(checkDist(root)).toEqual(['dist/index.html references missing /archive/']);
   });
 });
