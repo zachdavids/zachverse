@@ -1,6 +1,7 @@
 // Guardrail checks over synthesized CloudFormation templates. Each returns a
 // list of human-readable violations (empty = pass), so the same functions can
 // be pointed at deliberately bad templates to prove they detect problems.
+import { ACM_VALIDATION_NAME } from './dns-batch';
 import type { CfnResource, CfnTemplate } from './synth';
 
 type Json = any;
@@ -16,10 +17,15 @@ function resourcesOf(template: CfnTemplate, predicate: (r: CfnResource) => boole
 // Prohibited resources
 // ---------------------------------------------------------------------------
 
+// The first matching rule gives the reason.
 const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
   {
     matches: (t) => t.startsWith('AWS::Route53::') || t.startsWith('AWS::Route53Domains::'),
     reason: 'hosted zones, DNS records, and domains are managed outside CDK (reviewed batches in infra/dns/)',
+  },
+  {
+    matches: (t) => t === 'AWS::Amplify::Domain' || t.startsWith('AWS::ServiceDiscovery::'),
+    reason: 'Amplify domains and Cloud Map write DNS records themselves, bypassing the reviewed batches in infra/dns/',
   },
   {
     matches: (t) => t.startsWith('Custom::') || t === 'AWS::CloudFormation::CustomResource',
@@ -34,22 +40,57 @@ const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
     reason: 'the CloudFront certificate lives in us-east-1 and is managed outside CloudFormation (ADR 0002)',
   },
   { matches: (t) => t === 'AWS::CloudFormation::StackSet', reason: 'StackSets are not allowed in this project' },
+  {
+    // Service Catalog products launch their own templates, and its other types exist only to serve products.
+    matches: (t) =>
+      t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application' || t.startsWith('AWS::ServiceCatalog::'),
+    reason: 'nested stacks and Service Catalog products launch templates these guardrails do not check',
+  },
+  {
+    // Last of the CloudFormation rules, so those above keep their reasons. Change sets carry their own templates;
+    // hooks, macros, modules, and registry types run code or rewrite templates during deployment; wait conditions
+    // take outside input.
+    matches: (t) => t.startsWith('AWS::CloudFormation::'),
+    reason: 'other CloudFormation resource types are not checked by these guardrails',
+  },
+  {
+    // Registry extensions: third-party types such as Cloudflare::Dns::Record, private types, and modules.
+    matches: (t) => !t.startsWith('AWS::'),
+    reason: 'resource types outside the AWS namespace are not checked by these guardrails',
+  },
 ];
 
+const TRANSFORMED = 'transforms and macros rewrite the template during deployment, so these guardrails cannot see the result';
+
+/** Prohibited resources, and transforms that would hide what is actually deployed. */
 export function prohibitedResourceViolations(template: CfnTemplate): string[] {
   const violations: string[] = [];
+  if (template.Transform !== undefined) violations.push(`Transform ${JSON.stringify(template.Transform)}: ${TRANSFORMED}`);
+  // Fn::Transform (AWS::Include or a macro) can appear at any level, including in place of a resource.
+  if (JSON.stringify(template).includes('"Fn::Transform":')) violations.push(`Fn::Transform: ${TRANSFORMED}`);
   for (const [id, resource] of Object.entries(template.Resources ?? {})) {
+    if (id === 'Fn::Transform') continue;
     const rule = PROHIBITED.find((r) => r.matches(resource.Type));
     if (rule) violations.push(`${id} (${resource.Type}): ${rule.reason}`);
   }
   return violations;
 }
 
-/** Every resource must survive stack deletion and replacement. */
+/**
+ * Every resource must survive stack deletion and replacement. RetainExceptOnCreate also counts: it
+ * differs from Retain only by deleting a resource when the operation that created it rolls back.
+ * AWS::CDK::Metadata, which CDK's version reporting adds, creates nothing in the account (it carries only the
+ * version-reporting record), so deleting it loses nothing.
+ */
 export function retentionViolations(template: CfnTemplate): string[] {
   return Object.entries(template.Resources ?? {})
-    .filter(([, r]) => r.DeletionPolicy !== 'Retain' || r.UpdateReplacePolicy !== 'Retain')
-    .map(([id, r]) => `${id} (${r.Type}) must have DeletionPolicy and UpdateReplacePolicy Retain`);
+    .filter(
+      ([, r]) =>
+        r.Type !== 'AWS::CDK::Metadata' &&
+        ((r.DeletionPolicy !== 'Retain' && r.DeletionPolicy !== 'RetainExceptOnCreate') ||
+          r.UpdateReplacePolicy !== 'Retain'),
+    )
+    .map(([id, r]) => `${id} (${r.Type}) must have DeletionPolicy Retain or RetainExceptOnCreate, and UpdateReplacePolicy Retain`);
 }
 
 // ---------------------------------------------------------------------------
@@ -58,58 +99,155 @@ export function retentionViolations(template: CfnTemplate): string[] {
 
 export interface DnsWriteAllowance {
   hostedZoneId: string;
-  /** Exact ACM validation record names (lower case, trailing dot optional). */
+  /** ACM validation record names, in any case, trailing dot optional. Any other name is ignored. */
   validationRecordNames: string[];
 }
 
+/** IAM action matching: case-insensitive; `*` matches any run of characters (including none) and `?` any one character. */
 function wildcardMatches(pattern: string, action: string): boolean {
-  const regex = new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i');
-  return regex.test(action);
+  const source = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${source}$`, 'i').test(action);
 }
 
+// Every Route 53 and Route 53 Domains API action except the reads (Get*, List*, Check*, TestDNSAnswer,
+// ViewBilling), from the API Reference operation lists, read 2026-10-12. Add new write actions here so
+// wildcards find them too; one granted by name already counts as a write (isUnlistedRoute53Write).
 const ROUTE53_WRITE_PROBES = [
-  'route53:ChangeResourceRecordSets',
-  'route53:CreateHostedZone',
-  'route53:DeleteHostedZone',
-  'route53:ChangeTagsForResource',
-  'route53:UpdateHostedZoneComment',
-  'route53domains:TransferDomain',
-  'route53domains:UpdateDomainNameservers',
+  ...[
+    'ActivateKeySigningKey', 'AssociateVPCWithHostedZone', 'ChangeCidrCollection', 'ChangeResourceRecordSets',
+    'ChangeTagsForResource', 'CreateCidrCollection', 'CreateHealthCheck', 'CreateHostedZone', 'CreateKeySigningKey',
+    'CreateQueryLoggingConfig', 'CreateReusableDelegationSet', 'CreateTrafficPolicy', 'CreateTrafficPolicyInstance',
+    'CreateTrafficPolicyVersion', 'CreateVPCAssociationAuthorization', 'DeactivateKeySigningKey', 'DeleteCidrCollection',
+    'DeleteHealthCheck', 'DeleteHostedZone', 'DeleteKeySigningKey', 'DeleteQueryLoggingConfig',
+    'DeleteReusableDelegationSet', 'DeleteTrafficPolicy', 'DeleteTrafficPolicyInstance',
+    'DeleteVPCAssociationAuthorization', 'DisableHostedZoneDNSSEC', 'DisassociateVPCFromHostedZone',
+    'EnableHostedZoneDNSSEC', 'UpdateHealthCheck', 'UpdateHostedZoneComment', 'UpdateHostedZoneFeatures',
+    'UpdateTrafficPolicyComment', 'UpdateTrafficPolicyInstance',
+  ].map((action) => `route53:${action}`),
+  ...[
+    'AcceptDomainTransferFromAnotherAwsAccount', 'AssociateDelegationSignerToDomain',
+    'CancelDomainTransferToAnotherAwsAccount', 'DeleteDomain', 'DeleteTagsForDomain', 'DisableDomainAutoRenew',
+    'DisableDomainTransferLock', 'DisassociateDelegationSignerFromDomain', 'EnableDomainAutoRenew',
+    'EnableDomainTransferLock', 'PushDomain', 'RegisterDomain', 'RejectDomainTransferFromAnotherAwsAccount',
+    'RenewDomain', 'ResendContactReachabilityEmail', 'ResendOperationAuthorization', 'RetrieveDomainAuthCode',
+    'TransferDomain', 'TransferDomainToAnotherAwsAccount', 'UpdateDomainContact', 'UpdateDomainContactPrivacy',
+    'UpdateDomainNameservers', 'UpdateTagsForDomain',
+  ].map((action) => `route53domains:${action}`),
 ];
+const ROUTE53_ACTION = /^route53(?:domains)?:/i;
+const ROUTE53_READ = /^route53(?:domains)?:(?:Get|List|Check|Test|View)/i;
+/** A CloudFormation dynamic reference, which is resolved only during deployment. */
+const DYNAMIC_REFERENCE = /\{\{resolve:/i;
+
+/** An action named exactly in either service that is neither a read nor listed above, such as one added since. */
+function isUnlistedRoute53Write(action: string): boolean {
+  return (
+    !/[*?]/.test(action) &&
+    ROUTE53_ACTION.test(action) &&
+    !ROUTE53_READ.test(action) &&
+    !ROUTE53_WRITE_PROBES.some((probe) => wildcardMatches(action, probe))
+  );
+}
+
+/** Resources whose PolicyDocument grants permissions to IAM identities. */
+const POLICY_DOCUMENT_TYPES = new Set([
+  'AWS::IAM::Policy',
+  'AWS::IAM::ManagedPolicy',
+  'AWS::IAM::RolePolicy',
+  'AWS::IAM::UserPolicy',
+  'AWS::IAM::GroupPolicy',
+]);
+const IDENTITY_TYPES = new Set(['AWS::IAM::Role', 'AWS::IAM::User', 'AWS::IAM::Group']);
 
 function policyDocuments(template: CfnTemplate): { where: string; document: Json }[] {
   const docs: { where: string; document: Json }[] = [];
   for (const [id, r] of Object.entries(template.Resources ?? {})) {
     const props = r.Properties ?? {};
-    if (r.Type === 'AWS::IAM::Policy' || r.Type === 'AWS::IAM::ManagedPolicy') {
-      docs.push({ where: id, document: props.PolicyDocument });
-    }
-    if (r.Type === 'AWS::IAM::Role' || r.Type === 'AWS::IAM::User' || r.Type === 'AWS::IAM::Group') {
-      for (const p of asArray<Json>(props.Policies)) docs.push({ where: `${id}/${p.PolicyName}`, document: p.PolicyDocument });
+    if (POLICY_DOCUMENT_TYPES.has(r.Type)) docs.push({ where: id, document: props.PolicyDocument });
+    if (IDENTITY_TYPES.has(r.Type)) {
+      for (const p of asArray<Json>(props.Policies)) {
+        // An entry (or the whole list) wrapped in Fn::If has no literal name.
+        const name = typeof p.PolicyName === 'string' ? p.PolicyName : '(computed)';
+        docs.push({ where: `${id}/${name}`, document: p.PolicyDocument });
+      }
     }
   }
   return docs;
 }
 
 /**
+ * Permissions granted from outside the template cannot be inspected: AWS managed or
+ * imported managed policies, groups defined elsewhere, and IAM Identity Center.
+ */
+function unverifiableGrantViolations(template: CfnTemplate): string[] {
+  const resources = template.Resources ?? {};
+  const definedHere = (value: Json, type: string) => typeof value?.Ref === 'string' && resources[value.Ref]?.Type === type;
+  const out: string[] = [];
+  for (const [id, r] of Object.entries(resources)) {
+    const props = r.Properties ?? {};
+    if (IDENTITY_TYPES.has(r.Type)) {
+      for (const arn of asArray<Json>(props.ManagedPolicyArns)) {
+        if (!definedHere(arn, 'AWS::IAM::ManagedPolicy')) {
+          out.push(`${id}: managed policy ${JSON.stringify(arn)} is not defined in this stack, so it cannot be verified`);
+        }
+      }
+    }
+    // A user also gets the permissions of every group it joins.
+    const groups =
+      r.Type === 'AWS::IAM::User' ? props.Groups : r.Type === 'AWS::IAM::UserToGroupAddition' ? props.GroupName : undefined;
+    for (const group of asArray<Json>(groups)) {
+      if (!definedHere(group, 'AWS::IAM::Group')) {
+        out.push(`${id}: group ${JSON.stringify(group)} is not defined in this stack, so it cannot be verified`);
+      }
+    }
+    if (/^AWS::SSO::/.test(r.Type)) out.push(`${id} (${r.Type}): IAM Identity Center permissions cannot be verified`);
+  }
+  return out;
+}
+
+/**
  * Any IAM permission that can change DNS must be limited to UPSERT/CREATE of
  * CNAMEs with the exact ACM validation names in the one existing zone. With
- * no allowance (the current design) any Route 53 write is a violation.
+ * no allowance (the current design) any Route 53 write is a violation, and so
+ * is any permission the check cannot read: NotAction, computed actions
+ * (intrinsic functions or {{resolve:...}} dynamic references) or documents,
+ * and managed policies, groups, or Identity Center permissions from outside
+ * the stack. It does not model privilege escalation, such as
+ * iam:PutRolePolicy or sts:AssumeRole into a role that can write DNS.
  */
 export function dnsWriteViolations(template: CfnTemplate, allowance?: DnsWriteAllowance): string[] {
-  const violations: string[] = [];
+  const violations = unverifiableGrantViolations(template);
   for (const { where, document } of policyDocuments(template)) {
-    for (const statement of asArray<Json>(document?.Statement)) {
-      if (statement.Effect !== 'Allow') continue;
+    // A document wrapped in Fn::If, or given as a JSON string, has no readable Statement.
+    if (document?.Statement === undefined) {
+      violations.push(`${where}: a computed or missing PolicyDocument cannot be verified`);
+      continue;
+    }
+    for (const statement of asArray<Json>(document.Statement)) {
+      // Only a literal Deny is skipped: a computed Effect may resolve to Allow.
+      if (statement.Effect === 'Deny') continue;
       if (statement.NotAction !== undefined) {
         violations.push(`${where}: Allow with NotAction is too broad to verify`);
         continue;
       }
-      const actions = asArray<string>(statement.Action).filter((a) => typeof a === 'string');
-      const grants = ROUTE53_WRITE_PROBES.filter((probe) => actions.some((a) => wildcardMatches(a, probe)));
+      const actions = asArray<Json>(statement.Action);
+      if (actions.length === 0 || actions.some((a) => typeof a !== 'string' || DYNAMIC_REFERENCE.test(a))) {
+        violations.push(`${where}: Allow with a computed or missing Action is too broad to verify`);
+        continue;
+      }
+      const grants = [
+        ...ROUTE53_WRITE_PROBES.filter((probe) => actions.some((a) => wildcardMatches(a, probe))),
+        ...actions.filter(isUnlistedRoute53Write),
+      ].sort();
       if (grants.length === 0) continue;
       const onlyRecordChanges = grants.every((g) => g === 'route53:ChangeResourceRecordSets');
-      const exactActions = actions.every((a) => a === 'route53:ChangeResourceRecordSets' || !a.startsWith('route53'));
+      // Any other action must be outside Route 53. A pattern that matches the record change, even through
+      // a wildcard service prefix, also grants later actions it matches, which the conditions do not limit.
+      const exactActions = actions.every(
+        (a) =>
+          a === 'route53:ChangeResourceRecordSets' ||
+          (!ROUTE53_ACTION.test(a) && !ROUTE53_WRITE_PROBES.some((probe) => wildcardMatches(a, probe))),
+      );
       if (!allowance || !onlyRecordChanges || !exactActions) {
         violations.push(`${where}: grants Route 53 write access (${grants.join(', ')})`);
         continue;
@@ -127,10 +265,12 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
   if (resources.length !== 1 || resources[0] !== zoneArn) out.push(`${where}: Resource must be exactly ${zoneArn}`);
 
   const conditions = statement.Condition?.['ForAllValues:StringEquals'] ?? {};
-  const normalize = (n: string) => n.toLowerCase().replace(/\.$/, '');
-  const allowedNames = new Set(allowance.validationRecordNames.map(normalize));
+  // IAM compares normalized names (lower case, no trailing dot) case-sensitively, so only that form can match.
+  const allowedNames = new Set(
+    allowance.validationRecordNames.map((n) => n.toLowerCase().replace(/\.$/, '')).filter((n) => ACM_VALIDATION_NAME.test(n)),
+  );
   const names = asArray<string>(conditions['route53:ChangeResourceRecordSetsNormalizedRecordNames']);
-  if (names.length === 0 || names.some((n) => n.includes('*') || !allowedNames.has(normalize(n)))) {
+  if (names.length === 0 || names.some((n) => !allowedNames.has(n))) {
     out.push(`${where}: record names must be limited to the exact ACM validation names`);
   }
   const types = asArray<string>(conditions['route53:ChangeResourceRecordSetsRecordTypes']);
@@ -245,7 +385,7 @@ export function deployRoleViolations(
 // ---------------------------------------------------------------------------
 // CloudFront flat-rate Free plan compatibility
 // Source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/flat-rate-pricing-plan.html
-// (feature table and "Unsupported features"), read 2026-10-11.
+// (feature table, "Unsupported features" and "Unsupported associations"), read 2026-10-12.
 // ---------------------------------------------------------------------------
 
 export const FREE_PLAN_LIMITS = { cacheBehaviors: 5, wafRules: 5 } as const;
@@ -290,6 +430,8 @@ const FREE_PLAN_DISALLOWED_TYPES: Record<string, string> = {
   'AWS::CloudFront::AnycastIpList': 'Anycast IP lists are unsupported on pricing plans',
   'AWS::CloudFront::VpcOrigin': 'VPC origins need Business or higher',
   'AWS::CloudFront::DistributionTenant': 'multi-tenant distributions are unsupported on pricing plans',
+  'AWS::CloudFront::TrustStore': 'viewer mutual TLS needs Premium',
+  'AWS::CloudFront::ConnectionFunction': 'connection functions (viewer mutual TLS) need Premium',
   'AWS::Logs::DeliverySource': 'access-log delivery needs Pro or higher on flat-rate plans',
   'AWS::WAFv2::LoggingConfiguration': 'WAF request logs need Pro or higher',
   'AWS::WAFv2::RuleGroup': 'rule groups are unsupported on pricing plans',
@@ -302,18 +444,47 @@ export function freePlanViolations(template: CfnTemplate): string[] {
     const reason = FREE_PLAN_DISALLOWED_TYPES[r.Type];
     if (reason) violations.push(`${id} (${r.Type}): ${reason}`);
   }
-  for (const [id, r] of resourcesOf(template, (r) => r.Type === 'AWS::CloudFront::Distribution')) {
-    violations.push(...distributionViolations(template, id, r.Properties?.DistributionConfig ?? {}));
-  }
+  const distributions = resourcesOf(template, (r) => r.Type === 'AWS::CloudFront::Distribution').map(
+    ([id, r]): [string, Json] => [id, r.Properties?.DistributionConfig ?? {}],
+  );
+  for (const [id, config] of distributions) violations.push(...distributionViolations(template, id, config));
+  violations.push(...sharedAssociationViolations(distributions));
   for (const [id, r] of resourcesOf(template, (r) => r.Type === 'AWS::WAFv2::WebACL')) {
     violations.push(...freePlanWebAclViolations(r.Properties ?? {}).map((v) => `${id}: ${v}`));
   }
   return violations;
 }
 
+const behaviorsOf = (config: Json): Json[] => [config.DefaultCacheBehavior ?? {}, ...asArray<Json>(config.CacheBehaviors)];
+
+/** The logical ID of the function a function association references through Fn::GetAtt, if it does. */
+const functionRefOf = (assoc: Json): unknown => assoc.FunctionARN?.['Fn::GetAtt']?.[0];
+
+/**
+ * A plan distribution's CloudFront Functions and web ACL can be used by no other distribution
+ * ("Unsupported associations"). Only distributions in this template can be compared.
+ */
+function sharedAssociationViolations(distributions: [string, Json][]): string[] {
+  const usedBy = new Map<string, Set<string>>();
+  for (const [id, config] of distributions) {
+    const refs = behaviorsOf(config).flatMap((b) => asArray<Json>(b.FunctionAssociations).map(functionRefOf));
+    // CloudFront reads an empty WebACLId as no web ACL.
+    const hasWebAcl = config.WebACLId !== undefined && config.WebACLId !== '';
+    const associations = [
+      ...refs.filter((ref) => typeof ref === 'string').map((ref) => `CloudFront Function ${ref}`),
+      ...(hasWebAcl ? [`web ACL ${JSON.stringify(config.WebACLId)}`] : []),
+    ];
+    for (const association of associations) usedBy.set(association, new Set([...(usedBy.get(association) ?? []), id]));
+  }
+  const reason = 'a pricing-plan distribution cannot share its functions or web ACL';
+  return [...usedBy]
+    .filter(([, ids]) => ids.size > 1)
+    .map(([association, ids]) => `${association} is shared by ${[...ids].join(', ')}: ${reason}`);
+}
+
 function distributionViolations(template: CfnTemplate, id: string, config: Json): string[] {
   const out: string[] = [];
-  const behaviors: Json[] = [config.DefaultCacheBehavior ?? {}, ...asArray<Json>(config.CacheBehaviors)];
+  const behaviors = behaviorsOf(config);
   if (behaviors.length > FREE_PLAN_LIMITS.cacheBehaviors) {
     out.push(`${id}: ${behaviors.length} cache behaviors exceeds the Free limit of ${FREE_PLAN_LIMITS.cacheBehaviors}`);
   }
@@ -346,6 +517,9 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
     S3Origin: 'legacy origin settings are unsupported',
     CustomOrigin: 'legacy origin settings are unsupported',
     CNAMEs: 'legacy CNAMEs setting is unsupported; use Aliases',
+    ViewerMtlsConfig: 'viewer mutual TLS needs Premium',
+    ConnectionFunctionAssociation: 'connection functions (viewer mutual TLS) need Premium',
+    CacheTagConfig: 'cache-tag invalidation needs Pro or higher',
   };
   for (const [key, reason] of Object.entries(unsupportedConfig)) {
     if (config[key] !== undefined) out.push(`${id}: ${key}: ${reason}`);
@@ -360,6 +534,9 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
   for (const origin of asArray<Json>(config.Origins)) {
     if (origin.OriginShield?.Enabled) out.push(`${id} origin ${origin.Id}: Origin Shield needs Premium`);
     if (origin.VpcOriginConfig !== undefined) out.push(`${id} origin ${origin.Id}: VPC origins need Business or higher`);
+    if (origin.CustomOriginConfig?.OriginMtlsConfig !== undefined) {
+      out.push(`${id} origin ${origin.Id}: origin mutual TLS needs Business or higher`);
+    }
     const oai = origin.S3OriginConfig?.OriginAccessIdentity;
     if (oai !== undefined && oai !== '') out.push(`${id} origin ${origin.Id}: OAI is unsupported; use OAC`);
   }
@@ -367,7 +544,7 @@ function distributionViolations(template: CfnTemplate, id: string, config: Json)
 }
 
 function functionAssociationViolations(template: CfnTemplate, where: string, assoc: Json): string[] {
-  const ref = assoc.FunctionARN?.['Fn::GetAtt']?.[0];
+  const ref = functionRefOf(assoc);
   const fn = typeof ref === 'string' ? template.Resources[ref] : undefined;
   if (!fn || fn.Type !== 'AWS::CloudFront::Function') {
     return [`${where}: function associations must reference a CloudFront Function defined in this stack`];
@@ -410,11 +587,18 @@ export function freePlanWebAclViolations(acl: Json): string[] {
   }
   for (const rule of rules) {
     const name = rule.Name ?? '(unnamed rule)';
-    if (rule.Action?.Captcha !== undefined) out.push(`${name}: CAPTCHA needs Pro or higher`);
-    if (rule.Action?.Challenge !== undefined) out.push(`${name}: JavaScript challenge needs Business or higher`);
-    if (rule.Action?.Block?.CustomResponse !== undefined) out.push(`${name}: custom WAF responses need Pro or higher`);
-    out.push(...statementViolations(rule.Statement ?? {}).map((v) => `${name}: ${v}`));
+    const ruleViolations = [...ruleActionViolations(rule.Action), ...statementViolations(rule.Statement ?? {})];
+    out.push(...ruleViolations.map((v) => `${name}: ${v}`));
   }
+  return out;
+}
+
+/** A rule's Action, or a rule group's ActionToUse override. */
+function ruleActionViolations(action: Json): string[] {
+  const out: string[] = [];
+  if (action?.Captcha !== undefined) out.push('CAPTCHA needs Pro or higher');
+  if (action?.Challenge !== undefined) out.push('JavaScript challenge needs Business or higher');
+  if (action?.Block?.CustomResponse !== undefined) out.push('custom WAF responses need Pro or higher');
   return out;
 }
 
@@ -423,6 +607,7 @@ function statementViolations(node: Json): string[] {
   const out: string[] = [];
   for (const [key, value] of Object.entries<Json>(node)) {
     if (key === 'RuleGroupReferenceStatement') out.push('rule groups are unsupported on pricing plans');
+    if (key === 'ActionToUse') out.push(...ruleActionViolations(value));
     if (key === 'RegexMatchStatement' || key === 'RegexPatternSetReferenceStatement') {
       out.push('regex-based filtering needs Business or higher');
     }

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { afterAll, describe, expect, it } from 'vitest';
 import { githubOidcSubject, production } from '../lib/config';
 import {
   deployRoleViolations,
@@ -9,14 +10,15 @@ import {
   retentionViolations,
   WEBSITE_DEPLOY_ACTIONS,
 } from './support/checks';
-import { productionConfig, synthesizeAll, TEST_WEB_ACL_ARN } from './support/synth';
+import { PRICING_MODES, productionConfig, synthesizeAll } from './support/synth';
 
-const modes = {
-  'pay-as-you-go': productionConfig(),
-  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
-};
+// CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
+afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
-describe.each(Object.entries(modes))('every stack (%s)', (_mode, config) => {
+// What production deploys as configured, and both pricing modes whichever one it selects.
+const configs = { 'production config': productionConfig(), ...PRICING_MODES };
+
+describe.each(Object.entries(configs))('every stack (%s)', (_label, config) => {
   const stacks = synthesizeAll(config);
   const each = stacks.map((s) => [s.stack.stackName, s] as const);
 

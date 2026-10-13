@@ -1,7 +1,7 @@
 # ADR 0002: Region, certificate, and organization-policy constraints
 
 - Status: Accepted. The SCP blocker was resolved on 2026-10-12 (see "Resolution")
-- Date: 2026-10-11, revised after AWS advanced features were activated
+- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change
 
 ## Decision
 
