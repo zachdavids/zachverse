@@ -1,12 +1,14 @@
 # ADR 0002: Region, certificate, and organization-policy constraints
 
 - Status: Accepted. The SCP blocker was resolved on 2026-10-12 (see "Resolution")
-- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change, and 2026-10-13 to add "Account and billing"
+- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change, and 2026-10-13 to add "Account and billing" and the site certificate
 
 ## Decision
 
 1. All regional Zachverse infrastructure lives in **us-east-1** in the Website account `426499248998`, which owns hosted zone `Z03492543O0YEY0RDZZ0J`. That covers the CDK bootstrap, every stack, the S3 bucket, the ACM certificate, and the CLOUDFRONT-scope WAF ACL. CloudFront, Route 53, and IAM are global. Nothing is deployed to us-east-2 (the project's originally selected Region), or to the Management (`969788248923`) or Identity Delegated Admin accounts.
-2. The certificate is still requested outside CloudFormation and validated by a reviewed change batch in `infra/dns/`. CloudFormation-managed DNS validation would write records using the CDK execution role's full permissions, and the records would belong to a stack. Out-of-band validation limits DNS writes to the exact validation names and keeps the zone independent of the stacks.
+2. The certificate is still requested outside CloudFormation and validated by a reviewed change batch in `infra/dns/`. CloudFormation-managed DNS validation would write records using the CDK execution role's full permissions, and the records would belong to a stack. Out-of-band validation limits DNS writes to the exact validation names and keeps the zone independent of the stacks. The certificate, `arn:aws:acm:us-east-1:426499248998:certificate/f285dc12-6f64-4d9b-8309-043d5e90f354` (`zachdavids.com` and `www.zachdavids.com`, RSA-2048, DNS validation), was requested on 2026-10-13. Its two validation CNAMEs are the committed batch `infra/dns/2026-10-13-acm-validation.json`, which the owner applies within 72 hours of the request: if ACM cannot validate a certificate within 72 hours of generating its CNAMEs, the certificate's status becomes `VALIDATION_TIMED_OUT`, and a new one must be requested (ADR 0004, "Runbook").
+
+   Validation records stay while a certificate for these names is in use. ACM renews a certificate only while they resolve, and when it cannot, AWS Health warns by email from 30 days before expiry, which reaches the account's alternate contacts as well as its root address. So validation batches get no reverse batch, rollbacks never touch validation names, a lost record is restored from the committed batch (`infra/dns/README.md`), and `infra/test/dns-batches.test.ts` rejects any batch that deletes a validation record or gives the certificate's two validation names other values.
 3. Now that CloudFormation is allowed in us-east-1, the web ACL can be a CloudFormation resource. That is decided in milestone 7.
 
 ## Evidence
@@ -42,4 +44,4 @@ The backup and the apply, verify, and rollback scripts are in `docs/org-policy/`
 
 Advanced features are active. Activating them required upgrading to the AWS paid plan and removed spend limits; none can be created. A sudden Access Denied is therefore never a spend pause. It comes from an SCP (`docs/org-policy/`, including AWS Settings rewriting `p-ie47xwqg`), the RCP (`ManagedAccountResourceControlPolicy`), an IAM or resource policy, or account suspension. Suspension for non-payment would take the site, the hosted zone, and mail for the domain down together.
 
-A payer-wide cost budget with email alerts is set in the management account. Its settings are not recorded here; milestone 4's progress note will record them.
+A payer-wide cost budget with email alerts is set in the management account. Its settings are not recorded here; milestone 4's progress note (`docs/progress.md`) records them.

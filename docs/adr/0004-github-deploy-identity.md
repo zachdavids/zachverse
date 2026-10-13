@@ -1,7 +1,7 @@
 # ADR 0004: GitHub deploy identity and CDK bootstrap
 
 - Status: Accepted and deployed 2026-10-12 (UTC)
-- Date: 2026-10-11, revised 2026-10-12 after the deploy and 2026-10-13 after review
+- Date: 2026-10-11, revised 2026-10-12 after the deploy and 2026-10-13 after review and for the site stack's first deployment
 
 ## Decision
 
@@ -56,23 +56,28 @@ There is no delete, IAM, DNS, CloudFormation, or STS access. The bucket and dist
 
 ## Runbook
 
-Run the CDK CLI in `infra/` through npm (`npm run cdk -- <command>`), which uses the pinned CLI. Before it synthesizes, the CLI runs `cdk.json`'s `build` step, which typechecks and runs the tests, so a failing check stops the synth, diff, or deploy. `--build ''` skips that step; it is not for routine use.
+Run the CDK CLI in `infra/` through npm (`npm run cdk -- <command>`), which uses the pinned CLI. Before it synthesizes, the CLI runs `cdk.json`'s `build` step, which typechecks and runs the tests, so a failing test stops the synth, diff, or deploy. The guardrails, GitHub trust and deploy permissions included, also run inside every synthesis and fail it (ADR 0003, "Template checks"), so `--build ''` skips only the typecheck and the tests; it is not for routine use. The app always synthesizes both stacks. Deploy only reviewed commits: changed code, or an assembly synthesized earlier and passed with `--app`, gets past the guardrails (ADR 0003, "Limits").
 
 1. `aws login --profile default`, then `aws sts get-caller-identity`: the account must be `426499248998`.
-2. `cd infra && npm run bootstrap` (once per account and Region).
-3. `npm run cdk -- diff`, review, then `npm run cdk -- deploy ZachverseIdentity`.
-4. Verify the live state as in the table above.
+2. Check that `env | grep '^CDK_'` (Git Bash) or `Get-ChildItem Env:CDK_*` (PowerShell) prints nothing, or only `CDK_DISABLE_*` opt-outs such as `CDK_DISABLE_CLI_TELEMETRY`, and pass none of `--app`, `--build`, `--ignore-errors`, `--no-version-reporting`, or `--plugin`. The CLI reads every option from a `CDK_*` variable, so `CDK_APP`, `CDK_BUILD`, `CDK_IGNORE_ERRORS`, `CDK_VERSION_REPORTING=false`, and `CDK_PLUGIN` act like those options. `--plugin` loads code into the CLI, and `--no-version-reporting` would delete the identity stack's `AWS::CDK::Metadata` resource, against ADR 0003's decision to keep version reporting on ("Retention"), in a change `cdk diff` hides.
+3. `cd infra && npm run bootstrap` (once per account and Region).
+4. `npm run cdk -- diff`, review, then `npm run cdk -- deploy ZachverseIdentity`.
+5. Verify the live state as in the table above.
 
-Until milestone 4 sets `certificateArn` in `infra/lib/config.ts`, the app synthesizes only `ZachverseIdentity`, and `bin/zachverse.ts` prints why it skipped `ZachverseSite`; a `certificateArn` set to an invalid ARN fails synthesis (an empty string counts as unset). Milestone 4 makes `certificateArn` required and removes this identity-only synthesis.
+The site stack's first deployment (milestone 4) follows steps 1 and 2, then steps 6 to 8:
+
+6. Apply `infra/dns/2026-10-13-acm-validation.json`, an administrative step that follows `infra/dns/README.md`, within 72 hours of the certificate's request: before the same time on 2026-10-16 (`describe-certificate` gives the request time as `CreatedAt`). ACM stops trying to validate the certificate after that (ADR 0002), so if milestone 4's review is still open near then, review and apply the batch ahead of the rest.
+7. Wait until `aws acm describe-certificate --region us-east-1 --certificate-arn <certificateArn> --query Certificate.Status`, with the ARN from `infra/lib/config.ts`, returns `ISSUED`. CloudFront rejects a certificate still pending validation, and a failed first create leaves a termination-protected stack to retry as ADR 0003 describes ("Termination protection"). If it returns `VALIDATION_TIMED_OUT`, don't deploy. Request a new certificate, commit its ARN as `certificateArn` along with a new validation batch if its records differ and updates to the docs that name the certificate, and once that is reviewed, repeat steps 6 and 7 for the new certificate.
+8. `npm run cdk -- diff`, review, then `npm run cdk -- deploy ZachverseSite`. That also deploys `ZachverseIdentity`, which the site stack depends on, unless `--exclusively` is passed. The identity template is unchanged, so expect no change there unless the CDK or Node.js version differs from the one that deployed it, which changes only its `AWS::CDK::Metadata` resource (`cdk diff` leaves that resource out).
 
 ## Checks and limits
 
-`infra/test` asserts the exact provider configuration and trust policy, and pins the identity stack's logical IDs and create-only properties (the provider's URL, and the role's name with no path). Two guardrails also run in every configuration ADR 0003 lists, and `checks.test.ts` shows each failing on deliberately broad input:
+`infra/test` asserts the exact provider configuration and trust policy, and pins the identity stack's logical IDs and create-only properties (the provider's URL, and the role's name with no path). Two guardrails also run in every synthesis and in every configuration ADR 0003 lists, and `checks.test.ts` shows each failing on deliberately broad input:
 
 - **GitHub trust**, on every stack: every statement that trusts GitHub's OIDC provider must allow only `sts:AssumeRoleWithWebIdentity`, with only `StringEquals` on the STS audience, this exact subject, and `refs/heads/main`.
 - **Deploy permissions**, across all stacks: the role `zachverse-github-site-deploy` may be granted only the actions above, on literal ARNs without wildcards or on a bucket the stack defines, objects in it, or a distribution it defines, and never through a managed policy attached by ARN.
 
-Like the DNS check (ADR 0003), both fail closed on values CloudFormation computes: where a rule depends on a value, an intrinsic function they do not recognize or a `{{resolve:...}}` dynamic reference is a violation. `infra/test/support/checks.ts` has the complete rules.
+Like the DNS check (ADR 0003), both fail closed on values CloudFormation computes: where a rule depends on a value, an intrinsic function they do not recognize or a `{{resolve:...}}` dynamic reference is a violation. `infra/lib/guardrails/checks.ts` has the complete rules.
 
 Limits:
 
