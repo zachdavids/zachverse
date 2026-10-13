@@ -1,7 +1,7 @@
 # ADR 0002: Region, certificate, and organization-policy constraints
 
 - Status: Accepted. The SCP blocker was resolved on 2026-10-12 (see "Resolution")
-- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change
+- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change, and 2026-10-13 to add "Account and billing"
 
 ## Decision
 
@@ -37,3 +37,9 @@ Before applying, a local evaluation (`docs/org-policy/compare.cjs`) showed 6 cha
 - The simulator allows the needed actions. Lambda, EC2, DynamoDB, and SQS are still explicitly denied in us-east-1.
 
 Backup, exact apply commands, and rollback commands are in `docs/org-policy/`.
+
+## Account and billing
+
+Advanced features are active. Activating them required upgrading to the AWS paid plan and removed spend limits; none can be created. A sudden Access Denied is therefore never a spend pause. It comes from an SCP (`docs/org-policy/`, including AWS Settings rewriting `p-ie47xwqg`), the RCP (`ManagedAccountResourceControlPolicy`), an IAM or resource policy, or account suspension. Suspension for non-payment would take the site, the hosted zone, and mail for the domain down together.
+
+A payer-wide cost budget with email alerts is set in the management account. Its settings are not recorded here; milestone 4's progress note will record them.

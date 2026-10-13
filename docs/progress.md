@@ -1,6 +1,6 @@
 # Phase 1 progress
 
-One branch and one pull request per milestone (milestones 1 and 2 share PR #2). A milestone may start while the previous one is in review, on a branch stacked on it, as #3 is on #2.
+One branch and one pull request per milestone (milestones 1 and 2 share PR #2). A milestone may start while the previous one is in review, on a branch stacked on it, as #3 was on #2.
 
 | # | Milestone | Status | PR / evidence |
 | --- | --- | --- | --- |

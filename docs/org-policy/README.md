@@ -23,8 +23,13 @@ Every other control is unchanged:
 
 ## Apply (management account; each step leaves access no looser than the final state)
 
+Run future changes under the management account's AWS Settings role session, never as root: sign in with `aws login --profile zachverse-management` and choose that role. The guard at the top of each script below signs a root session out and stops. Save each script to a file and run it with `sh` from the repository root: its `file://` paths are relative to the root, and its `exit` then ends the script rather than your shell.
+
 ```sh
 P="--profile zachverse-management"
+# Guard: stop unless this is a non-root session.
+ARN=$(aws sts get-caller-identity $P --query Arn --output text) || exit 1
+case "$ARN" in *:root) echo "Root session: sign in with the AWS Settings role instead." >&2; aws logout $P; exit 1 ;; esac
 # 0. The live policy must still match the backup.
 aws organizations describe-policy --policy-id p-ie47xwqg $P --query Policy.Content --output text | sha256sum
 # 1. Region floor as its own root policy (duplicates the existing statement, so no effect yet).
@@ -43,24 +48,28 @@ aws organizations update-policy $P --policy-id p-ie47xwqg --content file://docs/
 
 ## Verify
 
-Run these from the Website account (`--profile default`, temporary `AccountFullAccessRole` credentials):
+SCPs and RCPs do not apply to the management account itself, so the policies' effects are verified from the Website account. Run these there (`--profile default`, temporary `AccountFullAccessRole` credentials):
 
 - `aws cloudformation list-stacks --region us-east-1`
 - `aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --region us-east-1` (returns `ParameterNotFound` before bootstrap)
 - `aws pricing-plan-manager list-subscriptions --region us-east-1`
 - `iam:SimulatePrincipalPolicy` for the us-east-1 actions in ADR 0002
 
-From the management account, re-list the attachments and compare them with `attachments.jsonl`.
+From the management account, re-list the attachments and compare them with `attachments.jsonl`. Then sign out: `aws logout --profile zachverse-management`.
 
 ## Rollback (management account)
 
 ```sh
 P="--profile zachverse-management"
 F=p-xwdm4cce W=p-1mpgzmjr
+# Guard: stop unless this is a non-root session.
+ARN=$(aws sts get-caller-identity $P --query Arn --output text) || exit 1
+case "$ARN" in *:root) echo "Root session: sign in with the AWS Settings role instead." >&2; aws logout $P; exit 1 ;; esac
 # Restoring the original text first reinstates every original deny before anything is removed.
 aws organizations update-policy $P --policy-id p-ie47xwqg --content file://docs/org-policy/backup-2026-10-12/p-ie47xwqg.content.json
 aws organizations detach-policy $P --policy-id "$W" --target-id 426499248998 && aws organizations delete-policy $P --policy-id "$W"
 aws organizations detach-policy $P --policy-id "$F" --target-id r-58a9 && aws organizations delete-policy $P --policy-id "$F"
+aws logout $P
 ```
 
 ## Caveat

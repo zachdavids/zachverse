@@ -13,6 +13,7 @@ Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) 
 | `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and synthesized-template checks |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
 | `docs/` | Architecture decisions (`docs/adr/`) and milestone status (`docs/progress.md`) |
+| `docs/org-policy/` | The SCP change behind ADR 0002's us-east-1 decision: backup, the policies as applied, a comparison script, and apply, verify, and rollback steps |
 
 ## Commands
 
@@ -32,9 +33,10 @@ npm ci
 npm run typecheck
 npm test             # synthesizes the stacks and runs the guardrail checks
 npm run test:coverage  # the same, with the 100% coverage gate CI enforces
+npm run bootstrap    # CDK bootstrap of the Website account in us-east-1: once per account and Region, already done (ADR 0004)
 npm run cdk -- diff  # the CDK CLI typechecks and runs the tests before every synth, diff, and deploy (cdk.json "build")
 ```
 
-Until milestone 4 sets `certificateArn` in `infra/lib/config.ts`, the site stack refuses to synthesize, so `cdk synth`, `diff`, and `deploy` fail; the tests use a placeholder certificate meanwhile.
+Until milestone 4 sets `certificateArn` in `infra/lib/config.ts`, the app leaves out the site stack and says why on stderr, so `cdk synth`, `diff`, and `deploy` cover only `ZachverseIdentity` (ADR 0004). A `certificateArn` that is set but invalid fails synthesis. The tests check the site stack with a placeholder certificate meanwhile.
 
 Both packages' `.npmrc` files stop dependencies' install scripts from running and stop `npx` from downloading packages that aren't installed. To run one package's install script deliberately, use `npm rebuild <package> --ignore-scripts=false`.

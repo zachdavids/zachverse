@@ -1,11 +1,11 @@
 # ADR 0004: GitHub deploy identity and CDK bootstrap
 
 - Status: Accepted and deployed 2026-10-12 (UTC)
-- Date: 2026-10-11
+- Date: 2026-10-11, revised 2026-10-13 after review
 
 ## Decision
 
-**Identity stack.** `ZachverseIdentity` (Website account `426499248998`, us-east-1) has termination protection, and every resource is retained. It contains two resources:
+**Identity stack.** `ZachverseIdentity` (Website account `426499248998`, us-east-1) has termination protection. It contains two resources, both retained, besides the `AWS::CDK::Metadata` record that version reporting adds (ADR 0003, "Retention"):
 
 - **GitHub OIDC provider** (`AWS::IAM::OIDCProvider`): URL `https://token.actions.githubusercontent.com`, client ID `sts.amazonaws.com`, and no thumbprints in the template, which matches AWS's current GitHub instructions. IAM checks GitHub's endpoint against its own trusted CAs. The live provider shows one thumbprint that IAM filled in itself, and drift detection reports it in sync. The account had no OIDC providers before (`ListOpenIDConnectProviders` returned an empty list), so the stack creates one rather than importing.
 - **Deploy role `zachverse-github-site-deploy`:** allows only `sts:AssumeRoleWithWebIdentity`, with `StringEquals` on three claims:
@@ -29,11 +29,18 @@
 | `s3:GetObject`, `s3:PutObject` | objects in the site bucket |
 | `cloudfront:CreateInvalidation`, `GetInvalidation`, `ListInvalidations`, `GetDistribution` | the site distribution |
 
-There is no delete, IAM, DNS, CloudFormation, or STS access. The bucket and distribution don't exist until milestone 4, so the policy is created in the same deployment as they are. Until then the role can authenticate but do nothing, and no interim wildcard grant exists. The site stack declares a dependency on the identity stack.
+There is no delete, IAM, DNS, CloudFormation, or STS access. The bucket and distribution don't exist until milestone 4, so the policy is created in the same deployment as they are. Until then the role can authenticate but do nothing, and no interim wildcard grant exists. The site stack declares a dependency on the identity stack. Like every resource the site stack defines, `SiteDeployPolicy` is retained (ADR 0003, "Retention"), so removing it from the template or deleting the stack leaves its grant on the role. To revoke access, change its statements while it is still in the template, or delete it from the role with `aws iam delete-role-policy`.
 
-**Admin vs. deploy access.** Infrastructure changes use the administrator's temporary session in the Website account (`aws login`, `AccountFullAccessRole`) and the CDK bootstrap roles. Those roles trust only the account (no trusted external accounts), and the deploy role has no `sts:AssumeRole` permission to reach them. Management-account credentials were used only for the organization-policy change (ADR 0002).
+**Admin vs. deploy access.** Infrastructure changes use the administrator's temporary session in the Website account (`aws login`, `AccountFullAccessRole`) and the CDK bootstrap roles. Those roles trust only the account (no trusted external accounts), and the deploy role has no `sts:AssumeRole` permission to reach them. Apart from activating advanced features and setting the payer-wide budget (ADR 0002, "Account and billing"), management-account credentials changed only the organization policies (ADR 0002, "Resolution").
 
 **CDK bootstrap.** Run `npm run bootstrap` in `infra/`, which runs `cdk bootstrap aws://426499248998/us-east-1 --termination-protection`. It uses the default template (qualifier `hnb659fds`), whose CloudFormation execution role has `AdministratorAccess`; only administrator deployments use it.
+
+## Administrative access
+
+- Root users are for break-glass use only.
+- Management-account CLI sessions are never root: they are the AWS Settings role session (`aws login --profile zachverse-management`, choosing that role), logged out after use with `aws logout --profile zachverse-management`. In the `docs/org-policy/` runbook, the Apply and Rollback scripts log a root session out and stop, and Verify and Rollback end by logging out.
+- The identity source stays AWS Builder ID.
+- No recovery path may depend on mail delivered through the `zachdavids.com` zone. The zone is in the Website account, so the account or DNS trouble that calls for recovery could also stop that mail (ADR 0002, "Account and billing").
 
 ## Deployed state (verified 2026-10-12)
 
@@ -49,17 +56,31 @@ There is no delete, IAM, DNS, CloudFormation, or STS access. The bucket and dist
 
 ## Runbook
 
+Run the CDK CLI in `infra/` through npm (`npm run cdk -- <command>`), which uses the pinned CLI. Before it synthesizes, the CLI runs `cdk.json`'s `build` step, which typechecks and runs the tests, so a failing check stops the synth, diff, or deploy. `--build ''` skips that step; it is not for routine use.
+
 1. `aws login --profile default`, then `aws sts get-caller-identity`: the account must be `426499248998`.
 2. `cd infra && npm run bootstrap` (once per account and Region).
-3. `npx cdk diff ZachverseIdentity`, review, then `npx cdk deploy ZachverseIdentity`.
+3. `npm run cdk -- diff`, review, then `npm run cdk -- deploy ZachverseIdentity`.
 4. Verify the live state as in the table above.
+
+Until milestone 4 sets `certificateArn` in `infra/lib/config.ts`, the app synthesizes only `ZachverseIdentity`, and `bin/zachverse.ts` prints why it skipped `ZachverseSite`; a `certificateArn` that is set but invalid fails synthesis. Milestone 4 makes `certificateArn` required and removes this identity-only synthesis.
 
 ## Checks and limits
 
-`infra/test` asserts the following, and `checks.test.ts` shows each check failing on deliberately broad input:
+`infra/test` asserts the exact provider configuration and trust policy, and pins the identity stack's logical IDs and create-only properties (the provider's URL, and the role's name with no path). Two guardrails also run in every configuration ADR 0003 lists, and `checks.test.ts` shows each failing on deliberately broad input:
 
-- The exact provider configuration and trust policy.
-- That every role trusting GitHub uses `StringEquals` on the STS audience, this exact subject, and `refs/heads/main` (so no wildcard, old-format, branch-only, missing-ref, or non-main subjects).
-- That, across all stacks, the deploy role's permissions are a subset of the actions above with no wildcard resources or managed policies.
+- **GitHub trust**, on every stack: every statement that trusts GitHub's OIDC provider must allow only `sts:AssumeRoleWithWebIdentity`, with only `StringEquals` on the STS audience, this exact subject, and `refs/heads/main`.
+- **Deploy permissions**, across all stacks: the role `zachverse-github-site-deploy` may be granted only the actions above, on literal ARNs without wildcards or on the stack's own bucket, objects in it, or distribution, and never through a managed policy attached by ARN.
 
-An actual GitHub job assuming the role is only verifiable once the deploy workflow exists (milestone 5).
+Like the DNS check (ADR 0003), both fail closed on values CloudFormation computes: where a rule depends on a value, an intrinsic function they do not recognize or a `{{resolve:...}}` dynamic reference is a violation. `infra/test/support/checks.ts` has the complete rules.
+
+Limits:
+
+- The deploy-role check covers only `zachverse-github-site-deploy`. Another role may trust GitHub under the same conditions, and only the DNS check limits what it is granted.
+- The deploy-role check reads identity-based policies only, so a bucket policy or other resource policy that names the role is not checked.
+- The deploy-role check does not evaluate IAM policy variables: an ARN such as `arn:aws:s3:::${aws:UserAgent}` passes as a literal, though IAM fills it in from each request and the caller sets the user agent.
+- A provider ARN built with `Fn::Join` or `Fn::Sub` is flagged rather than read; trust a literal ARN or the provider's `Ref`.
+- Failing closed also flags computed principals that cannot be `*`, such as an account root principal built from `AWS::Partition`. `cdk.json` enables `@aws-cdk/core:enablePartitionLiterals`, so CDK writes such principals in these stacks as literal ARNs.
+- Neither check models privilege escalation, such as another role changing the deploy role's policies.
+- Until milestone 4, no test checks the account, Region, or termination protection of the identity-only app the runbook deploys (ADR 0003, "Template checks").
+- An actual GitHub job assuming the role is only verifiable once the deploy workflow exists (milestone 5).
