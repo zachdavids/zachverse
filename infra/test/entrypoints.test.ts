@@ -98,6 +98,7 @@ describe('CDK entry point', () => {
     vi.resetModules();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    process.exitCode = undefined;
     for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -143,7 +144,10 @@ describe('CDK entry point', () => {
       };
     });
 
+    const skipped = vi.spyOn(console, 'error');
     const { beforeExit, exit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
+    expect(skipped.mock.calls.filter(([m]) => String(m).includes('ZachverseSite skipped'))).toEqual([]);
+    expect(process.exitCode ?? 0).toBe(0);
     // One app, so one synthesis, and no beforeExit or exit listener added, before or after that synthesis. Node calls
     // the listener once the event loop is empty, so calling it now misses work bin/ defers longer than
     // listenersAddedBy waits (a delayed timer, an I/O callback).
@@ -180,9 +184,11 @@ describe('CDK entry point', () => {
     // Captured, so the test checks the message instead of printing it.
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const { beforeExit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
+    const { beforeExit, exit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
     expect(beforeExit).toHaveLength(1);
-    await listenersAddedBy(() => beforeExit[0]!.call(process, 0));
+    expect(exit).toEqual([]);
+    expect(await listenersAddedBy(() => beforeExit[0]!.call(process, 0))).toEqual({ beforeExit: [], exit: [] });
+    expect(process.exitCode ?? 0).toBe(0);
 
     expect(error.mock.calls).toEqual([
       ['ZachverseSite skipped: set certificateArn in infra/lib/config.ts first (docs/adr/0002).'],

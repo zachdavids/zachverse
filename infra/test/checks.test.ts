@@ -141,6 +141,10 @@ describe('prohibitedResourceViolations', () => {
     ['AWS::Serverless::Function', LAMBDA],
     ['AWS::CertificateManager::Certificate', CERTIFICATE],
     ['AWS::CloudFormation::StackSet', 'StackSets are not allowed in this project'],
+    ...['IdentityPool', 'IdentityPoolRoleAttachment', 'UserPool'].map((name) => [
+      `AWS::Cognito::${name}`,
+      'website stacks need no Cognito resources, and an identity pool can exchange outside tokens for credentials',
+    ]),
     ['AWS::CloudFormation::Stack', NESTED],
     ['AWS::Serverless::Application', NESTED],
     ['AWS::ServiceCatalog::CloudFormationProvisionedProduct', NESTED],
@@ -1171,7 +1175,7 @@ describe('githubTrustViolations', () => {
   });
 
   /** A raw template with GitHub's provider and a role trusting these statements, for shapes CDK will not generate. */
-  const trusting = (...statements: object[]): CfnTemplate => ({
+  const trusting = (...statements: (object | null)[]): CfnTemplate => ({
     Resources: {
       Provider: { Type: 'AWS::IAM::OIDCProvider', Properties: { Url: 'https://token.actions.githubusercontent.com' } },
       Role: { Type: 'AWS::IAM::Role', Properties: { AssumeRolePolicyDocument: { Statement: statements } } },
@@ -1193,6 +1197,16 @@ describe('githubTrustViolations', () => {
     `Role: subject must be exactly ${subject}`,
     `Role: ref must be exactly ${ref}`,
   ];
+
+  it.each<[string, object]>([
+    ['AssumeRoleWithWebIdentity, then another action', { Action: ['sts:AssumeRoleWithWebIdentity', 'sts:TagSession'] }],
+    ['another action, then AssumeRoleWithWebIdentity', { Action: ['sts:TagSession', 'sts:AssumeRoleWithWebIdentity'] }],
+    ['NotAction, which allows every action it does not list', { Action: undefined, NotAction: 'sts:TagSession' }],
+  ])('flags one GitHub trust statement that allows %s', (_case, change) => {
+    expect(githubTrustViolations(trusting(github(change)), subject, ref)).toEqual([
+      'Role: GitHub trust must allow only sts:AssumeRoleWithWebIdentity',
+    ]);
+  });
 
   it.each<[string, unknown]>([
     ['a Ref to the provider', { Ref: 'Provider' }],
@@ -1326,8 +1340,9 @@ describe('githubTrustViolations', () => {
     ]);
   });
 
-  it.each<[string, object]>([
+  it.each<[string, object | null]>([
     ['a trust statement wrapped in Fn::If', { 'Fn::If': ['Trusting', unconditioned, { Ref: 'AWS::NoValue' }] }],
+    ['a null trust statement', null],
     ['a Principal wrapped in Fn::If', { ...unconditioned, Principal: { 'Fn::If': ['Trusting', unconditioned.Principal, { AWS: '*' }] } }],
     ['a null Principal', { ...unconditioned, Principal: null }],
   ])('flags %s, which it cannot read', (_case, statement) => {
@@ -1526,6 +1541,17 @@ describe('deployRoleViolations', () => {
     const what = `role ${JSON.stringify(target)}`;
     const unreadable = (id: string) => `${id}: ${what} is not a role name or a role in this stack, so it cannot be verified`;
     expect(check(template)).toEqual([unreadable('Standalone'), unreadable('Managed'), unreadable('Inline')]);
+  });
+
+  it('checks every template: the role in one, a grant by name in another, in either order', () => {
+    const role = withRole();
+    const grant: CfnTemplate = { Resources: { Policy: policyFor([roleName], deleteObject) } };
+    expect(deployRoleViolations([role, grant], roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([`Policy: ${DELETE_OBJECT}`]);
+    expect(deployRoleViolations([grant, role], roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([`Policy: ${DELETE_OBJECT}`]);
+  });
+
+  it('checks a policy attached to the deploy role and another role', () => {
+    expect(check(withRole({ Policy: policyFor(['other-role', roleName], deleteObject) }))).toEqual([`Policy: ${DELETE_OBJECT}`]);
   });
 
   describe('resources', () => {

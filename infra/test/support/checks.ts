@@ -41,6 +41,11 @@ const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
   },
   { matches: (t) => t === 'AWS::CloudFormation::StackSet', reason: 'StackSets are not allowed in this project' },
   {
+    // An identity pool that accepts GitHub's OIDC provider hands out credentials no role trust check sees.
+    matches: (t) => t.startsWith('AWS::Cognito::'),
+    reason: 'website stacks need no Cognito resources, and an identity pool can exchange outside tokens for credentials',
+  },
+  {
     // Service Catalog products launch their own templates, and its other types exist only to serve products.
     matches: (t) =>
       t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application' || t.startsWith('AWS::ServiceCatalog::'),
@@ -340,6 +345,10 @@ export function githubTrustViolations(template: CfnTemplate, expectedSubject: st
       continue;
     }
     for (const statement of asArray<Json>(document.Statement)) {
+      if (typeof statement !== 'object' || statement === null) {
+        out.push(`${id}: a trust statement without a readable Principal cannot be verified`);
+        continue;
+      }
       // Only a literal Deny is skipped: it can only take access away, and a computed Effect may resolve to Allow.
       if (statement.Effect === 'Deny') continue;
       if (statement.NotPrincipal !== undefined) {

@@ -23,7 +23,7 @@ These results match the `UsEast1Partitional` statement that AWS [publishes](http
 
 ## Resolution (applied 2026-10-12)
 
-The live policy, read from the management account, confirmed the cause. `p-ie47xwqg` (`AdvancedModeRegionRestrictionSecurityControlPolicy`) is customer-managed and attached at the root `r-58a9`. Its `UsEast1Partitional` statement omits `cloudformation`, `ssm`, `ecr`, and `pricingplanmanager`, and allows only 17 account-level `s3` actions. The policy was 5,104 of the allowed 5,120 characters, so it couldn't simply grow. Because it is attached at the root, editing its list in place would also have loosened the Identity Delegated Admin account.
+The live policy, read from the management account, confirmed the cause. `p-ie47xwqg` (`AdvancedModeRegionRestrictionSecurityControlPolicy`) is customer-managed and attached at the root `r-58a9`. Its `UsEast1Partitional` statement omits `cloudformation`, `ssm`, `ecr`, and `pricingplanmanager`, and allows only 17 `s3` actions. The policy was 5,104 of the allowed 5,120 characters, so it couldn't simply grow. Because it is attached at the root, editing its list in place would also have loosened the Identity Delegated Admin account.
 
 With approval, the change was scoped to the Website account:
 
@@ -36,7 +36,7 @@ Before applying, a local evaluation (`docs/org-policy/compare.cjs`) showed 6 cha
 - Real us-east-1 calls to CloudFormation, ECR, S3, and Pricing Plan Manager succeeded.
 - The simulator allows the needed actions. Lambda, EC2, DynamoDB, and SQS are still explicitly denied in us-east-1.
 
-Backup, exact apply commands, and rollback commands are in `docs/org-policy/`.
+The backup and the apply, verify, and rollback scripts are in `docs/org-policy/`; their guards were tightened on 2026-10-13.
 
 ## Account and billing
 
