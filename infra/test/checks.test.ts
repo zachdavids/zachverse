@@ -1228,6 +1228,30 @@ describe('githubTrustViolations', () => {
     expect(githubTrustViolations(template, subject, ref)).toEqual([...UNCONDITIONED, ...UNCONDITIONED]);
   });
 
+  // The host is compared whole: an enterprise issuer adds a path to GitHub's, and a host that only contains GitHub's
+  // names another issuer, whose tokens GitHub never signs.
+  const ENTERPRISE = 'token.actions.githubusercontent.com/acme';
+  const LONGER_HOST = 'token.actions.githubusercontent.com.example.org';
+  const IN_PATH = 'example.org/token.actions.githubusercontent.com';
+  it.each<[string, string, string[]]>([
+    ['an enterprise issuer Url', `https://${ENTERPRISE}`, UNCONDITIONED],
+    ["a Url whose host only starts with GitHub's", `https://${LONGER_HOST}`, []],
+    ["a Url with GitHub's host in its path", `https://${IN_PATH}`, []],
+  ])('reads the provider host whole: %s', (_case, url, expected) => {
+    const template = trusting(unconditioned);
+    template.Resources.Provider!.Properties!.Url = url;
+    expect(githubTrustViolations(template, subject, ref)).toEqual(expected);
+  });
+
+  it.each<[string, string, string[]]>([
+    ['an enterprise issuer ARN', ENTERPRISE, UNCONDITIONED],
+    ["an ARN whose host only starts with GitHub's", LONGER_HOST, []],
+    ["an ARN with GitHub's host in its path", IN_PATH, []],
+  ])('reads the provider host whole: %s', (_case, provider, expected) => {
+    const arn = `arn:aws:iam::426499248998:oidc-provider/${provider}`;
+    expect(githubTrustViolations(trusting({ ...unconditioned, Principal: { Federated: arn } }), subject, ref)).toEqual(expected);
+  });
+
   it('ignores statements that trust only other principals', () => {
     const template = trusting(
       { Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { Service: 'lambda.amazonaws.com', AWS: 'arn:aws:iam::426499248998:root' } },

@@ -316,8 +316,12 @@ const isLiteral = (value: Json): value is string => typeof value === 'string' &&
  * provider during deployment.
  */
 function isGitHubOidcPrincipal(template: CfnTemplate, federated: Json): boolean | undefined {
-  // In any letter case, which can only add checks.
-  const namesGitHub = (value: Json) => (isLiteral(value) ? value.toLowerCase().includes(GITHUB_OIDC_HOST) : undefined);
+  // The host of a provider ARN or Url, compared whole and in any letter case. An enterprise issuer adds a path.
+  const namesGitHub = (value: Json) => {
+    if (!isLiteral(value)) return undefined;
+    const host = value.startsWith('arn:') ? value.split(':oidc-provider/')[1]?.split('/')[0] : URL.parse(value)?.host;
+    return host?.toLowerCase() === GITHUB_OIDC_HOST;
+  };
   if (typeof federated === 'string') return namesGitHub(federated);
   const [getAttId, attribute] = asArray<Json>(federated?.['Fn::GetAtt']);
   const id = federated?.Ref ?? (attribute === 'Arn' ? getAttId : undefined);

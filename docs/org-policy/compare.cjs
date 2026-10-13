@@ -39,7 +39,7 @@ const denied = (docs, action, ctx) =>
 
 const probes = [
   ...new Set([
-    ...original.Statement.flatMap((s) => [].concat(s.NotAction)).map((a) => a.replace('*', 'Probe')),
+    ...original.Statement.flatMap((s) => [].concat(s.NotAction)).map((a) => a.replaceAll('*', 'Probe')),
     'cloudformation:CreateStack', 's3:PutObject', 's3:CreateBucket', 's3:ListAllMyBuckets', 'ssm:GetParameter',
     'ecr:CreateRepository', 'pricingplanmanager:CreateSubscription', 'lambda:CreateFunction', 'ec2:RunInstances',
     'dynamodb:CreateTable', 'iam:CreateRole', 'cloudfront:CreateDistribution', 'bedrock:InvokeModel',
