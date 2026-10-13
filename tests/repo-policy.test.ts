@@ -1,13 +1,14 @@
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { isAbsolute, posix, relative } from 'node:path';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, posix, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveConfig } from 'vite';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { site } from '../src/content.ts';
-import { files, git, read, readJson, root, tsc } from './support/repo.ts';
+import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
 
 // jsdom ships no type declarations; these checks only need its window's DOMParser.
 const { JSDOM } = createRequire(import.meta.url)('jsdom') as {
@@ -17,11 +18,16 @@ const { JSDOM } = createRequire(import.meta.url)('jsdom') as {
 type Filter = { branches?: string[]; tags?: string[]; types?: string[]; [key: string]: unknown };
 type Defaults = { run?: { shell?: string; 'working-directory'?: string } };
 type Conditions = { if?: unknown; 'continue-on-error'?: unknown };
+// An empty "with:" or "env:" parses as null.
+type Mapping = Record<string, unknown> | null;
+// GitHub also takes an env written as one ${{ }} expression.
+type Environment = Mapping | string;
 type Step = Conditions & {
   uses?: string;
   run?: string;
   shell?: string;
-  with?: Record<string, unknown>;
+  with?: Mapping;
+  env?: Environment;
   'working-directory'?: string;
 };
 type Job = Conditions & {
@@ -29,6 +35,10 @@ type Job = Conditions & {
   needs?: unknown;
   'runs-on'?: unknown;
   environment?: string | { name?: string };
+  // A call to a reusable workflow takes inputs.
+  with?: Mapping;
+  container?: string | { env?: Environment };
+  env?: Environment;
   steps?: Step[];
   permissions?: string | Record<string, string>;
   defaults?: Defaults;
@@ -37,6 +47,7 @@ type Workflow = {
   on?: string | string[] | Record<string, Filter | null>;
   permissions?: unknown;
   defaults?: Defaults;
+  env?: Environment;
   jobs: Record<string, Job>;
 };
 // The parts of a Vitest config these checks read.
@@ -87,6 +98,33 @@ function deploysToProduction(workflow: Workflow, job: Job) {
     return event === 'push' && isDeepStrictEqual(branches, ['main']) && tags === undefined && tagsIgnore === undefined;
   });
   return environment === 'production' && mainOrManual;
+}
+
+// Where a job could get long-lived AWS keys rather than assume a role through OIDC: an AWS key name anywhere in its
+// workflow's or its own settings, such as configure-aws-credentials' aws-access-key-id input, the AWS_ACCESS_KEY_ID
+// variable the AWS CLI and SDKs read, or a run script's aws configure set or $GITHUB_ENV write. A production deploy
+// may read variables, which could hold keys. Names match in any case, with _, - or nothing between their words, and
+// any mention fails, so an OIDC job must not name them either. An env, with: or container written as one expression
+// is reported too, since only GitHub sees what it sets. A script or action can still take keys under other names
+// (aws configure import, a credentials file, docker/login-action's password for ECR), so review what a deploy does
+// with each variable.
+function keySettings(list: typeof jobs) {
+  const keyName = /aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token)/gi;
+  return list.flatMap(({ where, workflow, job }) => {
+    const container = typeof job.container === 'string' ? undefined : job.container?.env;
+    const steps = job.steps ?? [];
+    const found = [...strings({ ...workflow, jobs: {} }), ...strings(job)].flatMap((text) => text.match(keyName) ?? []);
+    const settings: [string, unknown[]][] = [
+      ['env', [workflow.env, job.env, container, ...steps.map((step) => step.env)]],
+      ['with', steps.map((step) => step.with)],
+      ['container', [job.container]],
+    ];
+    for (const [kind, values] of settings) {
+      if (values.some((value) => typeof value === 'string' && value.includes('${{'))) found.push(`${kind} expression`);
+    }
+    // Each name is reported once per job.
+    return [...new Set(found)].map((name) => `${where}: ${name}`);
+  });
 }
 
 // Every key and string value in a parsed workflow value, at any depth. Expressions are read from these rather than
@@ -163,6 +201,20 @@ async function vitestSettings(dir: string) {
   const file = vitestConfigFiles.find((name) => existsSync(new URL(dir + name, root)));
   const { default: config } = (await import(new URL(`${dir}${file}`, root).href)) as { default: VitestConfig };
   return config.test ?? {};
+}
+
+// The paths that should run as tests but are missing from their package's Vitest list (infra/ files belong to infra,
+// the rest to the root). These are names with .test or .spec in any case, followed by anything but a letter (so not
+// .testing) or by nothing, such as a suite renamed to *.spec.ts, *.test.ts.disabled, *.test, *.test-disabled.txt, or
+// *.test_disabled, except Vitest's .snap files; and script files directly in tests/ or infra/test/, but not an OS or
+// editor file there, such as .DS_Store.
+function unrunTests(paths: string[], listed: { root: string[]; infra: string[] }) {
+  return paths.filter((path) => {
+    const named =
+      /\.(?:test|spec)(?![a-z])/i.test(posix.basename(path)) && !/(?:^|\/)__snapshots__\/[^/]+\.snap$/.test(path);
+    const script = /^(?:tests|infra\/test)\/[^/]+$/.test(path) && /\.[cm]?[jt]sx?$/i.test(path);
+    return (named || script) && !(path.startsWith('infra/') ? listed.infra : listed.root).includes(path);
+  });
 }
 
 // Whether an engines range accepts a Node version. Parts the version leaves out are unbounded, so .nvmrc's "24"
@@ -254,12 +306,13 @@ describe('GitHub Actions workflows', () => {
     expect(others.map(({ where, job }) => `${where}: ${JSON.stringify(job['runs-on'])}`)).toEqual([]);
   });
 
-  it('obtain AWS credentials only in production deploys, never from secrets, variables, or access keys', () => {
+  it('obtain AWS credentials only in production deploys, never from secrets or key settings, and read variables only there', () => {
     const configured = steps.filter(
       ({ workflow, job, step }) =>
         actionName(step.uses) === 'aws-actions/configure-aws-credentials' && !deploysToProduction(workflow, job),
     );
     expect(configured.map(({ where }) => where)).toEqual([]);
+    expect(keySettings(jobs)).toEqual([]);
     for (const { file, text, workflow } of workflows) {
       // Every ${{ }} expression, plus "secrets:" keys such as "secrets: inherit".
       const references = [
@@ -282,6 +335,96 @@ describe('GitHub Actions workflows', () => {
         .some((expression) => /\bvars\b/i.test(expression)),
     );
     expect(readingVariables.map(({ where }) => where)).toEqual([]);
+  });
+
+  it('counts an AWS key setting in a job, its steps and its workflow, but not an OIDC role', () => {
+    const configure = 'aws-actions/configure-aws-credentials@0123456789abcdef0123456789abcdef01234567';
+    const key = '${{ vars.KEY }}';
+    const workflow: Workflow = { jobs: {} };
+    const ls = { run: 'aws s3 ls' };
+    const list: typeof jobs = [
+      // A role assumed through OIDC, other AWS settings, a container named only by its image, and an empty with: pass.
+      {
+        where: 'oidc',
+        workflow: { env: { AWS_REGION: 'us-east-1' }, jobs: {} },
+        job: {
+          container: 'node:24',
+          steps: [
+            { uses: configure, with: { 'role-to-assume': key, 'aws-region': 'us-east-1' } },
+            { uses: configure, with: null },
+            { run: 'aws s3 sync dist s3://bucket' },
+          ],
+        },
+      },
+      // Key inputs to any action, in any case, with -, _ or nothing between the words.
+      { where: 'inputs', workflow, job: { steps: [{ uses: configure, with: { 'aws-access-key-id': key } }] } },
+      { where: 'inputs', workflow, job: { steps: [{ uses: configure, with: { 'AWS-Session-Token': key } }] } },
+      {
+        where: 'other action',
+        workflow,
+        job: { steps: [{ uses: 'example/s3-sync@v1', with: { aws_secret_access_key: key } }] },
+      },
+      { where: 'reusable workflow', workflow, job: { uses: './.github/workflows/sync.yml', with: { awsAccessKeyId: key } } },
+      // Key variables set for the workflow, a job (shared by its steps), its container, or a step. A name the job
+      // repeats is reported once.
+      { where: 'workflow env', workflow: { env: { AWS_ACCESS_KEY_ID: key }, jobs: {} }, job: { steps: [ls] } },
+      {
+        where: 'job env',
+        workflow,
+        job: { env: { AWS_SECRET_ACCESS_KEY: key }, steps: [{ ...ls, env: { AWS_SECRET_ACCESS_KEY: key } }] },
+      },
+      { where: 'container env', workflow, job: { container: { env: { AWS_SESSION_TOKEN: key } }, steps: [ls] } },
+      { where: 'step env', workflow, job: { steps: [{ ...ls, env: { PROD_AWS_ACCESS_KEY_ID: key } }] } },
+      // Any other workflow setting, such as a dispatch input.
+      {
+        where: 'dispatch input',
+        workflow: { on: { workflow_dispatch: { inputs: { 'aws-secret-access-key': { required: true } } } }, jobs: {} },
+        job: { steps: [ls] },
+      },
+      // Run scripts that hand keys to the AWS CLI or to later steps; each name a script holds counts.
+      {
+        where: 'configure',
+        workflow,
+        job: {
+          steps: [{ run: `aws configure set aws_access_key_id ${key} && aws configure set aws_secret_access_key ${key}` }],
+        },
+      },
+      { where: 'GITHUB_ENV', workflow, job: { steps: [{ run: `echo "AWS_SESSION_TOKEN=${key}" >> "$GITHUB_ENV"` }] } },
+      { where: 'export', workflow, job: { env: { DEPLOY: key }, steps: [{ run: 'export AWS_ACCESS_KEY_ID="$DEPLOY"' }] } },
+      // An env written as one expression, at each level, and a with: or container written as one.
+      { where: 'expression', workflow: { env: '${{ fromJSON(vars.ENV) }}', jobs: {} }, job: { steps: [ls] } },
+      { where: 'expression', workflow, job: { env: '${{ fromJSON(vars.ENV) }}', steps: [ls] } },
+      { where: 'expression', workflow, job: { container: { env: '${{ fromJSON(vars.ENV) }}' }, steps: [ls] } },
+      { where: 'expression', workflow, job: { steps: [{ ...ls, env: '${{ fromJSON(vars.ENV) }}' }] } },
+      // Step inputs are typed as a mapping, which is all the other checks read.
+      {
+        where: 'expression',
+        workflow,
+        job: { steps: [{ uses: configure, with: '${{ fromJSON(vars.IN) }}' as unknown as Mapping }] },
+      },
+      { where: 'expression', workflow, job: { container: '${{ fromJSON(vars.CONTAINER) }}', steps: [ls] } },
+    ];
+    expect(keySettings(list)).toEqual([
+      'inputs: aws-access-key-id',
+      'inputs: AWS-Session-Token',
+      'other action: aws_secret_access_key',
+      'reusable workflow: awsAccessKeyId',
+      'workflow env: AWS_ACCESS_KEY_ID',
+      'job env: AWS_SECRET_ACCESS_KEY',
+      'container env: AWS_SESSION_TOKEN',
+      'step env: AWS_ACCESS_KEY_ID',
+      'dispatch input: aws-secret-access-key',
+      'configure: aws_access_key_id',
+      'configure: aws_secret_access_key',
+      'GITHUB_ENV: AWS_SESSION_TOKEN',
+      'export: AWS_ACCESS_KEY_ID',
+      'expression: env expression',
+      'expression: env expression',
+      'expression: env expression',
+      'expression: env expression',
+      'expression: with expression',
+      'expression: container expression',
+    ]);
   });
 
   it('check out without persisting the token', () => {
@@ -395,8 +538,9 @@ describe('CI workflow', () => {
       const sources = files(['ts', 'tsx', 'mts', 'cts'].map((extension) => `${dir}*.${extension}`)).filter(
         (file) => dir !== '' || !file.startsWith('infra/'),
       );
-      // An empty list would pass, as when git takes pathspecs literally (GIT_LITERAL_PATHSPECS=1).
-      expect(sources, dir).not.toHaveLength(0);
+      // The list must reach nested files: git matches none when it takes pathspecs literally
+      // (GIT_LITERAL_PATHSPECS=1), and a * stops at / when it takes them as globs (GIT_GLOB_PATHSPECS=1).
+      expect(sources, dir).toContain(dir === '' ? 'src/content.ts' : 'infra/lib/config.ts');
       expect(sources.filter((file) => !checked.includes(file)), `${dir}tsconfig*.json`).toEqual([]);
     }
   });
@@ -438,9 +582,9 @@ describe('CI workflow', () => {
   it('runs every test file in each package', async () => {
     // Other settings, such as exclude, changed, dir, or projects, can leave test files unrun.
     const allowed = ['include', 'environment', 'testTimeout', 'passWithNoTests', 'coverage'];
-    for (const [dir, tests, required] of [
-      ['', 'tests/', ['src/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts', 'tests/**/*.test.ts']],
-      ['infra/', 'test/', ['test/**/*.test.ts']],
+    for (const [dir, required] of [
+      ['', ['src/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts', 'tests/**/*.test.ts']],
+      ['infra/', ['test/**/*.test.ts']],
     ] as const) {
       const settings = await vitestSettings(dir);
       expect(Object.keys(settings).filter((key) => !allowed.includes(key)), dir).toEqual([]);
@@ -449,18 +593,63 @@ describe('CI workflow', () => {
       expect(settings.include?.filter((glob) => glob.startsWith('!')), dir).toEqual([]);
       // On CI's clean checkout, changed selects no tests and turns passWithNoTests on unless it is set to false.
       expect(settings.passWithNoTests, dir).toBe(false);
-      // Coverage does not notice a suite that stops running, such as one renamed to *.spec.ts. Only script files
-      // count, so an OS or editor file there, such as .DS_Store, does not.
-      const unrun = readdirSync(new URL(dir + tests, root), { withFileTypes: true })
-        .filter((entry) => entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name))
-        .map(({ name }) => tests + name)
-        .filter((file) => !settings.include?.some((glob) => posix.matchesGlob(file, glob)));
-      expect(unrun, dir).toEqual([]);
     }
-    // These suites run the template checks on the synthesized stacks; the 100% gate passes without them.
-    for (const suite of ['guardrails', 'environment']) {
-      expect(existsSync(new URL(`infra/test/${suite}.test.ts`, root)), suite).toBe(true);
-    }
+    // Coverage does not notice a suite that stops running, so Vitest itself lists the files it runs. Its globs match
+    // case-sensitively on every OS, unlike path.matchesGlob on Windows and macOS.
+    const listed = { root: vitestFiles(''), infra: vitestFiles('infra/') };
+    const all = files([]);
+    // An empty list would pass. The guard names no test file, so a renamed suite fails the next check, which names
+    // it, rather than this one, which prints every file.
+    expect(all).toEqual(expect.arrayContaining(['package.json', 'infra/package.json']));
+    expect(unrunTests(all, listed)).toEqual([]);
+    // These suites run the template checks on the synthesized stacks; the 100% gate passes without them. Vitest
+    // lists names as stored, so a Guardrails.Test.ts that existsSync would find on NTFS or APFS does not count.
+    expect(listed.infra).toEqual(
+      expect.arrayContaining(['infra/test/guardrails.test.ts', 'infra/test/environment.test.ts']),
+    );
+  });
+
+  it('counts a file named as a test, or a script directly in a test directory, as unrun unless Vitest lists it', () => {
+    // An infra suite in the root package's list does not count, and a listed tests/x.test.ts does not cover its case
+    // variant tests/x.Test.ts, which Vitest skips on every OS.
+    const listed = {
+      root: ['src/App.test.tsx', 'tests/x.test.ts', 'infra/test/checks.test.ts'],
+      infra: ['infra/test/guardrails.test.ts'],
+    };
+    const paths = [
+      ...listed.root,
+      ...listed.infra,
+      'tests/x.Test.ts',
+      'src/App.Test.tsx',
+      'src/App.spec.tsx',
+      'infra/test/cdk-json.test.ts.disabled',
+      'infra/test/cdk-json.test',
+      'infra/test/cdk-json.test-disabled.txt',
+      'infra/test/cdk-json.test_disabled',
+      'src/App.test2.tsx',
+      'src/render.testing.tsx',
+      'tests/helper.ts',
+      'infra/test/helper.TS',
+      'tests/support/repo.ts',
+      'tests/.DS_Store',
+      'infra/test/.DS_Store',
+      'src/__snapshots__/App.test.tsx.snap',
+      'src/__snapshots__/x.test.ts',
+    ];
+    expect(unrunTests(paths, listed)).toEqual([
+      'infra/test/checks.test.ts',
+      'tests/x.Test.ts',
+      'src/App.Test.tsx',
+      'src/App.spec.tsx',
+      'infra/test/cdk-json.test.ts.disabled',
+      'infra/test/cdk-json.test',
+      'infra/test/cdk-json.test-disabled.txt',
+      'infra/test/cdk-json.test_disabled',
+      'src/App.test2.tsx',
+      'tests/helper.ts',
+      'infra/test/helper.TS',
+      'src/__snapshots__/x.test.ts',
+    ]);
   });
 
   it("requires 100% coverage of each package's source", async () => {
@@ -655,6 +844,116 @@ describe('.gitignore', () => {
     // A rule does not untrack a file committed before it or with git add -f.
     // Only the repo's own .gitignore files count, not a developer's global excludes.
     expect(git(['ls-files', '--cached', '--ignored', '--exclude-per-directory=.gitignore'])).toEqual([]);
+  });
+});
+
+describe('credentials', () => {
+  // An AWS access key ID; a 40-character secret access key after a name ending in "secret key" or "secret access key"
+  // (in any case, its words joined by _, -, or nothing), which may be quoted (escaped quotes included, as in
+  // JSON-encoded text) or end a subscript, then :, =, =>, a comma, whitespace, or an XML tag's >, and the key with or
+  // without quotes; or a private key.
+  const patterns = [
+    /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
+    /secret[_-]?(?:access[_-]?)?key\\?['"`]?\]?(?:\s*(?:[:=]>?|,)|\s|>)\s*\\?['"`]?[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/i,
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----/,
+  ];
+  // UTF-16 text, which Windows PowerShell 5.1 writes with > or Out-File, reads as UTF-8 with a NUL beside each ASCII
+  // character.
+  const leaks = (text: string) => patterns.some((pattern) => pattern.test(text.replaceAll('\0', '')));
+
+  it('appear in no file in the repository', () => {
+    // Untracked files count too, since git add -A would commit them. With no pathspec, git lists every file
+    // whatever its pathspec settings, but an empty list would still pass.
+    const scanned = files([]);
+    expect(scanned).toEqual(
+      expect.arrayContaining(['src/content.ts', 'infra/lib/config.ts', 'docs/progress.md', 'infra/dns/README.md']),
+    );
+    // Only file names are reported, so a failing run does not copy the credential into the CI log.
+    expect(scanned.filter((file) => leaks(read(file)))).toEqual([]);
+  });
+
+  it('are recognized as they are usually written', () => {
+    // AWS's documented example keys, assembled here so that this file holds none of them.
+    const keyId = ['AKIA', 'IOSFODNN7EXAMPLE'].join('');
+    const secret = ['wJalrXUtnFEMI', 'K7MDENG', 'bPxRfiCYEXAMPLEKEY'].join('/');
+    const begin = (label: string) => `-----BEGIN ${label}-----`;
+    const written = [
+      `export const accessKeyId = '${keyId}';`,
+      `aws_access_key_id = ${keyId.replace('AKIA', 'ASIA')}`,
+      `[default]\naws_secret_access_key = ${secret}\n`,
+      `export AWS_SECRET_ACCESS_KEY="${secret}"`,
+      `export PROD_AWS_SECRET_ACCESS_KEY=${secret}`,
+      `TF_VAR_aws_secret_access_key=${secret}`,
+      `AWS_SECRET_KEY=${secret}`,
+      `secret_key = "${secret}"`,
+      `\`secret_key\` = '${secret}'`,
+      `{"SecretAccessKey": "${secret}"}`,
+      `{'aws_secret_access_key': '${secret}'}`,
+      // JSON-encoded text: a JSON string holding JSON, and a notebook cell's source line.
+      `"{\\"SecretAccessKey\\": \\"${secret}\\"}"`,
+      `"aws_secret_access_key=\\"${secret}\\"\\n",`,
+      `<SecretAccessKey>${secret}</SecretAccessKey>`,
+      `credentials: { secretAccessKey: '${secret}' }`,
+      `prodSecretAccessKey: '${secret}'`,
+      `secretAccessKey: \`${secret}\``,
+      `:secret_access_key => '${secret}'`,
+      `          aws-secret-access-key: ${secret}`,
+      `aws configure set aws_secret_access_key ${secret}`,
+      `--secret-access-key ${secret}`,
+      `setx "AWS_SECRET_ACCESS_KEY" "${secret}"`,
+      `os.environ['AWS_SECRET_ACCESS_KEY'] = '${secret}'`,
+      `ENV["AWS_SECRET_ACCESS_KEY"] = "${secret}"`,
+      `os.environ.setdefault('AWS_SECRET_ACCESS_KEY', '${secret}')`,
+      `System.setProperty("aws.secretKey", "${secret}")`,
+      `<entry key="aws.secretKey">${secret}</entry>`,
+      // A UTF-16 file's text, as read.
+      Buffer.from(`aws_access_key_id = ${keyId}\r\n`, 'utf16le').toString('utf8'),
+      `${begin('PRIVATE KEY')}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n`,
+      begin('RSA PRIVATE KEY'),
+      begin('EC PRIVATE KEY'),
+      begin('ENCRYPTED PRIVATE KEY'),
+      begin('OPENSSH PRIVATE KEY'),
+      begin('PGP PRIVATE KEY BLOCK'),
+    ];
+    expect(written.filter((text) => !leaks(text))).toEqual([]);
+    // Naming or referencing a credential, a public key or certificate, or a value longer than an AWS key, such as a
+    // Rails secret_key_base, does not match.
+    const harmless = [
+      'aws_secret_access_key = <your secret access key>',
+      'secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY',
+      'aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}',
+      "os.environ['AWS_SECRET_ACCESS_KEY'] = os.environ['PROD_SECRET']",
+      'setenv("AWS_SECRET_ACCESS_KEY", secretFromVault)',
+      keyId.slice(0, -1),
+      `${keyId}X`,
+      `secretAccessKey: '${secret}ABCD'`,
+      `secret_key_base: ${'0123456789abcdef'.repeat(8)}`,
+      begin('PUBLIC KEY'),
+      begin('CERTIFICATE'),
+    ];
+    expect(harmless.filter(leaks)).toEqual([]);
+  });
+
+  it('are looked for in untracked files git does not ignore', () => {
+    // files() lists what the scan reads. Here it lists a scratch repository holding a tracked, an untracked, and an
+    // ignored file. Its git sees none of this process's GIT_ variables, such as the GIT_DIR a git hook sets, which
+    // would point it at this repo instead.
+    const dir = mkdtempSync(join(tmpdir(), 'repo-files-'));
+    try {
+      for (const name of Object.keys(process.env).filter((key) => key.startsWith('GIT_'))) vi.stubEnv(name, undefined);
+      // Only the .gitignore may ignore a file here, not a developer's excludes: no template copies in an info/exclude,
+      // and an excludes file of the repository's own, which does not exist, replaces a global or XDG one.
+      git(['-C', dir, 'init', '-q', '--template=']);
+      git(['-C', dir, 'config', 'core.excludesFile', join(dir, '.git', 'no-excludes')]);
+      writeFileSync(join(dir, '.gitignore'), 'ignored.ts\n');
+      for (const file of ['tracked.ts', 'untracked.ts', 'ignored.ts']) writeFileSync(join(dir, file), '');
+      // Staging needs no git identity, which CI lacks.
+      git(['-C', dir, 'add', 'tracked.ts']);
+      expect(files([], dir).sort()).toEqual(['.gitignore', 'tracked.ts', 'untracked.ts']);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
