@@ -1,7 +1,7 @@
 # ADR 0002: Region, certificate, and organization-policy constraints
 
 - Status: Accepted. The SCP blocker was resolved on 2026-10-12 (see "Resolution")
-- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change, 2026-10-13 to add "Account and billing" and the site certificate, and 2026-10-14 once the certificate was in use
+- Date: 2026-10-11 (revised that day after AWS advanced features were activated); revised 2026-10-12 after the SCP change, 2026-10-13 to add "Account and billing" and the site certificate, and 2026-10-14 once the certificate was in use and for the account-wide S3 public-access block
 
 ## Decision
 
@@ -45,3 +45,9 @@ The backup and the apply, verify, and rollback scripts are in `docs/org-policy/`
 Advanced features are active. Activating them required upgrading to the AWS paid plan and removed spend limits; none can be created. A sudden Access Denied is therefore never a spend pause. It comes from an SCP (`docs/org-policy/`, including AWS Settings rewriting `p-ie47xwqg`), the RCP (`ManagedAccountResourceControlPolicy`), an IAM or resource policy, or account suspension. Suspension for non-payment would take the site, the hosted zone, and mail for the domain down together.
 
 A payer-wide cost budget with email alerts is set in the management account. Its settings are not recorded here; milestone 4's progress note (`docs/progress.md`) records them.
+
+S3 Block Public Access is on for the whole Website account, all four settings, since 18:00 UTC on 2026-10-14. It covers every bucket and access point in the account, in every Region, now and later. New buckets already block public access by default, but a bucket's own setting can be turned off, and a bucket can be created without it; the account setting stops both. Nothing here needs public S3 access: the site bucket is read only through CloudFront's origin access control, which S3 does not count as public, and the full live check of the site passed again after the change. CloudFormation has no resource type for this setting, and the stacks may not use custom resources, so it is an administrative setting recorded here rather than in a stack.
+
+- Check: `aws s3control get-public-access-block --account-id 426499248998 --region us-east-1` shows all four settings `true`.
+- Undo, which nothing planned needs: `aws s3control delete-public-access-block --account-id 426499248998 --region us-east-1`, which restores the earlier state of no account setting. The us-east-1 SCPs allow both calls; `p-ie47xwqg` denies them in us-west-2.
+- It guards against accidents, not against an administrator, who can remove it. An AWS Organizations S3 policy attached to this account from the management account would enforce it instead, and would make the account's own put and delete calls fail while attached. That is a management-account change for the `docs/org-policy/` runbook and is not made. The management and Identity Delegated Admin accounts have their own settings, which this does not cover.
