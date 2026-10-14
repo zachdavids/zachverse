@@ -204,9 +204,11 @@ describe('dnsBatchViolations', () => {
     "rejects %s of the site certificate's validation record %s with another value",
     (action, name, value) => {
       const change = withRecordSet({ ...validation, Action: action }, { Name: `${name}.` });
-      expect(dnsBatchViolations({ Changes: [change] })).toEqual([
-        `change 0 (${action} CNAME ${name}): the site certificate validates through this record, so its value must stay ${value}`,
-      ]);
+      const violation = `change 0 (${action} CNAME ${name}): the site certificate validates through this record, so its value must stay ${value}`;
+      expect(dnsBatchViolations({ Changes: [change] })).toEqual([violation]);
+      // The whole value is compared, not only its token.
+      const otherDomain = withRecordSet(change, { ResourceRecords: [{ Value: value.replace('.wzccmgtwzk.', '.xlfgrmvvlj.') }] });
+      expect(dnsBatchViolations({ Changes: [otherDomain] })).toEqual([violation]);
       // Its own value passes, in any case and without the trailing dot.
       const own = withRecordSet(change, { ResourceRecords: [{ Value: value.toUpperCase() }] });
       expect(dnsBatchViolations({ Changes: [own] })).toEqual([]);

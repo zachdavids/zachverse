@@ -344,9 +344,10 @@ describe('CDK entry point', () => {
 
     const { beforeExit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
     expect(beforeExit).toHaveLength(1);
-    // The CLI sets no app mode, so CDK prints the report and throws; under Vitest's NODE_ENV it would put the report in
-    // the error instead. Thrown from beforeExit, the error makes the app, and so the CLI command, fail.
-    vi.stubEnv('NODE_ENV', undefined);
+    // The CLI sets no app mode, so CDK prints the report and throws. Every input CDK reads the mode from is cleared, so
+    // the shell cannot set one either; under Vitest's NODE_ENV, CDK would put the report in the error instead. Thrown
+    // from beforeExit, the error makes the app, and so the CLI command, fail.
+    for (const variable of ['NODE_ENV', 'CDK_APP_MODE', 'PYTEST_VERSION', 'PYTEST_CURRENT_TEST']) vi.stubEnv(variable, undefined);
     await expect(listenersAddedBy(() => beforeExit[0]!.call(process, 0))).rejects.toThrow(
       /^Validation failed\. A copy of this report can be found in: .*validation-report\.json$/,
     );

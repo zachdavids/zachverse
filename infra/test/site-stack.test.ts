@@ -215,6 +215,11 @@ describe('site stack (pay-as-you-go)', () => {
     template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
   });
 
+  // Milestone 7 enables the plan for production (ADR 0003), in a reviewed change to this test.
+  it('is what production deploys until then', () => {
+    expect(productionConfig()).toEqual(PRICING_MODES['pay-as-you-go']);
+  });
+
   it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
     expect(json.Resources['SiteDeployPolicyEEC9A210']!.Properties).toEqual({
       PolicyName: 'SiteDeployPolicyEEC9A210',

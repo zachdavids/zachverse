@@ -57,7 +57,7 @@ const TEMPLATE_RULES: Record<string, (checked: Checked[]) => string[][]> = {
 
 /**
  * Checks every template a synthesis writes, wherever its stack is in the app, with every rule above and the
- * account, Region, and termination-protection rules (test/environment.test.ts). Every violation is fatal, and CDK
+ * account, Region, and termination-protection rules (environmentViolations). Every violation is fatal, and CDK
  * lets no acknowledgment (Validations.of(...).acknowledge()) suppress a fatal one, so any violation fails the report,
  * as does an error thrown here. A failed report fails the synthesis unless the app's context turns that off, which
  * bin/zachverse.ts prevents.
@@ -109,8 +109,10 @@ const wholeStack = ({ path, templatePath }: Checked): PolicyViolatingResource =>
  * that names none, such as a transform or an association two distributions share, is about the whole stack.
  */
 function violatingResource(description: string, checked: Checked): PolicyViolatingResource {
+  // The ways ./checks.ts follows a logical ID; a template-wide finding such as `Transform "X": ...` or `Fn::Transform: ...`
+  // starts with none of them after any ID, so it is not pinned on a resource that happens to be named Transform or Fn.
   const named = Object.keys(checked.template.Resources ?? {}).find((id) =>
-    [' ', ':', '/'].some((separator) => description.startsWith(`${id}${separator}`)),
+    [' (', ': ', '/', ' origin ', ' behavior '].some((separator) => description.startsWith(`${id}${separator}`)),
   );
   return named ? { resourceLogicalId: named, templatePath: checked.templatePath, locations: [] } : wholeStack(checked);
 }

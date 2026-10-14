@@ -18,8 +18,14 @@ describe('cdk.json', () => {
 
   it('keeps version reporting on', () => {
     // AWS uses the reported versions to contact users of CDK releases with serious security or reliability issues.
-    // The CLI then adds AWS::CDK::Metadata, and support/synth.ts adds it to the test templates too.
-    expect(cdkJson.versionReporting ?? true).toBe(true);
+    // The CLI then adds AWS::CDK::Metadata, and support/synth.ts adds it to the test templates too. Set here, as the
+    // CLI's default is not enough: the user's ~/.cdk.json, which the CLI reads under cdk.json, could turn it off.
+    expect(cdkJson.versionReporting).toBe(true);
+  });
+
+  it('loads no CLI plugins', () => {
+    // The CLI replaces lists when it merges settings, so this empty one also drops any list in the user's ~/.cdk.json.
+    expect(cdkJson.plugin).toEqual([]);
   });
 
   it('sets every feature flag the installed CDK recommends', () => {

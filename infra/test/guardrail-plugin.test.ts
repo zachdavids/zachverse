@@ -10,7 +10,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { App, RemovalPolicies, Stack, Stage, Validations } from 'aws-cdk-lib/core';
-import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { CDK_APP_MODE_CONTEXT, CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { Construct } from 'constructs';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { createStacks } from '../lib/app';
@@ -20,7 +20,11 @@ import { cdkContext, createApp, PRICING_MODES, productionConfig } from './suppor
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.doUnmock('../lib/guardrails/checks');
+  vi.resetModules();
+  vi.restoreAllMocks();
+});
 
 const WEBSITE = { account: '426499248998', region: 'us-east-1' };
 const DNS = 'hosted zones, DNS records, and domains are managed outside CDK (reviewed batches in infra/dns/)';
@@ -28,9 +32,15 @@ const TRANSFORMED = 'transforms and macros rewrite the template during deploymen
 
 type Stacks = ReturnType<typeof createStacks>;
 
-/** The production app as createStacks builds it, with cdk.json's context, after `change`. */
+/**
+ * cdk.json's context, with CDK's app mode set so that a failed synthesis throws the report itself. CDK otherwise takes
+ * the mode from CDK_APP_MODE or NODE_ENV, which Vitest sets to 'test' only when the shell has not set it.
+ */
+const CONTEXT = { ...cdkContext, [CDK_APP_MODE_CONTEXT]: 'inmemory' };
+
+/** The production app as createStacks builds it, with CONTEXT, after `change`. */
 function productionApp(change: (app: App, stacks: Stacks) => void): App {
-  const app = new App({ context: cdkContext });
+  const app = new App({ context: CONTEXT });
   change(app, createStacks(app, productionConfig()));
   return app;
 }
@@ -119,9 +129,24 @@ describe('every synthesis of an app built by createStacks', () => {
     const validate = vi.spyOn(GuardrailsPlugin.prototype, 'validate');
     const violation = `FATAL Dns (AWS::Route53::RecordSet): ${DNS} (Zachverse guardrails)`;
     expect(() => app.synth()).toThrow(violation);
-    // A failed synthesis leaves no cloud assembly, so CDK synthesizes the app again.
+    // A failed synthesis keeps no cloud assembly in the app (its files stay on disk), so CDK synthesizes the app again.
     expect(() => app.synth()).toThrow(violation);
     expect(validate).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails when a rule throws, instead of passing what it could not check', async () => {
+    vi.doMock('../lib/guardrails/checks', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../lib/guardrails/checks')>()),
+      retentionViolations: () => {
+        throw new Error('a rule threw');
+      },
+    }));
+    // createStacks and the plugin afresh, so the plugin's rules come from the module above.
+    vi.resetModules();
+    const { createStacks: createWithThrowingRule } = await import('../lib/app.js');
+    const app = new App({ context: CONTEXT });
+    createWithThrowingRule(app, productionConfig());
+    expect(() => app.synth()).toThrow("Validation plugin 'Zachverse guardrails' failed: a rule threw");
   });
 
   // CDK skips acknowledged violations unless they are fatal. Pinned, so a CDK release that changes this fails here.
@@ -239,29 +264,81 @@ describe('every synthesis of an app built by createStacks', () => {
 });
 
 describe('GuardrailsPlugin', () => {
-  it('flags a template whose stack is not in the app, since where that stack deploys cannot be verified', () => {
+  /**
+   * Validates `template` as the template of a stack at Lost, which the app does not have. Called directly, so the
+   * report is as the plugin returns it, before CDK adds to it.
+   */
+  function validateLost(template: object) {
     const dir = mkdtempSync(path.join(tmpdir(), 'zachverse-guardrails-'));
     try {
       const templatePath = path.join(dir, 'Lost.template.json');
-      // No Resources section, as CDK writes for a stack with nothing in it.
-      writeFileSync(templatePath, JSON.stringify({ Transform: 'DnsMacro' }));
+      writeFileSync(templatePath, JSON.stringify(template));
       const report = new GuardrailsPlugin().validate({
         templatePaths: [templatePath],
         stackTemplates: [{ stackConstructPath: 'Lost', templatePath, accountId: WEBSITE.account, region: WEBSITE.region }],
         appConstruct: new App(),
       });
-      // Called directly, so the report is as the plugin returns it, before CDK adds to it.
-      const lost = { constructPath: 'Lost', templatePath, locations: [] };
-      const unknown = 'the app has no stack at Lost, so its account, Region, and termination protection cannot be verified';
-      expect(report).toEqual({
-        success: false,
-        violations: [
-          fatal('prohibited-resources', `Transform "DnsMacro": ${TRANSFORMED}`, lost),
-          fatal('environment', unknown, lost),
-        ],
-      });
+      return { report, templatePath, lost: { constructPath: 'Lost', templatePath, locations: [] } };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+  const unknown = 'the app has no stack at Lost, so its account, Region, and termination protection cannot be verified';
+  const retained = { DeletionPolicy: 'Retain', UpdateReplacePolicy: 'Retain' };
+
+  it('flags a template whose stack is not in the app, since where that stack deploys cannot be verified', () => {
+    // No Resources section, as CDK writes for a stack with nothing in it.
+    const { report, lost } = validateLost({ Transform: 'DnsMacro' });
+    expect(report).toEqual({
+      success: false,
+      violations: [
+        fatal('prohibited-resources', `Transform "DnsMacro": ${TRANSFORMED}`, lost),
+        fatal('environment', unknown, lost),
+      ],
+    });
+  });
+
+  it('reports transforms against the whole stack, though resources are named Transform and Fn', () => {
+    const { report, lost } = validateLost({
+      Transform: 'DnsMacro',
+      Resources: {
+        Transform: { Type: 'AWS::S3::Bucket', ...retained },
+        Fn: { Type: 'AWS::S3::Bucket', ...retained, Properties: { 'Fn::Transform': { Name: 'DnsMacro' } } },
+      },
+    });
+    expect(report).toEqual({
+      success: false,
+      violations: [
+        fatal('prohibited-resources', `Transform "DnsMacro": ${TRANSFORMED}`, lost),
+        fatal('prohibited-resources', `Fn::Transform: ${TRANSFORMED}`, lost),
+        fatal('environment', unknown, lost),
+      ],
+    });
+  });
+
+  it("reports findings about a distribution's behaviors and origins against the distribution", () => {
+    const { report, lost, templatePath } = validateLost({
+      Resources: {
+        Dist: {
+          Type: 'AWS::CloudFront::Distribution',
+          ...retained,
+          Properties: {
+            DistributionConfig: {
+              Origins: [{ Id: 'o1', DomainName: 'example.com', OriginShield: { Enabled: true } }],
+              DefaultCacheBehavior: { TargetOriginId: 'o1', CachePolicyId: 'custom' },
+            },
+          },
+        },
+      },
+    });
+    const dist = { resourceLogicalId: 'Dist', templatePath, locations: [] };
+    expect(report).toEqual({
+      success: false,
+      violations: [
+        fatal('free-plan', 'Dist behavior default: CachePolicyId must be an AWS-managed policy ID', dist),
+        fatal('free-plan', 'Dist origin o1: Origin Shield needs Premium', dist),
+        fatal('environment', unknown, lost),
+      ],
+    });
   });
 });

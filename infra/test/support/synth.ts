@@ -11,9 +11,9 @@ export const TEST_WEB_ACL_ARN = `arn:aws:wafv2:us-east-1:${production.account}:g
 const cdkJson = JSON.parse(readFileSync(path.join(__dirname, '..', '..', 'cdk.json'), 'utf8'));
 
 /**
- * cdk.json's feature flags, plus version reporting, which the CLI turns on unless cdk.json sets versionReporting to
- * false. The CLI also passes keys for path and asset metadata and for bundling, which this leaves out. Tests then
- * synthesize the same resources and properties as `cdk deploy`; only the CLI's path metadata differs.
+ * cdk.json's feature flags, plus version reporting, which cdk.json keeps on for the CLI. The CLI also passes keys for
+ * path and asset metadata and for bundling, which this leaves out. Tests then synthesize the same resources and
+ * properties as `cdk deploy`; only the CLI's path metadata differs.
  */
 export const cdkContext = { ...cdkJson.context, 'aws:cdk:version-reporting': cdkJson.versionReporting !== false };
 
