@@ -9,7 +9,7 @@ Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) 
 | --- | --- |
 | `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML |
 | `scripts/` | Prerender step and post-build output check |
-| `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows and CI steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
+| `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows, CI steps, and the deploy workflow's build, artifact, and role steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
 | `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and the template guardrails (`infra/lib/guardrails/`), which run in every synthesis and in the tests |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
 | `docs/` | Architecture decisions (`docs/adr/`) and milestone status (`docs/progress.md`) |
@@ -37,5 +37,7 @@ npm run cdk -- diff  # the CDK CLI typechecks and runs the tests before every sy
 ```
 
 The app always synthesizes both stacks, `ZachverseIdentity` and `ZachverseSite`. `certificateArn` in `infra/lib/config.ts` names the site certificate (ADR 0002), and an empty or malformed one fails synthesis. Every synthesis also runs the template guardrails as a CDK validation plugin, and `bin/zachverse.ts` makes any violation fail the synthesis, so every CLI command that synthesizes the app fails on one, even with `--build ''` (which skips only the typecheck and the tests) or `--ignore-errors`. Changed code, or an assembly synthesized earlier and passed with `--app` (or `CDK_APP`), still gets past them (ADR 0003, "Limits"). The CDK bootstrap (`npm run bootstrap` in `infra/`) changes the account and was already run; ADR 0004's runbook covers it.
+
+Pushes to `main` also run `.github/workflows/deploy.yml` (ADR 0005). It checks and builds the commit, then, in the GitHub `production` environment, assumes the deploy role through OIDC; until milestone 6 it checks that role's access and publishes nothing. Infrastructure changes are not deployed by any workflow: an administrator deploys them with ADR 0004's runbook.
 
 Both packages' `.npmrc` files stop dependencies' install scripts from running and stop `npx` from downloading packages that aren't installed. To run one package's install script deliberately, use `npm rebuild <package> --ignore-scripts=false`.
