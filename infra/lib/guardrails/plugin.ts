@@ -109,8 +109,8 @@ const wholeStack = ({ path, templatePath }: Checked): PolicyViolatingResource =>
  * that names none, such as a transform or an association two distributions share, is about the whole stack.
  */
 function violatingResource(description: string, checked: Checked): PolicyViolatingResource {
-  // The ways ./checks.ts follows a logical ID; a template-wide finding such as `Transform "X": ...` or `Fn::Transform: ...`
-  // starts with none of them after any ID, so it is not pinned on a resource that happens to be named Transform or Fn.
+  // The ways ./checks.ts follows a logical ID. A template-wide finding such as `Transform "X": ...` or `Fn::Transform: ...`
+  // has none of them after an alphanumeric ID, so it is not pinned on a resource that happens to be named Transform or Fn.
   const named = Object.keys(checked.template.Resources ?? {}).find((id) =>
     [' (', ': ', '/', ' origin ', ' behavior '].some((separator) => description.startsWith(`${id}${separator}`)),
   );

@@ -34,7 +34,8 @@ type Stacks = ReturnType<typeof createStacks>;
 
 /**
  * cdk.json's context, with CDK's app mode set so that a failed synthesis throws the report itself. CDK otherwise takes
- * the mode from CDK_APP_MODE or NODE_ENV, which Vitest sets to 'test' only when the shell has not set it.
+ * the mode from CDK_APP_MODE, NODE_ENV (which Vitest sets to 'test' only when the shell has not set it), or pytest's
+ * variables.
  */
 const CONTEXT = { ...cdkContext, [CDK_APP_MODE_CONTEXT]: 'inmemory' };
 
