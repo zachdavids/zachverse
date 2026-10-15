@@ -147,11 +147,12 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - assets kept, uploaded, or replaced and invalidated, by checksum and headers;
   - a replaced asset recorded as pending before it is overwritten, and invalidated by the rollback and by a re-run after its own run failed first;
   - a stale, diverged, or replaced release refused before any write, and every release over a restore unless a run's first attempt resumes;
-  - a copy with other files, a history, manifest, or pending record that is not what it should be, a history from newer release code, or a key no release writes, all refused before any write;
+  - a copy with other files, a history, manifest, or pending record that is not what it should be, a history from newer release code, or a key no release writes, all refused before any write, in a publish, a restore, and a rollback;
+  - a field it does not know inside a history entry kept through every rewrite, as the format rule relies on;
   - a re-run of a restore restoring the same release;
-  - a rollback after a failed check or a publish that stopped partway, past earlier failed releases, in a later attempt of the run, and to a restore whose own checks failed; none when the run changed nothing or no earlier release passed or was restored;
+  - a rollback after a failed check or a publish that stopped partway, past earlier failed releases, in a later attempt of the run, and to a restore whose own checks failed; none when the run changed nothing or no earlier release passed or was restored; and a publish of the release a run rolled back allowed again, however many of its attempts rolled back;
   - a damaged copy, a missing file, or a never-verified release not restored;
-  - the AWS adapter reading AWS's error codes from the CLI's JSON errors;
+  - the AWS adapter reading AWS's error codes from the CLI's JSON errors, with only S3's two missing-key codes read as missing;
   - each smoke and browser check failing for the fault it looks for, and the home-page check passing the build's real prerendered page.
 - **The browser check in real Chromium**, against copies of a fresh build broken on purpose: the first round's ten breakages, and the second review's eleven experiments, all as expected. The ten were a script that throws, a console error, a layout wider than a phone, a missing stylesheet, a missing script, no focus indicator, a hidden heading, a heading off the screen, pages that name another release, and a hydration mismatch. In the second round, every breakage failed and the unbroken build passed. The breakages were:
   - a heading hidden, made transparent, or moved above or below the window;
@@ -160,15 +161,15 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - a console error on the 404 page.
 - **`tests/repo-policy.test.ts`** pins the jobs that may assume the deploy role: the deploy and verify jobs, and the Restore workflow's restore job.
   - It pins their steps in order, the verify job's conditions exactly, their settings (no container, services, matrix, or shell override), their permissions and role inputs, and their variables.
-  - No step may set those variables again, and the jobs read no job's outputs but the build's digest, no input but their own, and other jobs only for their results.
+  - No step may set those variables again, and the jobs read no job's outputs but the build's digest, no input but their own, nothing from the event, and other jobs only for their results. The workflow's own `env`, which reaches every job, counts too.
   - It pins their shared concurrency group, which no other workflow or job may join.
-  - It keeps the browser job out of the environment, without variables, an OIDC token, or outputs, and no workflow may set a Playwright or proxy variable.
+  - It keeps the browser job out of the environment, without variables, an OIDC token, or outputs. No workflow may set a Playwright, npm config, or proxy variable, in `env` or in a script, and `package.json` sets no `config`.
   - It also pins the Deploy workflow's `resume` input, the Restore workflow's test job, and the release scripts' commands.
-  - For the scripts the role jobs run, `tsc` on a Node-only project (`tsconfig.release.json`) must load nothing from `node_modules` but Node's types. A scan rejects what `tsc` cannot follow, and both entry points must load under plain Node, copied where no package can be found.
+  - For the scripts the role jobs run, `tsc` on a Node-only project (`tsconfig.release.json`) must load nothing from `node_modules` but Node's types. A scan rejects what `tsc` cannot follow, and both entry points must load under plain Node, copied beside the repository's `package.json` and run under Node's permission model, which lets them read nothing outside the copy, so no package above it can load.
   - It forbids `NODE_` variables in the role jobs.
-  - Mutations caught: the six workflow changes the second review's mutations represent, and six import forms that the earlier check missed.
+  - Mutations caught: the six workflow changes the second review's mutations represent, six import forms that the earlier check missed, and the third review's six bypasses: a Playwright download host set through npm config, through `$GITHUB_ENV`'s multiline form, or in `package.json`; event data through the workflow's `env` or `toJSON(github)`; and a dynamic import of `typescript`.
 - **`infra/test/site-stack.test.ts`** pins the bucket policy's statements, the release-record deny included, and the deploy policy's, with its page deletion and its deny of deleting assets or release records.
-- **Two reviews:**
+- **Reviews:**
   - The first, of the change in five areas with each finding checked by two independent skeptics, confirmed 21 findings, all addressed.
   - The second, of the pipeline, the scripts, and the design, after the browser check, page removal, and holds were added, raised 18 distinct findings, each checked by two skeptics. All but a few were confirmed, none of high severity, and all are addressed here.
   - A third, of the second's fixes, confirmed 14 low-severity findings (two rollbacks in one run blocking a retry, `npm ci` not retried, mixed colour syntaxes in the focus check, gaps in the policy tests, and overstated docs), all addressed here; mutations show the new tests catch each regression it described.
