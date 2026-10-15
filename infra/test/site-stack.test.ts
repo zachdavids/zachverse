@@ -2,9 +2,9 @@ import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
 import { App } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
-import { SiteStack } from '../lib/site-stack';
+import { RATE_LIMIT_PER_IP, SiteStack } from '../lib/site-stack';
 import type { CfnTemplate } from '../lib/guardrails/template';
-import { cdkContext, PRICING_MODES, productionConfig, synthesizeSite, TEST_WEB_ACL_ARN } from './support/synth';
+import { cdkContext, PRICING_MODES, productionConfig, synthesizeSite } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -200,11 +200,15 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
     }
   });
 
-  it('exports the values the deploy workflow needs', () => {
+  it('exports the values the deploy workflow needs, and with the plan, the ARNs the checks after a deploy read', () => {
     expect(json.Outputs).toEqual({
       SiteBucketName: { Value: { Ref: BUCKET } },
       DistributionId: { Value: { Ref: DISTRIBUTION } },
       DistributionDomainName: { Value: { 'Fn::GetAtt': [DISTRIBUTION, 'DomainName'] } },
+      ...(siteConfig.pricingPlan && {
+        WebAclArn: { Value: { 'Fn::GetAtt': ['SiteWebAcl', 'Arn'] } },
+        PricingPlanSubscriptionArn: { Value: { 'Fn::GetAtt': ['PricingPlanSubscription', 'Arn'] } },
+      }),
     });
   });
 
@@ -217,14 +221,10 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
 describe('site stack (pay-as-you-go)', () => {
   const { template, json } = synthesizeSite(PRICING_MODES['pay-as-you-go']);
 
-  it('has no web ACL or pricing-plan subscription before the plan is enabled', () => {
+  it('has no web ACL or pricing-plan subscription without the plan, so pay-as-you-go pays for no web ACL', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
+    template.resourceCountIs('AWS::WAFv2::WebACL', 0);
     template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
-  });
-
-  // Milestone 7 enables the plan for production (ADR 0003), in a reviewed change to this test.
-  it('is what production deploys until then', () => {
-    expect(productionConfig()).toEqual(PRICING_MODES['pay-as-you-go']);
   });
 
   it('grants the GitHub deploy role read, write, and page deletion on this bucket, and invalidation/read on this distribution', () => {
@@ -266,28 +266,68 @@ describe('site stack (pay-as-you-go)', () => {
 });
 
 describe('site stack (Free flat-rate plan enabled)', () => {
-  const { template, json } = synthesizeSite(PRICING_MODES['Free flat-rate plan']);
-
-  it('attaches the intended web ACL to the distribution', () => {
-    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
+  const { json } = synthesizeSite(PRICING_MODES['Free flat-rate plan']);
+  const WEB_ACL = 'SiteWebAcl';
+  const managed = (name: string, priority: number) => ({
+    Name: `AWS-${name}`,
+    Priority: priority,
+    Statement: { ManagedRuleGroupStatement: { VendorName: 'AWS', Name: name } },
+    OverrideAction: { None: {} },
+    VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: `AWS-${name}` },
   });
 
-  it('subscribes the distribution, web ACL, and existing hosted zone to the FREE tier', () => {
-    template.resourceCountIs('AWS::PricingPlanManager::Subscription', 1);
-    const [, subscription] = Object.entries(json.Resources).find(
-      ([, r]) => r.Type === 'AWS::PricingPlanManager::Subscription',
-    )!;
-    expect(subscription.Properties).toEqual({
+  it('is what production deploys, since milestone 7 (ADR 0007)', () => {
+    expect(productionConfig()).toEqual(PRICING_MODES['Free flat-rate plan']);
+  });
+
+  it('creates a CLOUDFRONT-scope web ACL with four of the plan\'s five rules: a per-IP rate limit and three AWS managed rule groups', () => {
+    expect(json.Resources[WEB_ACL]!.Type).toBe('AWS::WAFv2::WebACL');
+    expect(json.Resources[WEB_ACL]!.Properties).toEqual({
+      Name: 'zachverse-site',
+      Scope: 'CLOUDFRONT',
+      DefaultAction: { Allow: {} },
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: 'zachverse-site' },
+      Rules: [
+        managed('AWSManagedRulesAmazonIpReputationList', 0),
+        {
+          Name: 'RateLimitPerIp',
+          Priority: 1,
+          Statement: { RateBasedStatement: { Limit: 1000, EvaluationWindowSec: 300, AggregateKeyType: 'IP' } },
+          Action: { Block: {} },
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: 'RateLimitPerIp' },
+        },
+        managed('AWSManagedRulesKnownBadInputsRuleSet', 2),
+        managed('AWSManagedRulesCommonRuleSet', 3),
+      ],
+      Tags: [{ Key: 'project', Value: 'zachverse' }],
+    });
+    expect(RATE_LIMIT_PER_IP).toBe(1000);
+  });
+
+  // The references order the deployment: the web ACL first, then the distribution that uses it, then the subscription.
+  it('attaches the web ACL to the distribution by reference', () => {
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toEqual({ 'Fn::GetAtt': [WEB_ACL, 'Arn'] });
+  });
+
+  it('subscribes the distribution, the web ACL, and the existing hosted zone to the FREE tier', () => {
+    const subscriptions = Object.entries(json.Resources).filter(([, r]) => r.Type === 'AWS::PricingPlanManager::Subscription');
+    expect(subscriptions.map(([id]) => id)).toEqual(['PricingPlanSubscription']);
+    expect(subscriptions[0]![1].Properties).toEqual({
       PlanFamily: 'CloudFront',
       PlanTier: 'FREE',
       ResourceArns: [
         { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: DISTRIBUTION }]] },
-        TEST_WEB_ACL_ARN,
+        { 'Fn::GetAtt': [WEB_ACL, 'Arn'] },
         // The existing zone from docs/adr/0002.
         'arn:aws:route53:::hostedzone/Z03492543O0YEY0RDZZ0J',
       ],
     });
   });
+
+  it('declares no other dependency, so nothing else waits on the plan', () => {
+    for (const id of [WEB_ACL, DISTRIBUTION, 'PricingPlanSubscription']) expect(json.Resources[id]!.DependsOn).toBeUndefined();
+  });
+
 });
 
 // toThrow('text') only checks for a substring, so pass the whole message.
@@ -382,85 +422,6 @@ describe('site stack configuration errors', () => {
     const certificateArn = CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
     expect(() => synthesizeSite(productionConfig({ region: 'us-east-2', certificateArn }))).toThrow(
       error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
-    );
-  });
-});
-
-describe('web ACL configuration errors', () => {
-  const synthesizeWith = (webAclArn: string) => () =>
-    synthesizeSite(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn } }));
-
-  it('refuses to synthesize when the web ACL ARN is empty', () => {
-    expect(synthesizeWith('')).toThrow(
-      error('pricingPlan.webAclArn is empty. Set it to the ARN of the CLOUDFRONT-scope web ACL (docs/adr/0002).'),
-    );
-  });
-
-  // Each ARN changes one part of TEST_WEB_ACL_ARN, which the Free-plan tests synthesize successfully.
-  it.each([
-    ['another partition', TEST_WEB_ACL_ARN.replace('arn:aws:', 'arn:aws-cn:')],
-    ['another service', TEST_WEB_ACL_ARN.replace(':wafv2:', ':waf-regional:')],
-    ['the REGIONAL scope', TEST_WEB_ACL_ARN.replace(':global/', ':regional/')],
-    ['another Region', TEST_WEB_ACL_ARN.replace(':us-east-1:', ':us-east-2:')],
-    ['another account', TEST_WEB_ACL_ARN.replace(':426499248998:', ':111111111111:')],
-  ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
-    expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
-    expect(synthesizeWith(webAclArn)).toThrow(
-      error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by 426499248998: ${webAclArn}`),
-    );
-  });
-
-  // Paste errors that CloudFront or the pricing plan would otherwise reject only at deploy time.
-  it.each([
-    ['nothing after the scope', TEST_WEB_ACL_ARN.replace(/\/.*$/, '')],
-    ['another WAF resource type', TEST_WEB_ACL_ARN.replace('/webacl/', '/ipset/')],
-    ['no web ACL ID', TEST_WEB_ACL_ARN.replace(/\/[^/]*$/, '')],
-    ['a truncated web ACL ID', TEST_WEB_ACL_ARN.slice(0, -1)],
-    ['a trailing newline', `${TEST_WEB_ACL_ARN}\n`],
-    ['an extra path segment', `${TEST_WEB_ACL_ARN}/extra`],
-    ['the ARN pasted twice', TEST_WEB_ACL_ARN.repeat(2)],
-    ['a colon after the scope', TEST_WEB_ACL_ARN.replace(':global/', ':global:')],
-    ['a letter that is not hex in the web ACL ID', TEST_WEB_ACL_ARN.replace(/0{8}-/, '0000000o-')],
-    ['an uppercase web ACL ID', TEST_WEB_ACL_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID.toUpperCase())],
-    ['a misplaced dash in the web ACL ID', TEST_WEB_ACL_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
-    ['an empty web ACL name', TEST_WEB_ACL_ARN.replace('/zachverse/', '//')],
-    ['a web ACL name longer than 128 characters', TEST_WEB_ACL_ARN.replace('/zachverse/', `/${'a'.repeat(129)}/`)],
-    ['a character WAF does not allow in the web ACL name', TEST_WEB_ACL_ARN.replace('/zachverse/', '/zach.verse/')],
-  ])('rejects a web ACL ARN with %s', (_case, webAclArn) => {
-    expect(webAclArn).not.toBe(TEST_WEB_ACL_ARN);
-    expect(synthesizeWith(webAclArn)).toThrow(
-      error(`pricingPlan.webAclArn must have the form arn:aws:wafv2:us-east-1:<account>:global/webacl/<name>/<ID>: ${webAclArn}`),
-    );
-  });
-
-  it('accepts a web ACL name with hyphens and underscores and an ID with any lowercase hex digit', () => {
-    const webAclArn = TEST_WEB_ACL_ARN.replace(/zachverse\/[0-9a-f-]{36}$/, `zachverse_site-1/${ANY_ID}`);
-    const { json } = synthesizeWith(webAclArn)();
-    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(webAclArn);
-  });
-
-  it('accepts a web ACL name of 128 characters, the longest WAF allows', () => {
-    const webAclArn = TEST_WEB_ACL_ARN.replace('/zachverse/', `/${'a'.repeat(128)}/`);
-    const { json } = synthesizeWith(webAclArn)();
-    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(webAclArn);
-  });
-
-  it.each([
-    ['a WAF Classic web ACL ID', '00000000-0000-0000-0000-000000000000'],
-    ['an ARN with a leading space', ` ${TEST_WEB_ACL_ARN}`],
-  ])('rejects %s as malformed, naming it', (_case, webAclArn) => {
-    // aws-cdk-lib's ARN parser words these errors, so pin only the value they name.
-    expect(synthesizeWith(webAclArn)).toThrow(error(expect.stringContaining(webAclArn)));
-  });
-
-  it('checks ownership against the configured account', () => {
-    const otherAccount = productionConfig({
-      account: '111111111111',
-      certificateArn: CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:'),
-      pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN },
-    });
-    expect(() => synthesizeSite(otherAccount)).toThrow(
-      error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by 111111111111: ${TEST_WEB_ACL_ARN}`),
     );
   });
 });

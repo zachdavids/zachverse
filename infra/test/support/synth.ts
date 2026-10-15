@@ -6,6 +6,7 @@ import { createStacks } from '../../lib/app';
 import { production, type SiteConfig } from '../../lib/config';
 import type { CfnTemplate } from '../../lib/guardrails/template';
 
+/** A web ACL ARN of the right form, for the guardrail tests; the site stack creates its own web ACL (ADR 0007). */
 export const TEST_WEB_ACL_ARN = `arn:aws:wafv2:us-east-1:${production.account}:global/webacl/zachverse/00000000-0000-0000-0000-000000000000`;
 
 const cdkJson = JSON.parse(readFileSync(path.join(__dirname, '..', '..', 'cdk.json'), 'utf8'));
@@ -24,7 +25,7 @@ export function productionConfig(overrides: Partial<SiteConfig> = {}): SiteConfi
 /** The production config with the Free flat-rate plan off and on. Production deploys one, so tests check both. */
 export const PRICING_MODES = {
   'pay-as-you-go': productionConfig({ pricingPlan: undefined }),
-  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }),
+  'Free flat-rate plan': productionConfig({ pricingPlan: { tier: 'FREE' } }),
 };
 
 export interface SynthesizedStack {

@@ -11,7 +11,7 @@ import { production } from '../lib/config';
 import { IdentityStack } from '../lib/identity-stack';
 import { SiteStack } from '../lib/site-stack';
 import { prohibitedResourceViolations } from '../lib/guardrails/checks';
-import { productionConfig, synthesizeAll, synthesizeSite, TEST_WEB_ACL_ARN } from './support/synth';
+import { productionConfig, synthesizeAll, synthesizeSite } from './support/synth';
 
 // The real createStacks, wrapped so one test can make the app build a differently named stack.
 vi.mock('../lib/app', async (importOriginal) => {
@@ -34,7 +34,8 @@ describe('productionConfig', () => {
   });
 
   it('applies overrides on top', () => {
-    const pricingPlan = { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } as const;
+    // Production has the plan on (ADR 0007), so turning it off is an override.
+    const pricingPlan = undefined;
     const certificateArn = production.certificateArn.replace(/\/[0-9a-f]{8}-/, '/87654321-');
     expect(certificateArn).not.toBe(production.certificateArn);
     expect(productionConfig({ pricingPlan, certificateArn })).toEqual({ ...production, pricingPlan, certificateArn });
@@ -47,12 +48,12 @@ describe('synthesizeAll', () => {
     expect(stacks.map((s) => s.stack.stackName)).toEqual(['ZachverseIdentity', 'ZachverseSite']);
     const config = stacks[1]!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
     expect(config.ViewerCertificate.AcmCertificateArn).toBe(productionConfig().certificateArn);
-    expect(config.WebACLId).toBe(production.pricingPlan?.webAclArn);
+    expect(config.WebACLId).toEqual({ 'Fn::GetAtt': ['SiteWebAcl', 'Arn'] });
   });
 
   it('synthesizes the configuration it is given', () => {
-    const [, site] = synthesizeAll(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }));
-    expect(site!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
+    const [, site] = synthesizeAll(productionConfig({ pricingPlan: undefined }));
+    expect(site!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
   });
 
   it('applies the feature flags from cdk.json, as cdk deploy would', () => {
@@ -117,11 +118,11 @@ describe('synthesizeSite', () => {
     expect(stack.stackName).toBe('ZachverseSite');
     const config = json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
     expect(config.ViewerCertificate.AcmCertificateArn).toBe(productionConfig().certificateArn);
-    expect(config.WebACLId).toBe(production.pricingPlan?.webAclArn);
+    expect(config.WebACLId).toEqual({ 'Fn::GetAtt': ['SiteWebAcl', 'Arn'] });
   });
 
   it('synthesizes the configuration it is given', () => {
-    const { json } = synthesizeSite(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }));
-    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
+    const { json } = synthesizeSite(productionConfig({ pricingPlan: undefined }));
+    expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
   });
 });
