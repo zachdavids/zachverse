@@ -57,8 +57,9 @@ function filesIn(dir: URL): Set<string> {
 }
 
 // Returns one message per problem found in rootDir's dist/. rootDir is a
-// directory URL ending in "/".
-export function checkDist(rootDir: URL): string[] {
+// directory URL ending in "/". release is the commit the deploy build sets
+// (RELEASE_COMMIT, ADR 0006), which each page must name; other builds name none.
+export function checkDist(rootDir: URL, release?: string): string[] {
   const dist = new URL('dist/', rootDir);
   const distFiles = filesIn(dist);
   const publicFiles = filesIn(new URL('public/', rootDir));
@@ -112,6 +113,13 @@ export function checkDist(rootDir: URL): string[] {
       `<meta name="description" content="${escapeHtml(site.description)}" />`,
     ]);
     if (html.includes('<!--app-')) failures.push(`dist/${file} still contains a prerender marker`);
+    const releaseTags = html.match(/<meta name="zachverse-release"[^>]*>/g) ?? [];
+    const releaseTag = `<meta name="zachverse-release" content="${release}" />`;
+    if (release === undefined && releaseTags.length > 0) {
+      failures.push(`dist/${file} names a release, but no RELEASE_COMMIT was given`);
+    } else if (release !== undefined && (releaseTags.length !== 1 || releaseTags[0] !== releaseTag)) {
+      failures.push(`dist/${file} does not name release ${release} exactly once`);
+    }
     // The capture group is not optional, so every match has m[1].
     const urls = [...html.matchAll(/\s(?:src|href)="([^"]*)"/g)].map((m) => m[1]!);
     // CloudFront serves /404.html at every missing path, so on /a/b/c a relative

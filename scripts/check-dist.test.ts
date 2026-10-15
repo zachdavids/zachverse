@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const checkDist = vi.hoisted(() => vi.fn<(rootDir: URL) => string[]>());
+const checkDist = vi.hoisted(() => vi.fn<(rootDir: URL, release?: string) => string[]>());
 vi.mock('./check-dist-lib.ts', () => ({ checkDist }));
 
 describe('check-dist script', () => {
   beforeEach(() => {
     vi.resetModules();
+    vi.stubEnv('RELEASE_COMMIT', '');
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     checkDist.mockReset();
   });
 
@@ -31,11 +33,26 @@ describe('check-dist script', () => {
 
     await run();
 
-    expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url));
+    expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url), undefined);
     expect(log).toHaveBeenCalledExactlyOnceWith(
       'dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets',
     );
     expect(error).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("checks the deploy build's release when RELEASE_COMMIT names one", async () => {
+    const release = '0123456789abcdef0123456789abcdef01234567';
+    vi.stubEnv('RELEASE_COMMIT', release);
+    checkDist.mockReturnValue([]);
+    const { exit, log } = captureOutput();
+
+    await run();
+
+    expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url), release);
+    expect(log).toHaveBeenCalledExactlyOnceWith(
+      `dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets, release ${release}`,
+    );
     expect(exit).not.toHaveBeenCalled();
   });
 

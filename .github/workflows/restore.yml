@@ -1,0 +1,112 @@
+name: Restore
+
+# Publishes a verified release again from its saved copy (ADR 0006), run by hand. Only main may run it: the production
+# environment and the deploy role's trust admit no other ref, and the first step stops one before anything else runs.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '"previous" (the last verified release before the current one), or the commit SHA of a verified release'
+        required: true
+        default: previous
+        type: string
+
+# Read-only token; only the restore job may request an OIDC token.
+permissions:
+  contents: read
+
+# The deploy workflow's group (concurrency groups are shared by the repository's workflows), so a restore never runs
+# while a deploy publishes, or a deploy while a restore does. A run waiting in the group is replaced by a newer one.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    name: Restore a verified release
+    runs-on: ubuntu-24.04
+    # Restoring waits up to 10 minutes for CloudFront's invalidation.
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read # the checkout
+      id-token: write # the OIDC token for the deploy role
+    defaults:
+      run:
+        shell: bash
+    # The production environment's variables (ADR 0005), under names the AWS CLI does not read, and the release asked
+    # for, which the restore checks.
+    env:
+      ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ROLE_ARN: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+      BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      RELEASE: ${{ inputs.release }}
+    steps:
+      - name: Restore only on main
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Only main restores; this run is for $GITHUB_REF."
+            exit 1
+          fi
+      - name: Check the environment's variables
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ $ACCOUNT_ID =~ ^[0-9]{12}$ ]] || fail 'AWS_ACCOUNT_ID must be a 12-digit account ID.'
+          [[ $ROLE_ARN =~ ^arn:aws:iam::$ACCOUNT_ID:role/[A-Za-z0-9+=,.@_/-]+$ ]] ||
+            fail 'AWS_SITE_DEPLOY_ROLE_ARN must be the ARN of a role in AWS_ACCOUNT_ID.'
+          [[ $BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || fail 'SITE_BUCKET must be an S3 bucket name.'
+          [[ $DISTRIBUTION_ID =~ ^[A-Z0-9]{8,32}$ ]] || fail 'CLOUDFRONT_DISTRIBUTION_ID must be a distribution ID.'
+      # The release and smoke-test scripts, from this run's commit. They import only Node's built-in modules, so the job
+      # installs no packages.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-session-name: zachverse-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          # Long enough for the invalidation, the smoke test, and the record after it.
+          role-duration-seconds: 1800
+          # As in the deploy workflow: no variable fills an input left out here, and no step may set one the action or
+          # the AWS CLI reads (ADR 0005, "Limits").
+          translate-env-variables: false
+      - name: Check the deploy role's access (read-only)
+        id: access
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          caller=$(aws sts get-caller-identity --query Arn --output text)
+          [[ $caller == "arn:aws:sts::$ACCOUNT_ID:assumed-role/${ROLE_ARN##*/}/"* ]] ||
+            fail "Expected a session of $ROLE_ARN, got $caller."
+          aws s3api list-objects-v2 --bucket "$BUCKET" --max-keys 1 > /dev/null
+          origins=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
+            --query 'Distribution.DistributionConfig.Origins.Items[].DomainName' --output text)
+          [[ $origins == "$BUCKET.s3.us-east-1.amazonaws.com" ]] ||
+            fail "Distribution $DISTRIBUTION_ID should have one origin, bucket $BUCKET; it has: $origins."
+          domain=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" --query Distribution.DomainName --output text)
+          [[ $domain =~ ^[a-z0-9]+\.cloudfront\.net$ ]] || fail "Distribution $DISTRIBUTION_ID has the hostname $domain."
+          aws cloudfront list-invalidations --distribution-id "$DISTRIBUTION_ID" --max-items 1 > /dev/null
+          echo "domain=$domain" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Access checked'
+            echo
+            echo "- Role session: \`$caller\`"
+            echo "- Bucket \`$BUCKET\`: listed"
+            echo "- Distribution \`$DISTRIBUTION_ID\` (\`$domain\`): read, with the bucket as its only origin"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Checks the saved copy against its manifest, then publishes it as a new release entry and waits for the
+      # invalidation (ADR 0006).
+      - name: Restore the release
+        run: node scripts/release.ts restore "$RELEASE" restored
+      - name: Smoke-test the restored release through CloudFront
+        env:
+          CLOUDFRONT_DOMAIN: ${{ steps.access.outputs.domain }}
+        run: node scripts/smoke.ts restored
+      - name: Record the release as verified
+        run: node scripts/release.ts verified

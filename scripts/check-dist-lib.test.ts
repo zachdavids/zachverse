@@ -74,6 +74,37 @@ describe('checkDist', () => {
     expect(checkDist(await project())).toEqual([]);
   });
 
+  it("requires each page to name the deploy build's release exactly once, and other builds' pages to name none", async () => {
+    const release = '0123456789abcdef0123456789abcdef01234567';
+    const named = {
+      'index.html': renderDocument(template, home!, render('home'), release),
+      '404.html': renderDocument(template, notFound!, render('not-found'), release),
+    };
+    expect(checkDist(await project(named), release)).toEqual([]);
+    expect(checkDist(await project(named))).toEqual([
+      'dist/index.html names a release, but no RELEASE_COMMIT was given',
+      'dist/404.html names a release, but no RELEASE_COMMIT was given',
+    ]);
+    expect(checkDist(await project(), release)).toEqual([
+      `dist/index.html does not name release ${release} exactly once`,
+      `dist/404.html does not name release ${release} exactly once`,
+    ]);
+    const other = 'f'.repeat(40);
+    const twice = named['index.html'].replace('</head>', `<meta name="zachverse-release" content="${release}" /></head>`);
+    expect(
+      checkDist(
+        await project({
+          'index.html': twice,
+          '404.html': renderDocument(template, notFound!, render('not-found'), other),
+        }),
+        release,
+      ),
+    ).toEqual([
+      `dist/index.html does not name release ${release} exactly once`,
+      `dist/404.html does not name release ${release} exactly once`,
+    ]);
+  });
+
   it('passes a build whose content has characters React escapes', async () => {
     vi.resetModules();
     vi.doMock('../src/content.ts', async (importOriginal) => {

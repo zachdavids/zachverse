@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { resolveConfig } from 'vite';
 import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
+import { RECORDS } from '../scripts/release-lib.ts';
 import { site } from '../src/content.ts';
 import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
 
@@ -77,6 +78,7 @@ const jobs = workflows.flatMap(({ file, workflow }) =>
 const steps = jobs.flatMap((context) => (context.job.steps ?? []).map((step) => ({ ...context, step })));
 const ci = workflows.find(({ file }) => /^ci\.ya?ml$/.test(file))?.workflow;
 const deploy = workflows.find(({ file }) => /^deploy\.ya?ml$/.test(file))?.workflow;
+const restoreWorkflow = workflows.find(({ file }) => /^restore\.ya?ml$/.test(file))?.workflow;
 
 // The checks CI's web job runs, which the deploy workflow also runs before it uploads the site.
 const WEB_STEPS = [
@@ -759,6 +761,55 @@ describe('CI workflow', () => {
   });
 });
 
+// The deploy build job's first step, and the restore job's: it stops any ref but main before anything else runs.
+const MAIN_ONLY = /^if \[ "\$GITHUB_REF" != refs\/heads\/main \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/;
+
+// A step's or job's env as a mapping; one written as an expression, which the workflow rules reject, reads as empty.
+const envOf = (item?: { env?: Environment }) =>
+  (item?.env && typeof item.env === 'object' ? item.env : {}) as Record<string, unknown>;
+
+// A step as the action it uses, the node command it runs, or "run" for any other script.
+const kind = (step: Step) =>
+  step.uses !== undefined ? actionName(step.uses) : /^node \S/.test(step.run?.trim() ?? '') ? step.run!.trim() : 'run';
+
+// A job that runs the release scripts: it checks them out and installs Node, but no packages.
+function expectReleaseTools(job: Job | undefined, where: string) {
+  const list = job?.steps ?? [];
+  const setups = list.filter((step) => actionName(step.uses) === 'actions/setup-node');
+  expect(setups.map((step) => step.with), where).toEqual([{ 'node-version-file': '.nvmrc', 'package-manager-cache': false }]);
+  expect(list.filter((step) => actionName(step.uses) === 'actions/checkout'), where).toHaveLength(1);
+  expect(list.filter((step) => /\b(?:npm|npx|yarn|pnpm|corepack)\b/.test(step.run ?? '')).map(kind), where).toEqual([]);
+}
+
+// The smoke test reaches the custom hostnames through the distribution whose hostname the access check read.
+function expectSmokeTestThroughDistribution(job: Job | undefined) {
+  const list = job?.steps ?? [];
+  const access = list.find((step) => step.name === "Check the deploy role's access (read-only)");
+  expect(access?.id).toBe('access');
+  expect(access?.run).toContain('echo "domain=$domain" >> "$GITHUB_OUTPUT"');
+  const smoke = list.find((step) => step.run?.trim().startsWith('node scripts/smoke.ts '));
+  expect(smoke?.env).toEqual({ CLOUDFRONT_DOMAIN: '${{ steps.access.outputs.domain }}' });
+}
+
+// A job in the production environment that assumes the deploy role through OIDC, and nothing else.
+function expectDeployRole(job: Job | undefined, session: string) {
+  expect(job?.environment).toBe('production');
+  // contents: read for the checkout and the deploy job's comparison of commits; no other scope.
+  expect(job?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
+  const list = job?.steps ?? [];
+  const configured = list.filter((step) => actionName(step.uses) === 'aws-actions/configure-aws-credentials');
+  expect(configured.map((step) => step.with)).toEqual([
+    {
+      'role-to-assume': '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
+      'aws-region': 'us-east-1',
+      'allowed-account-ids': '${{ vars.AWS_ACCOUNT_ID }}',
+      'role-session-name': `${session}\${{ github.run_id }}-\${{ github.run_attempt }}`,
+      'role-duration-seconds': 1800,
+      'translate-env-variables': false,
+    },
+  ]);
+}
+
 describe('Deploy workflow', () => {
   const build = deploy?.jobs.build;
   const job = deploy?.jobs.deploy;
@@ -772,32 +823,42 @@ describe('Deploy workflow', () => {
     expect([job?.needs].flat()).toEqual(['build']);
   });
 
-  it('is the only workflow with a job that may assume the deploy role', () => {
+  it("leaves the deploy role to its deploy job and the Restore workflow's restore job", () => {
     // The role's trust names the environment and main, not a workflow, and the rules for every workflow let any
-    // production deploy request an OIDC token, so one in another workflow would skip this workflow's checks and order.
+    // production deploy request an OIDC token, so one in another workflow would skip these jobs' checks and order.
     expect(jobs.filter(({ workflow, job }) => deploysToProduction(workflow, job)).map(({ where }) => where)).toEqual([
       'deploy.yml deploy',
+      'restore.yml restore',
     ]);
   });
 
-  it('runs one deploy at a time for main, never cancelling one in progress', () => {
+  it('runs one deploy or restore at a time for main, never cancelling one in progress', () => {
     // A group on the deploy job alone would order deploys by when each build finished, so an earlier push could often
     // deploy last. At the workflow level only the order in which runs reach the group counts, which GitHub does not
-    // promise is push order (ADR 0005).
-    expect(deploy?.concurrency).toEqual({ group: 'deploy-${{ github.ref }}', 'cancel-in-progress': false });
-    expect(Object.values(deploy?.jobs ?? {}).filter((each) => each.concurrency !== undefined)).toEqual([]);
+    // promise is push order (ADR 0005), so publishing refuses an older release (ADR 0006). The Restore workflow joins
+    // the same group, which is shared across workflows, so a restore and a deploy never publish at once.
+    for (const each of [deploy, restoreWorkflow]) {
+      expect(each?.concurrency).toEqual({ group: 'deploy-${{ github.ref }}', 'cancel-in-progress': false });
+      expect(Object.values(each?.jobs ?? {}).filter((other) => other.concurrency !== undefined)).toEqual([]);
+    }
   });
 
   it('stops any ref but main, then builds and checks the site as CI does before uploading it', () => {
     // The production environment and the role's trust also refuse other refs; this stops them before the build.
     const [first] = build?.steps ?? [];
-    expect(first?.run).toMatch(/^if \[ "\$GITHUB_REF" != refs\/heads\/main \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
+    expect(first?.run).toMatch(MAIN_ONLY);
     expectRequiredSteps(deploy, 'deploy.yml', 'build', [...WEB_STEPS, 'actions/upload-artifact']);
     expect(plan(deploy, 'build').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
     // No environment, so no AWS access or variables, and no dependency cache.
     expect(build?.environment).toBeUndefined();
     const [setup] = positions(build?.steps ?? [], 'actions/setup-node').map((index) => build!.steps![index]);
     expect(setup?.with).toEqual({ 'node-version-file': '.nvmrc', 'package-manager-cache': false });
+    // The pages name the commit they are built from, and check:dist requires them to (ADR 0006).
+    const named = (build?.steps ?? []).filter((step) => envOf(step).RELEASE_COMMIT !== undefined);
+    expect(named.map((step) => [step.run?.trim(), envOf(step).RELEASE_COMMIT])).toEqual([
+      ['npm run build', '${{ github.sha }}'],
+      ['npm run check:dist', '${{ github.sha }}'],
+    ]);
   });
 
   it('uploads every file of the checked build right after the check, hidden ones included, with a digest of them all', () => {
@@ -820,15 +881,20 @@ describe('Deploy workflow', () => {
     expect(build?.outputs).toEqual({ digest: '${{ steps.digest.outputs.digest }}' });
   });
 
-  it("deploys only the uploaded files, checked against the build job's digest before AWS credentials exist", () => {
+  it("publishes only the uploaded files, checked against the build job's digest before AWS credentials exist", () => {
     const list = job?.steps ?? [];
     // Every step of this job can request its OIDC token, so it runs only these, in this order.
-    expect(list.map((step) => (step.uses === undefined ? 'run' : actionName(step.uses)))).toEqual([
+    expect(list.map(kind)).toEqual([
       'run', // the variables check
+      'actions/checkout',
+      'actions/setup-node',
       'actions/download-artifact',
       'run', // the digest check
       'aws-actions/configure-aws-credentials',
       'run', // the access check
+      'node scripts/release.ts publish site',
+      'node scripts/smoke.ts site',
+      'node scripts/release.ts verified',
     ]);
     const [download] = positions(list, 'actions/download-artifact');
     const [configure] = positions(list, 'aws-actions/configure-aws-credentials');
@@ -841,52 +907,133 @@ describe('Deploy workflow', () => {
     expect(command(list[check])).toBe(command(build?.steps?.find((step) => step.id === 'digest')));
     expect(command(list[check])).toMatch(/^digest=\$\(find \. -type f /);
     expect(list[check]?.run).toMatch(/\nif \[ "\$digest" != "\$DIGEST" \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
-    expect((job?.env as Record<string, unknown> | undefined)?.DIGEST).toBe('${{ needs.build.outputs.digest }}');
+    expect(envOf(job).DIGEST).toBe('${{ needs.build.outputs.digest }}');
     expect(plan(deploy, 'deploy').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+    expectReleaseTools(job, 'deploy.yml deploy');
+    // The order check compares commits through GitHub's API with the job's read-only token; the smoke test connects
+    // through the distribution whose hostname the access check read.
+    const publish = list.find((step) => step.run?.trim() === 'node scripts/release.ts publish site');
+    expect(publish?.env).toEqual({ GITHUB_TOKEN: '${{ github.token }}' });
+    expectSmokeTestThroughDistribution(job);
   });
 
   it('assumes only the deploy role, through OIDC, in the production environment', () => {
-    expect(job?.environment).toBe('production');
-    // The job reads no repository content, so its token has no scope beyond the OIDC token.
-    expect(job?.permissions).toEqual({ 'id-token': 'write' });
-    const list = job?.steps ?? [];
-    expect(positions(list, 'aws-actions/configure-aws-credentials').map((index) => list[index]?.with)).toEqual([
-      {
-        'role-to-assume': '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
-        'aws-region': 'us-east-1',
-        'allowed-account-ids': '${{ vars.AWS_ACCOUNT_ID }}',
-        'role-session-name': 'zachverse-deploy-${{ github.run_id }}-${{ github.run_attempt }}',
-        'role-duration-seconds': 900,
-        'translate-env-variables': false,
-      },
-    ]);
+    expectDeployRole(job, 'zachverse-deploy-');
   });
 
   it('reads only the four production variables, and lets no step set a variable the AWS tools read', () => {
-    const read = strings(deploy)
-      .flatMap(expressions)
-      // GitHub reads context names in any case; a read such as vars['NAME'] or toJSON(vars) counts as "vars".
-      .flatMap((expression) =>
-        [...expression.matchAll(/\bvars\b(?:\s*\.\s*(\w+))?/gi)].map((match) => match[1] ?? match[0]),
+    for (const [file, each, jobId] of [
+      ['deploy.yml', deploy, 'deploy'],
+      ['restore.yml', restoreWorkflow, 'restore'],
+    ] as const) {
+      const read = strings(each)
+        .flatMap(expressions)
+        // GitHub reads context names in any case; a read such as vars['NAME'] or toJSON(vars) counts as "vars".
+        .flatMap((expression) =>
+          [...expression.matchAll(/\bvars\b(?:\s*\.\s*(\w+))?/gi)].map((match) => match[1] ?? match[0]),
+        );
+      expect([...new Set(read)].sort(), file).toEqual([
+        'AWS_ACCOUNT_ID',
+        'AWS_SITE_DEPLOY_ROLE_ARN',
+        'CLOUDFRONT_DISTRIBUTION_ID',
+        'SITE_BUCKET',
+      ]);
+      // The AWS CLI and SDKs read variables such as AWS_ACCOUNT_ID or AWS_ENDPOINT_URL_STS beside the role's
+      // credentials, and the credentials action reads HTTP_PROXY, so scripts get the values under other names.
+      const roleJob = each?.jobs[jobId];
+      const names = [each?.env, roleJob?.env, ...(roleJob?.steps ?? []).map((step) => step.env)].flatMap((env) =>
+        env && typeof env === 'object' ? Object.keys(env) : [],
       );
-    expect([...new Set(read)].sort()).toEqual([
-      'AWS_ACCOUNT_ID',
-      'AWS_SITE_DEPLOY_ROLE_ARN',
-      'CLOUDFRONT_DISTRIBUTION_ID',
-      'SITE_BUCKET',
+      expect(names, file).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
+      expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy)$/i.test(name)), file).toEqual([]);
+      // Nor may a script set one, for itself or, through $GITHUB_ENV or $GITHUB_PATH, for later steps, or write the
+      // AWS CLI's config, whose endpoint_url the SDKs also read.
+      const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
+      const setters = (roleJob?.steps ?? []).filter((step) => setting.test(step.run ?? ''));
+      expect(setters.map((step) => step.name ?? step.run), file).toEqual([]);
+    }
+  });
+});
+
+describe('Restore workflow', () => {
+  const job = restoreWorkflow?.jobs.restore;
+
+  it('runs only by hand, restoring the release its one input names', () => {
+    expect(restoreWorkflow ? triggers(restoreWorkflow) : undefined).toEqual({
+      workflow_dispatch: {
+        inputs: { release: { description: expect.any(String), required: true, default: 'previous', type: 'string' } },
+      },
+    });
+    expect(Object.keys(restoreWorkflow?.jobs ?? {})).toEqual(['restore']);
+    // The input reaches the script through env, and the script checks it.
+    expect(envOf(job).RELEASE).toBe('${{ inputs.release }}');
+  });
+
+  it("stops any ref but main, and runs the deploy job's checks before it restores, smoke-tests, and records the release", () => {
+    const list = job?.steps ?? [];
+    expect(list.map(kind)).toEqual([
+      'run', // the ref check
+      'run', // the variables check
+      'actions/checkout',
+      'actions/setup-node',
+      'aws-actions/configure-aws-credentials',
+      'run', // the access check
+      'node scripts/release.ts restore "$RELEASE" restored',
+      'node scripts/smoke.ts restored',
+      'node scripts/release.ts verified',
     ]);
-    // The AWS CLI and SDKs read variables such as AWS_ACCOUNT_ID or AWS_ENDPOINT_URL_STS beside the role's
-    // credentials, and the credentials action reads HTTP_PROXY, so scripts get the values under other names.
-    const names = [deploy?.env, job?.env, ...(job?.steps ?? []).map((step) => step.env)].flatMap((env) =>
-      env && typeof env === 'object' ? Object.keys(env) : [],
-    );
-    expect(names).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
-    expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy)$/i.test(name))).toEqual([]);
-    // Nor may a script set one, for itself or, through $GITHUB_ENV or $GITHUB_PATH, for later steps, or write the AWS
-    // CLI's config, whose endpoint_url the SDKs also read.
-    const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
-    const setters = (job?.steps ?? []).filter((step) => setting.test(step.run ?? ''));
-    expect(setters.map((step) => step.name ?? step.run)).toEqual([]);
+    expect(list[0]?.run).toMatch(MAIN_ONLY);
+    // The deploy job's own checks, so the two jobs cannot drift apart.
+    const deploySteps = deploy?.jobs.deploy?.steps ?? [];
+    for (const name of ["Check the environment's variables", "Check the deploy role's access (read-only)"]) {
+      const run = (list: Step[]) => list.find((step) => step.name === name)?.run;
+      expect(run(list), name).toBeDefined();
+      expect(run(list), name).toBe(run(deploySteps));
+    }
+    expect(plan(restoreWorkflow, 'restore').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+    expectReleaseTools(job, 'restore.yml restore');
+    expectSmokeTestThroughDistribution(job);
+  });
+
+  it('assumes only the deploy role, through OIDC, in the production environment', () => {
+    expectDeployRole(job, 'zachverse-restore-');
+  });
+});
+
+describe('Release and smoke-test scripts', () => {
+  it('keep the release records under the prefix the bucket policy keeps CloudFront from reading', () => {
+    // infra/lib/site-stack.ts denies CloudFront that prefix; records anywhere else would be served as part of the site.
+    expect(read('infra/lib/site-stack.ts')).toContain(`export const RELEASE_RECORDS = '${RECORDS}';`);
+  });
+
+  it("import only Node's built-in modules and the repository's own files", () => {
+    // The deploy and restore jobs run them with the deploy role and install no packages: an import of a package would
+    // fail there, and installing one would run its code beside the role's credentials.
+    const seen = new Set<string>();
+    const queue = ['scripts/release.ts', 'scripts/smoke.ts'];
+    const packages: string[] = [];
+    while (queue.length > 0) {
+      const file = queue.shift()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      // Type-only imports are erased before Node runs the file.
+      for (const [, specifier] of read(file).matchAll(/^import\s+(?!type\s)[^'"]*['"]([^'"]+)['"]/gm)) {
+        if (specifier!.startsWith('.')) queue.push(posix.normalize(posix.join(posix.dirname(file), specifier!)));
+        else if (!specifier!.startsWith('node:')) packages.push(`${file}: ${specifier}`);
+      }
+    }
+    expect(packages).toEqual([]);
+    // The walk reached every module the two entries load.
+    expect([...seen].sort()).toEqual([
+      'scripts/release-aws.ts',
+      'scripts/release-github.ts',
+      'scripts/release-lib.ts',
+      'scripts/release.ts',
+      'scripts/smoke-http.ts',
+      'scripts/smoke-lib.ts',
+      'scripts/smoke.ts',
+      'src/content.ts',
+    ]);
   });
 });
 

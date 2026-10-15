@@ -75,8 +75,9 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
     expect(JSON.stringify(allows[0].Condition.StringEquals['AWS:SourceArn'])).toContain(`"Ref":"${DISTRIBUTION}"`);
   });
 
-  it('denies every request that does not use TLS, to the bucket and its objects', () => {
-    // Exact: a narrower action, principal, or resource would let some plain-HTTP requests through.
+  it('denies every request that does not use TLS, and CloudFront every release record', () => {
+    // Exact: a narrower action, principal, or resource would let some plain-HTTP requests through, or let CloudFront
+    // serve a release record; a broader one could deny CloudFront the site itself.
     const bucketArn = { 'Fn::GetAtt': [BUCKET, 'Arn'] };
     expect(bucketPolicyStatements().filter((s) => s.Effect === 'Deny')).toEqual([
       {
@@ -85,6 +86,12 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
         Action: 's3:*',
         Resource: [bucketArn, { 'Fn::Join': ['', [bucketArn, '/*']] }],
         Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+      },
+      {
+        Effect: 'Deny',
+        Principal: { Service: 'cloudfront.amazonaws.com' },
+        Action: 's3:GetObject',
+        Resource: { 'Fn::Join': ['', [bucketArn, '/_releases/*']] },
       },
     ]);
   });

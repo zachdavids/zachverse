@@ -9,6 +9,9 @@ import type { Construct } from 'constructs';
 import type { SiteConfig } from './config';
 import { viewerRequestCode } from './viewer-request';
 
+/** The bucket prefix that holds the release records (scripts/release-lib.ts, ADR 0006). */
+export const RELEASE_RECORDS = '_releases/';
+
 export interface SiteStackProps extends StackProps {
   readonly config: SiteConfig;
 }
@@ -88,6 +91,18 @@ export class SiteStack extends Stack {
     Annotations.of(this.distribution).acknowledgeWarning(
       '@aws-cdk/aws-cloudfront-origins:listBucketSecurityRisk',
       'defaultRootObject is index.html (asserted in tests), so "/" never lists the bucket.',
+    );
+
+    // The release records (a copy of each release, and the history) live beside the site, under _releases/, and are
+    // not part of it: CloudFront may read every object but these, so a request for one gets S3's 403, which the
+    // distribution leaves visible (ADR 0006).
+    this.bucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.DENY,
+        principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
+        actions: ['s3:GetObject'],
+        resources: [this.bucket.arnForObjects(`${RELEASE_RECORDS}*`)],
+      }),
     );
 
     if (config.pricingPlan) {
