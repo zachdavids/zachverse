@@ -108,7 +108,7 @@ Run this after milestone 6's first release has passed its checks, as an administ
   - The zone has 10 records.
   - The site's distribution is the only one, with no web ACL.
   - The viewer-request function is the only CloudFront Function, used by no other distribution.
-  - The Free Tier API's `GetAccountPlanState` answered `ResourceNotFoundException` ("Missing data for account"), so it couldn't confirm the account's plan type. Accounts on the AWS Free Tier plan can't subscribe. The Website account is a member of the organization, and the owner reports the Paid account plan. An ineligible account would fail the subscription, which the runbook covers.
+  - The Free Tier API's `GetAccountPlanState` answered `ResourceNotFoundException` ("Missing data for account"), so it couldn't confirm the account's plan type. Accounts on the AWS Free Tier plan can't subscribe; the owner confirmed on 2026-10-15 that the account is on the Paid plan.
 
 ## Limits
 
