@@ -1,13 +1,21 @@
 name: Deploy
 
-# Pushes to main, and runs started by hand, which only main may start (ADR 0005). The deploy job publishes the build as
-# a release, smoke-tests it through CloudFront, and records it as verified (ADR 0006).
+# Pushes to main, and runs started by hand, which only main may start (ADR 0005). The build is checked, in a browser too,
+# then published as a release and smoke-tested over HTTP; a job without the deploy role checks the live release in a
+# browser; and the release is recorded as verified, or rolled back to the last verified one (ADR 0006).
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      # A restore holds deploys until a run started by hand publishes over it (ADR 0006, "Holding deploys").
+      resume:
+        description: Publish over a restore
+        required: false
+        default: false
+        type: boolean
 
-# Read-only token; only the deploy job may request an OIDC token.
+# Read-only token; only the deploy and verify jobs may request an OIDC token.
 permissions:
   contents: read
 
@@ -45,9 +53,15 @@ jobs:
         run: npm run typecheck
       - name: Unit tests (100% coverage required)
         run: npm run test:coverage
-      # The pages name the commit they are built from, and the check requires it (ADR 0006).
+      # The pages name the commit they are built from, and the checks require it (ADR 0006).
       - name: Build and prerender
         run: npm run build
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+      # Chromium's headless shell, and the system libraries it needs, for the browser check.
+      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Check the pages in a browser
+        run: npm run check:browser
         env:
           RELEASE_COMMIT: ${{ github.sha }}
       - name: Check prerendered output
@@ -75,11 +89,11 @@ jobs:
           overwrite: true
 
   deploy:
-    name: Deploy (publish, smoke-test, and record the release)
+    name: Deploy (publish, and smoke-test over HTTP)
     needs: build
     runs-on: ubuntu-24.04
-    # Publishing waits up to 10 minutes for CloudFront's invalidation, and a rollback as long again.
-    timeout-minutes: 30
+    # Publishing waits up to 10 minutes for CloudFront's invalidation.
+    timeout-minutes: 20
     environment: production
     permissions:
       contents: read # the checkout, and the order check's comparison of commits through GitHub's API
@@ -87,6 +101,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    outputs:
+      domain: ${{ steps.access.outputs.domain }}
     # The production environment's variables (ADR 0005), under names the AWS CLI does not read.
     env:
       ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
@@ -131,8 +147,8 @@ jobs:
           aws-region: us-east-1
           allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
           role-session-name: zachverse-deploy-${{ github.run_id }}-${{ github.run_attempt }}
-          # Long enough to publish, smoke-test, and roll back, each with its invalidation: the role's 1-hour maximum.
-          role-duration-seconds: 3600
+          # Long enough for the invalidation and the smoke test.
+          role-duration-seconds: 1800
           # Keeps variables such as USE_EXISTING_CREDENTIALS or ROLE_CHAINING from filling inputs left out here. The
           # action still reads HTTP_PROXY, and its AWS SDK reads AWS_ENDPOINT_URL_STS and ~/.aws/config, as the AWS
           # CLI does in later steps, so no step in this job may set them (ADR 0005, "Limits").
@@ -160,33 +176,137 @@ jobs:
             echo "- Bucket \`$BUCKET\`: listed"
             echo "- Distribution \`$DISTRIBUTION_ID\` (\`$domain\`): read, with the bucket as its only origin"
           } >> "$GITHUB_STEP_SUMMARY"
-      # Refuses a release older than the newest one published; then uploads the assets, a copy of the release, and the
-      # pages, and waits for the invalidation (ADR 0006).
+      # Refuses a release older than the newest one published, or any release over a restore unless this run was started
+      # by hand to resume; then uploads the assets, a copy of the release, and the pages, deletes the pages the release no
+      # longer has, and waits for the invalidation (ADR 0006).
       - name: Publish the release
-        id: publish
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RESUME_DEPLOYS: ${{ inputs.resume }}
         run: node scripts/release.ts publish site
       - name: Smoke-test the release through CloudFront
-        id: smoke
         env:
           CLOUDFRONT_DOMAIN: ${{ steps.access.outputs.domain }}
         run: node scripts/smoke.ts site
+
+  # Checks the live release in Chromium. It installs packages, Playwright and its browser among them, which a job that
+  # holds the deploy role never does, so it has no environment, no variables, and no OIDC token.
+  browser:
+    name: Check the release in a browser, through CloudFront
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Check the live release in Chromium
+        env:
+          CLOUDFRONT_DOMAIN: ${{ needs.deploy.outputs.domain }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: node scripts/browser-check.ts live
+
+  # Records the release as verified when it passed the smoke test and the browser check, or else puts the last verified
+  # release back (ADR 0006, "Automatic rollback"). It runs whenever the deploy job ran, unless the run was cancelled: after
+  # a deploy job that failed, or timed out, which GitHub can report as cancelled.
+  verify:
+    name: Record the release as verified, or roll it back
+    needs: [deploy, browser]
+    if: ${{ !cancelled() && needs.deploy.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    # A rollback waits up to 10 minutes for CloudFront's invalidation.
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read # the checkout
+      id-token: write # the OIDC token for the deploy role
+    defaults:
+      run:
+        shell: bash
+    # The production environment's variables (ADR 0005), under names the AWS CLI does not read.
+    env:
+      ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ROLE_ARN: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+      BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+    steps:
+      - name: Check the environment's variables
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ $ACCOUNT_ID =~ ^[0-9]{12}$ ]] || fail 'AWS_ACCOUNT_ID must be a 12-digit account ID.'
+          [[ $ROLE_ARN =~ ^arn:aws:iam::$ACCOUNT_ID:role/[A-Za-z0-9+=,.@_/-]+$ ]] ||
+            fail 'AWS_SITE_DEPLOY_ROLE_ARN must be the ARN of a role in AWS_ACCOUNT_ID.'
+          [[ $BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || fail 'SITE_BUCKET must be an S3 bucket name.'
+          [[ $DISTRIBUTION_ID =~ ^[A-Z0-9]{8,32}$ ]] || fail 'CLOUDFRONT_DISTRIBUTION_ID must be a distribution ID.'
+      # The release and smoke-test scripts, from this run's commit, as in the deploy job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-session-name: zachverse-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          # Long enough for a rollback's invalidation, its smoke test, and the record after it.
+          role-duration-seconds: 1800
+          # As in the deploy job: no variable fills an input left out here, and no step may set one the action or the
+          # AWS CLI reads (ADR 0005, "Limits").
+          translate-env-variables: false
+      - name: Check the deploy role's access (read-only)
+        id: access
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          caller=$(aws sts get-caller-identity --query Arn --output text)
+          [[ $caller == "arn:aws:sts::$ACCOUNT_ID:assumed-role/${ROLE_ARN##*/}/"* ]] ||
+            fail "Expected a session of $ROLE_ARN, got $caller."
+          aws s3api list-objects-v2 --bucket "$BUCKET" --max-keys 1 > /dev/null
+          origins=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
+            --query 'Distribution.DistributionConfig.Origins.Items[].DomainName' --output text)
+          [[ $origins == "$BUCKET.s3.us-east-1.amazonaws.com" ]] ||
+            fail "Distribution $DISTRIBUTION_ID should have one origin, bucket $BUCKET; it has: $origins."
+          domain=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" --query Distribution.DomainName --output text)
+          [[ $domain =~ ^[a-z0-9]+\.cloudfront\.net$ ]] || fail "Distribution $DISTRIBUTION_ID has the hostname $domain."
+          aws cloudfront list-invalidations --distribution-id "$DISTRIBUTION_ID" --max-items 1 > /dev/null
+          echo "domain=$domain" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Access checked'
+            echo
+            echo "- Role session: \`$caller\`"
+            echo "- Bucket \`$BUCKET\`: listed"
+            echo "- Distribution \`$DISTRIBUTION_ID\` (\`$domain\`): read, with the bucket as its only origin"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Record the release as verified
+        if: needs.deploy.result == 'success' && needs.browser.result == 'success'
         run: node scripts/release.ts verified
-      # Automatic rollback (ADR 0006): if publishing failed partway or the smoke test failed, the last verified release
-      # goes back out, is smoke-tested, and is recorded as verified again. The run still fails. Nothing is rolled back
-      # when this run changed nothing, and the rolled-back release is recorded only if its own smoke test passes.
+      # If publishing failed partway, or the smoke test or the browser check failed, the last verified release goes back
+      # out, is smoke-tested, and is recorded as verified again only if that passes. Nothing is rolled back when this run
+      # changed nothing.
       - name: Roll back to the last verified release
         id: rollback
-        if: failure() && (steps.publish.outcome == 'failure' || steps.smoke.outcome == 'failure')
+        if: needs.deploy.result != 'success' || needs.browser.result != 'success'
         run: node scripts/release.ts rollback rolled-back
       - name: Smoke-test the rolled-back release through CloudFront
         id: rollback_smoke
-        if: failure() && steps.rollback.outputs.release != ''
+        if: steps.rollback.outputs.release != ''
         env:
           CLOUDFRONT_DOMAIN: ${{ steps.access.outputs.domain }}
         run: node scripts/smoke.ts rolled-back
       - name: Record the rolled-back release as verified
-        if: failure() && steps.rollback_smoke.outcome == 'success'
+        if: steps.rollback_smoke.outcome == 'success'
         run: node scripts/release.ts verified
+      - name: Fail the run, since the release was not verified
+        if: needs.deploy.result != 'success' || needs.browser.result != 'success'
+        run: |
+          echo "::error::The release was refused, failed to publish, or failed its checks, so it was not verified; the jobs above say which."
+          exit 1

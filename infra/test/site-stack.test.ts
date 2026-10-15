@@ -227,7 +227,7 @@ describe('site stack (pay-as-you-go)', () => {
     expect(productionConfig()).toEqual(PRICING_MODES['pay-as-you-go']);
   });
 
-  it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
+  it('grants the GitHub deploy role read, write, and page deletion on this bucket, and invalidation/read on this distribution', () => {
     expect(json.Resources['SiteDeployPolicyEEC9A210']!.Properties).toEqual({
       PolicyName: 'SiteDeployPolicyEEC9A210',
       Roles: ['zachverse-github-site-deploy'],
@@ -237,8 +237,17 @@ describe('site stack (pay-as-you-go)', () => {
           { Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [BUCKET, 'Arn'] } },
           {
             Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject'],
+            Action: ['s3:DeleteObject', 's3:GetObject', 's3:PutObject'],
             Resource: { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/*']] },
+          },
+          // Never an asset, which an earlier page may still load, or a release record (ADR 0006).
+          {
+            Effect: 'Deny',
+            Action: 's3:DeleteObject',
+            Resource: [
+              { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/_releases/*']] },
+              { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/assets/*']] },
+            ],
           },
           {
             Effect: 'Allow',

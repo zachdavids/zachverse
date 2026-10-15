@@ -2,7 +2,8 @@ name: Restore
 
 # Publishes a verified release again from its saved copy (ADR 0006), run by hand. Only main may run it: the production
 # environment and the deploy role's trust admit no other ref, and the first step stops one before anything else runs.
-# The release is named by its full commit SHA, fixed when the run starts, so a re-run restores the same one.
+# The release is named by its full commit SHA, fixed when the run starts, so a re-run restores the same one. A restore
+# holds deploys until the Deploy workflow is run by hand with "Publish over a restore" checked.
 on:
   workflow_dispatch:
     inputs:
@@ -122,8 +123,8 @@ jobs:
             echo "- Bucket \`$BUCKET\`: listed"
             echo "- Distribution \`$DISTRIBUTION_ID\` (\`$domain\`): read, with the bucket as its only origin"
           } >> "$GITHUB_STEP_SUMMARY"
-      # Checks the saved copy against its manifest, then publishes it as a new release entry and waits for the
-      # invalidation (ADR 0006).
+      # Checks the saved copy against its manifest, then publishes it as a new release entry, removes the pages it lacks,
+      # and waits for the invalidation (ADR 0006).
       - name: Restore the release
         run: node scripts/release.ts restore "$RELEASE" restored
       - name: Smoke-test the restored release through CloudFront

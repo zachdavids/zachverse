@@ -1397,8 +1397,8 @@ describe('deployRoleViolations', () => {
   it.each([
     ['s3:* on the bucket', new iam.PolicyStatement({ actions: ['s3:*'], resources: ['arn:aws:s3:::bucket/*'] }),
       [`${POLICY}: s3:* is not an allowed deploy action`, `${POLICY}: wildcard resource arn:aws:s3:::bucket/*`]],
-    ['object deletion', new iam.PolicyStatement({ actions: ['s3:DeleteObject'], resources: ['arn:aws:s3:::bucket/x'] }),
-      [`${POLICY}: s3:DeleteObject is not an allowed deploy action`]],
+    ['permanent object deletion', new iam.PolicyStatement({ actions: ['s3:DeleteObjectVersion'], resources: ['arn:aws:s3:::bucket/x'] }),
+      [`${POLICY}: s3:DeleteObjectVersion is not an allowed deploy action`]],
     ['a wildcard resource', new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: ['*'] }), [`${POLICY}: wildcard resource *`]],
     ['DNS changes', new iam.PolicyStatement({ actions: ['route53:ChangeResourceRecordSets'], resources: ['arn:aws:route53:::hostedzone/Z1'] }),
       [`${POLICY}: route53:ChangeResourceRecordSets is not an allowed deploy action`]],
@@ -1439,8 +1439,8 @@ describe('deployRoleViolations', () => {
     Type: 'AWS::IAM::Policy',
     Properties: { PolicyName: 'Deploy', Roles: roles, PolicyDocument: { Statement: statements } },
   });
-  const deleteObject = { Effect: 'Allow', Action: 's3:DeleteObject', Resource: 'arn:aws:s3:::bucket/x' };
-  const DELETE_OBJECT = 's3:DeleteObject is not an allowed deploy action';
+  const deleteObject = { Effect: 'Allow', Action: 's3:DeleteObjectVersion', Resource: 'arn:aws:s3:::bucket/x' };
+  const DELETE_OBJECT = 's3:DeleteObjectVersion is not an allowed deploy action';
 
   it("checks the role's inline policies", () => {
     const template = withRole();
@@ -1452,7 +1452,7 @@ describe('deployRoleViolations', () => {
     const template = withRole({
       Policy: policyFor(
         [roleName],
-        { Effect: 'Allow', NotAction: 's3:DeleteObject', Resource: 'arn:aws:s3:::bucket/x' },
+        { Effect: 'Allow', NotAction: 's3:DeleteObjectVersion', Resource: 'arn:aws:s3:::bucket/x' },
         { Effect: 'Allow', Action: 's3:GetObject', NotResource: 'arn:aws:s3:::other/x' },
       ),
     });
@@ -1461,7 +1461,7 @@ describe('deployRoleViolations', () => {
   });
 
   it.each<[string, unknown]>([
-    ['an Fn::If', { 'Fn::If': ['IsProd', 's3:GetObject', 's3:DeleteObject'] }],
+    ['an Fn::If', { 'Fn::If': ['IsProd', 's3:GetObject', 's3:DeleteObjectVersion'] }],
     ['a Ref to a parameter', { Ref: 'DeployAction' }],
     ['a dynamic reference', '{{resolve:ssm:/zachverse/deploy-action}}'],
   ])('flags an Action given as %s, which it cannot read', (_case, action) => {

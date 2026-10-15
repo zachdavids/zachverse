@@ -150,6 +150,31 @@ describe('s3Store', () => {
   });
 });
 
+describe('s3Store listing and deleting', () => {
+  it('lists every key in the bucket, and none in an empty one', async () => {
+    const aws = vi.fn<Aws>().mockResolvedValueOnce('["index.html", "assets/a-AbCd1234.js"]').mockResolvedValueOnce('null');
+    const store = s3Store('bucket', aws);
+    expect(await store.list()).toEqual(['index.html', 'assets/a-AbCd1234.js']);
+    expect(await store.list()).toEqual([]);
+    expect(aws.mock.calls[0]?.[0]).toEqual([
+      's3api',
+      'list-objects-v2',
+      '--bucket',
+      'bucket',
+      '--query',
+      'Contents[].Key',
+      '--output',
+      'json',
+    ]);
+  });
+
+  it('deletes an object by its key', async () => {
+    const aws = vi.fn<Aws>().mockResolvedValue('{}');
+    await s3Store('bucket', aws).remove('about/index.html');
+    expect(aws).toHaveBeenCalledExactlyOnceWith(['s3api', 'delete-object', '--bucket', 'bucket', '--key', 'about/index.html']);
+  });
+});
+
 describe('cloudfrontCdn', () => {
   it('creates an invalidation for the paths and waits for it to complete', async () => {
     const aws = vi.fn<Aws>().mockResolvedValueOnce('{"Invalidation": {"Id": "I123"}}').mockResolvedValueOnce('');

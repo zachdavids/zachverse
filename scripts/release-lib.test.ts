@@ -63,7 +63,7 @@ interface StoredObject {
   cacheControl: string;
 }
 
-// The bucket and the distribution in memory; every write and invalidation is logged in order.
+// The bucket and the distribution in memory; every write, deletion, and invalidation is logged in order.
 function fakes(
   initial: Map<string, StoredObject> = new Map(),
   relation: Awaited<ReturnType<Repository['compare']>> = 'ahead',
@@ -83,6 +83,13 @@ function fakes(
     async write(key, body, headers) {
       log.push(`write ${key}`);
       objects.set(key, { body, ...headers });
+    },
+    async list() {
+      return [...objects.keys()];
+    },
+    async remove(key) {
+      log.push(`remove ${key}`);
+      objects.delete(key);
     },
   };
   const cdn: Cdn = {
@@ -212,8 +219,10 @@ describe('checkOrder', () => {
 
   it('lets a release newer than the newest one published through, compared with that one', async () => {
     const { repository, compared } = repositoryAnswering('ahead');
-    await checkOrder([entry(A), entry(B, { run: '91-1' }), entry(A, { action: 'restore', run: '92-1' })], C, repository);
-    expect(compared).toEqual([`${B}...${C}`]);
+    await checkOrder([entry(A), entry(B, { run: '91-1' }), entry(A, { action: 'rollback', run: '92-1' })], C, repository);
+    // Over a restore, only when the run asks to resume.
+    await checkOrder([entry(A), entry(B, { run: '91-1' }), entry(A, { action: 'restore', run: '92-1' })], C, repository, true);
+    expect(compared).toEqual([`${B}...${C}`, `${B}...${C}`]);
   });
 
   it('lets the current release be published again, as a retry', async () => {
@@ -227,9 +236,15 @@ describe('checkOrder', () => {
     await expect(checkOrder([entry(B, { run: '91-1' })], A, repositoryAnswering('diverged').repository)).rejects.toThrow(
       `Not publishing ${A}: it and ${B}, which run 91-1 published, have diverged.`,
     );
+    // A re-run of the deploy that a restore replaced meets the hold.
     const restored = [entry(A), entry(B, { run: '91-1' }), entry(A, { action: 'restore', run: '92-1' })];
     await expect(checkOrder(restored, B, repositoryAnswering('identical').repository)).rejects.toThrow(
-      `Not publishing ${B}: run 91-1 published it, and run 92-1 has since restored ${A}.`,
+      `Not publishing ${B}: deploys are held, since run 92-1 restored ${A}.`,
+    );
+    // The same release again, when the site has since gone back to another one some other way.
+    const goneBack = [entry(B, { run: '91-1' }), entry(A, { action: 'rollback', run: '92-1' }), entry(C, { action: 'rollback', run: '93-1' })];
+    await expect(checkOrder(goneBack, B, repositoryAnswering('identical').repository)).rejects.toThrow(
+      `Not publishing ${B}: run 91-1 published it, and the site has since gone back to ${C}.`,
     );
   });
 });
@@ -262,6 +277,7 @@ describe('publish', () => {
       uploaded: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
       replaced: [],
       kept: [],
+      removed: [],
       invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
     });
     // The first release is compared with nothing.
@@ -411,6 +427,7 @@ describe('restore', () => {
       uploaded: [],
       replaced: [],
       kept: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
+      removed: [],
       invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
     });
     expect(objects.get('robots.txt')?.body.toString()).toBe('B');
@@ -442,7 +459,7 @@ describe('restore', () => {
     expect(objects.get('robots.txt')?.body.toString()).toBe('A');
     // A newer release published in between does not change which one the run restores.
     const later = fakes(objects);
-    await publish(site({ 'robots.txt': 'D' }), 'd'.repeat(40), later.repository, later.context);
+    await publish(site({ 'robots.txt': 'D' }), 'd'.repeat(40), later.repository, later.context, true);
     const { objects: after, context: rerun } = fakes(later.objects);
     expect((await restore(A, tempDir(), { ...rerun, run: '300-3' })).release).toBe(A);
     expect(after.get('robots.txt')?.body.toString()).toBe('A');
@@ -530,6 +547,7 @@ describe('rollBack', () => {
       uploaded: [],
       replaced: [],
       kept: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
+      removed: [],
       invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
     });
     expect(objects.get('robots.txt')?.body.toString()).toBe('A');
@@ -610,6 +628,115 @@ describe('rollBack', () => {
     await checkOrder(entries, B, afterB.repository);
     const restored = [...entries, entry(A, { action: 'restore', run: '103-1', verified: 'then' })];
     await expect(checkOrder(restored, B, afterB.repository)).rejects.toThrow(`Not publishing ${B}`);
+  });
+});
+
+describe('removing pages', () => {
+  it('deletes the pages the bucket holds that the release does not, after writing its own, and invalidates them', async () => {
+    const first = fakes();
+    await publish(site({ 'about/index.html': 'about', 'old.txt': 'old' }), A, first.repository, first.context);
+    const { objects, log, repository, context } = fakes(first.objects);
+    const outcome = await publish(site(), B, repository, context);
+
+    expect(outcome.removed).toEqual(['about/index.html', 'old.txt']);
+    expect(log.slice(-5)).toEqual([
+      'write index.html',
+      'remove about/index.html',
+      'remove old.txt',
+      `invalidate / /404.html /about /about/ /about/index.html /favicon.svg /index.html /old.txt /robots.txt (100-1-publish-${B})`,
+      'write _releases/history.json',
+    ]);
+    expect(objects.has('about/index.html')).toBe(false);
+    // Assets an earlier page may still load, and the release records, stay.
+    expect(objects.has('assets/index-AbCd1234.js')).toBe(true);
+    expect(objects.has(`_releases/${A}/site/about/index.html`)).toBe(true);
+  });
+
+  it('never deletes an asset or a release record, even one no release lists', async () => {
+    const first = fakes();
+    await publish(site(), A, first.repository, first.context);
+    const stray = first.objects.get('robots.txt')!;
+    first.objects.set('assets/old-ZzZz9999.js', stray);
+    first.objects.set('_releases/probe-2026-10-15.txt', stray);
+    const { log, repository, context } = fakes(first.objects);
+    expect((await publish(site(), B, repository, context)).removed).toEqual([]);
+    expect(log.filter((line) => line.startsWith('remove'))).toEqual([]);
+  });
+
+  it('fails before any write when the bucket holds a key no release would write', async () => {
+    const first = fakes();
+    await publish(site(), A, first.repository, first.context);
+    first.objects.set('notes/a b.txt', first.objects.get('robots.txt')!);
+    const { log, repository, context } = fakes(first.objects);
+    await expect(publish(site(), B, repository, context)).rejects.toThrow(
+      'No page was changed: the bucket holds notes/a b.txt, which no release would write. Check, and remove by hand what does not belong.',
+    );
+    expect(log.filter((line) => !line.startsWith('write assets/') && !line.startsWith(`write _releases/${B}`))).toEqual([]);
+  });
+
+  it('restoring an earlier release deletes the pages a later one added', async () => {
+    const first = fakes();
+    await publish(site(), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    await publish(site({ 'about/index.html': 'about' }), B, second.repository, second.context);
+    const { objects, context } = fakes(second.objects);
+    expect((await restore(A, tempDir(), context)).removed).toEqual(['about/index.html']);
+    expect(objects.has('about/index.html')).toBe(false);
+  });
+});
+
+describe('holding deploys after a restore', () => {
+  // A and B published and verified, then A restored by run 300-1.
+  async function restoredA() {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    await publish(site({ 'robots.txt': 'B' }), B, second.repository, second.context);
+    await recordVerified(second.context);
+    const third = fakes(second.objects);
+    await restore(A, tempDir(), { ...third.context, run: '300-1' });
+    return third.objects;
+  }
+
+  it('publishes nothing over a restore someone ran, however new the commit', async () => {
+    const { log, repository, context } = fakes(await restoredA());
+    await expect(publish(site({ 'robots.txt': 'C' }), C, repository, context)).rejects.toThrow(
+      `Not publishing ${C}: deploys are held, since run 300-1 restored ${A}. Nothing was changed. To publish over the restore, run the Deploy workflow on main by hand with "Publish over a restore" checked.`,
+    );
+    expect(log).toEqual([]);
+  });
+
+  it('publishes over the restore when a run asks to resume, a newer commit or the one restored over', async () => {
+    const newer = fakes(await restoredA());
+    await publish(site({ 'robots.txt': 'C' }), C, newer.repository, newer.context, true);
+    expect(newer.objects.get('robots.txt')?.body.toString()).toBe('C');
+
+    const same = fakes(await restoredA(), 'identical');
+    await publish(site({ 'robots.txt': 'B' }), B, same.repository, same.context, true);
+    expect(same.objects.get('robots.txt')?.body.toString()).toBe('B');
+    // Once published over, deploys are no longer held.
+    const next = fakes(same.objects);
+    await publish(site({ 'robots.txt': 'C' }), C, next.repository, next.context);
+    expect(next.objects.get('robots.txt')?.body.toString()).toBe('C');
+  });
+
+  it('still refuses an older commit, even when resuming', async () => {
+    const { repository, context } = fakes(await restoredA(), 'behind');
+    await expect(publish(site(), A, repository, context, true)).rejects.toThrow(`Not publishing ${A}: it is older than ${B}`);
+  });
+
+  it('holds nothing after an automatic rollback, so a fix goes out as usual', async () => {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    await publish(site({ 'robots.txt': 'B' }), B, second.repository, second.context);
+    await rollBack(tempDir(), second.context);
+    const fix = fakes(second.objects);
+    await publish(site({ 'robots.txt': 'C' }), C, fix.repository, fix.context);
+    expect(fix.objects.get('robots.txt')?.body.toString()).toBe('C');
   });
 });
 

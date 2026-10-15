@@ -88,6 +88,8 @@ const WEB_STEPS = [
   'npm run typecheck',
   'npm run test:coverage',
   'npm run build',
+  'npx playwright install --with-deps --only-shell chromium',
+  'npm run check:browser',
   'npm run check:dist',
 ];
 
@@ -631,6 +633,7 @@ describe('CI workflow', () => {
       'vite build && vite build --ssr src/entry-server.tsx --outDir dist-ssr && node scripts/prerender.ts',
     );
     expect(scripts['check:dist']).toBe('node scripts/check-dist.ts');
+    expect(scripts['check:browser']).toBe('node scripts/browser-check.ts local dist');
   });
 
   it('lets the Vite config set no client output name without a content hash', async () => {
@@ -807,8 +810,21 @@ function expectDeployRole(job: Job | undefined, session: string, seconds: number
   // contents: read for the checkout and the deploy job's comparison of commits; no other scope.
   expect(job?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
   // Only the settings these checks read: a container would run every step in an image no pin covers, with the role's
-  // credentials; services or a matrix would run more beside or in parallel; a shell could hide a failed step.
-  const allowed = ['name', 'needs', 'runs-on', 'timeout-minutes', 'environment', 'permissions', 'defaults', 'env', 'steps'];
+  // credentials; services or a matrix would run more beside or in parallel; a shell could hide a failed step. Each
+  // job's own tests pin its condition and outputs.
+  const allowed = [
+    'name',
+    'needs',
+    'if',
+    'runs-on',
+    'timeout-minutes',
+    'environment',
+    'permissions',
+    'defaults',
+    'outputs',
+    'env',
+    'steps',
+  ];
   expect(Object.keys(job ?? {}).filter((key) => !allowed.includes(key))).toEqual([]);
   expect(job?.defaults).toEqual({ run: { shell: 'bash' } });
   const list = job?.steps ?? [];
@@ -829,21 +845,42 @@ function expectDeployRole(job: Job | undefined, session: string, seconds: number
 describe('Deploy workflow', () => {
   const build = deploy?.jobs.build;
   const job = deploy?.jobs.deploy;
+  const browser = deploy?.jobs.browser;
+  const verify = deploy?.jobs.verify;
   // The positions of a job's steps that use an action.
   const positions = (list: Step[], action: string) =>
     list.flatMap((step, index) => (actionName(step.uses) === action ? [index] : []));
+  // A job's steps that run only under a condition, or may fail without failing the job, with their conditions.
+  const conditional = (list: Step[]) =>
+    list.filter((step) => step.if !== undefined || step['continue-on-error'] !== undefined).map((step) => [step.name, step.if]);
 
-  it('runs on pushes to main and by hand, as a build job and then a deploy job', () => {
-    expect(deploy ? triggers(deploy) : undefined).toEqual({ push: { branches: ['main'] }, workflow_dispatch: null });
-    expect(Object.keys(deploy?.jobs ?? {})).toEqual(['build', 'deploy']);
+  it('runs on pushes to main and by hand: build, deploy, a browser check, then verify or roll back', () => {
+    // By hand, it can also publish over a restore, which otherwise holds deploys (ADR 0006).
+    expect(deploy ? triggers(deploy) : undefined).toEqual({
+      push: { branches: ['main'] },
+      workflow_dispatch: {
+        inputs: { resume: { description: expect.any(String), required: false, default: false, type: 'boolean' } },
+      },
+    });
+    expect(Object.keys(deploy?.jobs ?? {})).toEqual(['build', 'deploy', 'browser', 'verify']);
     expect([job?.needs].flat()).toEqual(['build']);
+    expect([browser?.needs].flat()).toEqual(['deploy']);
+    expect([verify?.needs].flat()).toEqual(['deploy', 'browser']);
+    // Only verify has a condition: it runs whenever the deploy job ran, so it can roll back what that job published,
+    // even when the job timed out, which GitHub can report as cancelled; but not after the run was cancelled.
+    expect(Object.entries(deploy?.jobs ?? {}).filter(([, each]) => each.if !== undefined)).toEqual([
+      ['verify', expect.anything()],
+    ]);
+    expect(verify?.if).toBe("${{ !cancelled() && needs.deploy.result != 'skipped' }}");
+    expect(Object.values(deploy?.jobs ?? {}).filter((each) => each['continue-on-error'] !== undefined)).toEqual([]);
   });
 
-  it("leaves the deploy role to its deploy job and the Restore workflow's restore job", () => {
+  it("leaves the deploy role to its deploy and verify jobs and the Restore workflow's restore job", () => {
     // The role's trust names the environment and main, not a workflow, and the rules for every workflow let any
     // production deploy request an OIDC token, so one in another workflow would skip these jobs' checks and order.
     expect(jobs.filter(({ workflow, job }) => deploysToProduction(workflow, job)).map(({ where }) => where)).toEqual([
       'deploy.yml deploy',
+      'deploy.yml verify',
       'restore.yml restore',
     ]);
   });
@@ -891,7 +928,7 @@ describe('Deploy workflow', () => {
     expect(groups.map(mayJoinDeployGroup)).toEqual([true, true, true, true, true, true, true, false, false, true]);
   });
 
-  it('stops any ref but main, then builds and checks the site as CI does before uploading it', () => {
+  it('stops any ref but main, then builds and checks the site as CI does, in a browser too, before uploading it', () => {
     // The production environment and the role's trust also refuse other refs; this stops them before the build.
     const [first] = build?.steps ?? [];
     expect(first?.run).toMatch(MAIN_ONLY);
@@ -901,10 +938,11 @@ describe('Deploy workflow', () => {
     expect(build?.environment).toBeUndefined();
     const [setup] = positions(build?.steps ?? [], 'actions/setup-node').map((index) => build!.steps![index]);
     expect(setup?.with).toEqual({ 'node-version-file': '.nvmrc', 'package-manager-cache': false });
-    // The pages name the commit they are built from, and check:dist requires them to (ADR 0006).
+    // The pages name the commit they are built from, and the browser check and check:dist require them to (ADR 0006).
     const named = (build?.steps ?? []).filter((step) => envOf(step).RELEASE_COMMIT !== undefined);
     expect(named.map((step) => [step.run?.trim(), envOf(step).RELEASE_COMMIT])).toEqual([
       ['npm run build', '${{ github.sha }}'],
+      ['npm run check:browser', '${{ github.sha }}'],
       ['npm run check:dist', '${{ github.sha }}'],
     ]);
   });
@@ -931,7 +969,7 @@ describe('Deploy workflow', () => {
 
   it("publishes only the uploaded files, checked against the build job's digest before AWS credentials exist", () => {
     const list = job?.steps ?? [];
-    // Every step of this job can request its OIDC token, so it runs only these, in this order.
+    // Every step of this job can request its OIDC token, so it runs only these, in this order, and all of them.
     expect(list.map(kind)).toEqual([
       'run', // the variables check
       'actions/checkout',
@@ -942,10 +980,6 @@ describe('Deploy workflow', () => {
       'run', // the access check
       'node scripts/release.ts publish site',
       'node scripts/smoke.ts site',
-      'node scripts/release.ts verified',
-      'node scripts/release.ts rollback rolled-back',
-      'node scripts/smoke.ts rolled-back',
-      'node scripts/release.ts verified',
     ]);
     const [download] = positions(list, 'actions/download-artifact');
     const [configure] = positions(list, 'aws-actions/configure-aws-credentials');
@@ -959,41 +993,96 @@ describe('Deploy workflow', () => {
     expect(command(list[check])).toMatch(/^digest=\$\(find \. -type f /);
     expect(list[check]?.run).toMatch(/\nif \[ "\$digest" != "\$DIGEST" \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
     expect(envOf(job).DIGEST).toBe('${{ needs.build.outputs.digest }}');
-    // Every step runs unconditionally except the automatic rollback (ADR 0006): it runs only when publishing or the
-    // smoke test failed, and records the rolled-back release as verified only when that release's own smoke test passed.
-    expect(list.filter((step) => step.if !== undefined || step['continue-on-error'] !== undefined).map((step) => [step.id, step.if])).toEqual([
-      ['rollback', "failure() && (steps.publish.outcome == 'failure' || steps.smoke.outcome == 'failure')"],
-      ['rollback_smoke', "failure() && steps.rollback.outputs.release != ''"],
-      [undefined, "failure() && steps.rollback_smoke.outcome == 'success'"],
-    ]);
-    expect(list.slice(-6).map((step) => step.id)).toEqual(['publish', 'smoke', undefined, 'rollback', 'rollback_smoke', undefined]);
-    expect(job?.['continue-on-error']).toBeUndefined();
-    expect(job?.if).toBeUndefined();
+    expect(conditional(list)).toEqual([]);
     expectReleaseTools(job, 'deploy.yml deploy');
     // The order check compares commits through GitHub's API with the job's read-only token; the smoke test connects
-    // through the distribution whose hostname the access check read.
+    // through the distribution whose hostname the access check read, which the browser job gets as an output.
     const publish = list.find((step) => step.run?.trim() === 'node scripts/release.ts publish site');
-    expect(publish?.env).toEqual({ GITHUB_TOKEN: '${{ github.token }}' });
+    expect(publish?.env).toEqual({ GITHUB_TOKEN: '${{ github.token }}', RESUME_DEPLOYS: '${{ inputs.resume }}' });
     expectSmokeTestThroughDistribution(job);
+    expect(job?.outputs).toEqual({ domain: '${{ steps.access.outputs.domain }}' });
+  });
+
+  it('checks the live release in a browser in a job that has no environment, variables, or OIDC token', () => {
+    // This job installs packages, Playwright and its browser among them, which no job that holds the role may do.
+    expect(browser?.environment).toBeUndefined();
+    expect(browser?.permissions).toBeUndefined();
+    expect(browser?.env).toBeUndefined();
+    expect((browser?.steps ?? []).map(kind)).toEqual([
+      'actions/checkout',
+      'actions/setup-node',
+      'run', // npm ci
+      'run', // the browser
+      'node scripts/browser-check.ts live',
+    ]);
+    expect(plan(deploy, 'browser').slice(2, 4)).toEqual(['npm ci', 'npx playwright install --with-deps --only-shell chromium']);
+    expect(conditional(browser?.steps ?? [])).toEqual([]);
+    const [setup] = positions(browser?.steps ?? [], 'actions/setup-node').map((index) => browser!.steps![index]);
+    expect(setup?.with).toEqual({ 'node-version-file': '.nvmrc', 'package-manager-cache': false });
+    // It checks the site at its own hostname, connected to the distribution the deploy job published to, and the
+    // release this run published.
+    expect(browser?.steps?.at(-1)?.env).toEqual({
+      CLOUDFRONT_DOMAIN: '${{ needs.deploy.outputs.domain }}',
+      RELEASE_COMMIT: '${{ github.sha }}',
+    });
+  });
+
+  it('records the release as verified only after both checks passed, and otherwise rolls back and fails', () => {
+    const list = verify?.steps ?? [];
+    expect(list.map(kind)).toEqual([
+      'run', // the variables check
+      'actions/checkout',
+      'actions/setup-node',
+      'aws-actions/configure-aws-credentials',
+      'run', // the access check
+      'node scripts/release.ts verified',
+      'node scripts/release.ts rollback rolled-back',
+      'node scripts/smoke.ts rolled-back',
+      'node scripts/release.ts verified',
+      'run', // the failure
+    ]);
+    // The checks before the role are the deploy job's own, so the two cannot drift apart.
+    const deploySteps = job?.steps ?? [];
+    for (const name of ["Check the environment's variables", "Check the deploy role's access (read-only)"]) {
+      const run = (steps: Step[]) => steps.find((step) => step.name === name)?.run;
+      expect(run(list), name).toBeDefined();
+      expect(run(list), name).toBe(run(deploySteps));
+    }
+    // A rolled-back release counts as verified only when its own smoke test passed, and the run fails whenever the
+    // release was not verified. Without a status function, GitHub adds success() to each condition, so a failed
+    // rollback or smoke test stops the steps after it.
+    expect(conditional(list)).toEqual([
+      ['Record the release as verified', "needs.deploy.result == 'success' && needs.browser.result == 'success'"],
+      ['Roll back to the last verified release', "needs.deploy.result != 'success' || needs.browser.result != 'success'"],
+      ['Smoke-test the rolled-back release through CloudFront', "steps.rollback.outputs.release != ''"],
+      ['Record the rolled-back release as verified', "steps.rollback_smoke.outcome == 'success'"],
+      ['Fail the run, since the release was not verified', "needs.deploy.result != 'success' || needs.browser.result != 'success'"],
+    ]);
+    expect(list.map((step) => step.id).filter(Boolean)).toEqual(['access', 'rollback', 'rollback_smoke']);
+    expect(list.at(-1)?.run).toMatch(/^echo "::error::.*"\nexit 1\n$/);
+    expectReleaseTools(verify, 'deploy.yml verify');
+    expectSmokeTestThroughDistribution(verify);
   });
 
   it('assumes only the deploy role, through OIDC, in the production environment', () => {
-    // An hour, the role's maximum: publishing and a rollback can each wait 10 minutes for an invalidation.
-    expectDeployRole(job, 'zachverse-deploy-', 3600);
+    expectDeployRole(job, 'zachverse-deploy-', 1800);
+    expectDeployRole(verify, 'zachverse-verify-', 1800);
   });
 
   it('reads only the four production variables, and lets no step set a variable the AWS tools read', () => {
     for (const [file, each, jobId] of [
       ['deploy.yml', deploy, 'deploy'],
+      ['deploy.yml', deploy, 'verify'],
       ['restore.yml', restoreWorkflow, 'restore'],
     ] as const) {
+      const where = `${file} ${jobId}`;
       const read = strings(each)
         .flatMap(expressions)
         // GitHub reads context names in any case; a read such as vars['NAME'] or toJSON(vars) counts as "vars".
         .flatMap((expression) =>
           [...expression.matchAll(/\bvars\b(?:\s*\.\s*(\w+))?/gi)].map((match) => match[1] ?? match[0]),
         );
-      expect([...new Set(read)].sort(), file).toEqual([
+      expect([...new Set(read)].sort(), where).toEqual([
         'AWS_ACCOUNT_ID',
         'AWS_SITE_DEPLOY_ROLE_ARN',
         'CLOUDFRONT_DISTRIBUTION_ID',
@@ -1005,15 +1094,15 @@ describe('Deploy workflow', () => {
       const names = [each?.env, roleJob?.env, ...(roleJob?.steps ?? []).map((step) => step.env)].flatMap((env) =>
         env && typeof env === 'object' ? Object.keys(env) : [],
       );
-      expect(names, file).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
+      expect(names, where).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
       // Nor a NODE_ variable: NODE_OPTIONS can load code into the release scripts, and NODE_TLS_REJECT_UNAUTHORIZED or
       // NODE_EXTRA_CA_CERTS changes which certificates they and the smoke test trust.
-      expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy|node_\w+)$/i.test(name)), file).toEqual([]);
+      expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy|node_\w+)$/i.test(name)), where).toEqual([]);
       // Nor may a script set one, for itself or, through $GITHUB_ENV or $GITHUB_PATH, for later steps, or write the
       // AWS CLI's config, whose endpoint_url the SDKs also read.
       const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy|node_\w+)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
       const setters = (roleJob?.steps ?? []).filter((step) => setting.test(step.run ?? ''));
-      expect(setters.map((step) => step.name ?? step.run), file).toEqual([]);
+      expect(setters.map((step) => step.name ?? step.run), where).toEqual([]);
     }
   });
 });

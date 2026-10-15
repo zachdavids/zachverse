@@ -35,6 +35,10 @@ jobs:
         run: npm run test:coverage
       - name: Build and prerender
         run: npm run build
+      # Chromium's headless shell, and the system libraries it needs, for the browser check (ADR 0006).
+      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Check the pages in a browser
+        run: npm run check:browser
       - name: Check prerendered output
         run: npm run check:dist
 

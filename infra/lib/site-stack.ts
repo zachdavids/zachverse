@@ -121,15 +121,21 @@ export class SiteStack extends Stack {
     // The GitHub deploy role lives in the identity stack (deployed first); its
     // permissions are defined here so they reference only this bucket and
     // distribution and come into existence together with them (ADR 0004).
-    // No delete: routine releases never remove objects, and versioning keeps
-    // overwritten files recoverable.
+    // A release deletes the pages it no longer has (ADR 0006), but never an asset, which an earlier page may still load,
+    // or a release record. With versioning, a delete only hides an object behind a delete marker, and the role cannot
+    // delete versions, so every page stays recoverable for 90 days.
     new iam.Policy(this, 'SiteDeployPolicy', {
       roles: [iam.Role.fromRoleName(this, 'SiteDeployRole', config.github.deployRoleName)],
       statements: [
         new iam.PolicyStatement({ actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn] }),
         new iam.PolicyStatement({
-          actions: ['s3:GetObject', 's3:PutObject'],
+          actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
           resources: [this.bucket.arnForObjects('*')],
+        }),
+        new iam.PolicyStatement({
+          effect: iam.Effect.DENY,
+          actions: ['s3:DeleteObject'],
+          resources: [this.bucket.arnForObjects('assets/*'), this.bucket.arnForObjects(`${RELEASE_RECORDS}*`)],
         }),
         new iam.PolicyStatement({
           actions: [

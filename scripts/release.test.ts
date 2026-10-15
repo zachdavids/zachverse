@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Context, Outcome } from './release-lib.ts';
 
 const lib = vi.hoisted(() => ({
-  publish: vi.fn<(dir: string, release: string, repository: unknown, context: Context) => Promise<Outcome>>(),
+  publish: vi.fn<(dir: string, release: string, repository: unknown, context: Context, resume?: boolean) => Promise<Outcome>>(),
   restore: vi.fn<(requested: string, outDir: string, context: Context) => Promise<Outcome>>(),
   recordVerified: vi.fn<(context: Context) => Promise<{ release: string; run: string }>>(),
   rollBack: vi.fn<(outDir: string, context: Context) => Promise<Outcome | undefined>>(),
@@ -22,6 +22,7 @@ const OUTCOME: Outcome = {
   uploaded: ['assets/index-AbCd1234.js'],
   replaced: [],
   kept: [],
+  removed: ['about/index.html'],
   invalidated: ['/', '/index.html'],
 };
 
@@ -86,6 +87,7 @@ describe('release script', () => {
       SHA,
       'repository',
       expect.objectContaining({ store: 'store', cdn: 'cdn', run: '7-2' }),
+      false,
     );
     const report = [
       `### Published ${SHA}`,
@@ -93,6 +95,7 @@ describe('release script', () => {
       '- Assets uploaded: assets/index-AbCd1234.js',
       '- Assets replaced, and invalidated: none',
       '- Assets already in place: none',
+      '- Pages removed: about/index.html',
       '- Paths invalidated: /, /index.html',
     ].join('\n');
     expect(log.mock.calls).toEqual([['a message'], [report]]);
@@ -108,6 +111,7 @@ describe('release script', () => {
       uploaded: [],
       replaced: ['assets/index-AbCd1234.js'],
       kept: ['assets/index-EfGh5678.css'],
+      removed: [],
     });
     const { exit, log } = await run('restore', SHA, 'restored');
 
@@ -120,7 +124,10 @@ describe('release script', () => {
         '- Assets uploaded: none',
         '- Assets replaced, and invalidated: assets/index-AbCd1234.js',
         '- Assets already in place: assets/index-EfGh5678.css',
+        '- Pages removed: none',
         '- Paths invalidated: /, /index.html',
+        '',
+        'Deploys are held: pushes to main publish nothing until the Deploy workflow is run on main by hand with "Publish over a restore" checked.',
       ].join('\n'),
     );
     expect(exit).not.toHaveBeenCalled();
@@ -151,6 +158,13 @@ describe('release script', () => {
     vi.resetModules();
     vi.restoreAllMocks();
     expect((await run('rollback', 'rolled-back')).exit).not.toHaveBeenCalled();
+  });
+
+  it('publishes over a restore when a run started by hand asks to resume', async () => {
+    vi.stubEnv('RESUME_DEPLOYS', 'true');
+    lib.publish.mockResolvedValue(OUTCOME);
+    await run('publish', 'site');
+    expect(lib.publish.mock.calls[0]?.[4]).toBe(true);
   });
 
   it('records the release as verified', async () => {

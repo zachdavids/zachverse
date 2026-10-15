@@ -1,5 +1,6 @@
 // Release mechanics (ADR 0006). The deploy and restore workflows run these with the deploy role, which can read and
-// write the bucket's objects but cannot delete one, so a release never removes a file an earlier page may still load.
+// write the bucket's objects and delete pages, but not assets or release records, so a release never removes a file an
+// earlier page may still load.
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
@@ -83,6 +84,10 @@ export interface Store {
   head(key: string): Promise<{ sha256?: string; contentType?: string; cacheControl?: string } | undefined>;
   read(key: string): Promise<Buffer | undefined>;
   write(key: string, body: Buffer, headers: { sha256: string; contentType: string; cacheControl: string }): Promise<void>;
+  /** Every key in the bucket. */
+  list(): Promise<string[]>;
+  /** Deletes an object. The bucket is versioned, so this only hides it behind a delete marker; its versions stay. */
+  remove(key: string): Promise<void>;
 }
 
 export interface Cdn {
@@ -109,6 +114,8 @@ export interface Outcome {
   /** Assets whose names held other bytes or headers; their paths are invalidated too. */
   replaced: string[];
   kept: string[];
+  /** Pages the bucket held that this release does not, deleted; their paths are invalidated too. */
+  removed: string[];
   invalidated: string[];
 }
 
@@ -249,21 +256,33 @@ async function readManifest(store: Store, release: string): Promise<Manifest | u
 /**
  * Refuses a release older than the newest one published, which is how GitHub can run deploys out of order or re-run an
  * old one (ADR 0005). Publishing the same commit again is a retry, allowed while it is the current release, or when the
- * current release is an automatic rollback from it, after its smoke test failed. Re-running the deploy of a release
- * that someone restored over does not put it back. A newer commit still publishes over a restore, whether pushed or
- * re-run; going back is the Restore workflow's job.
+ * current release is an automatic rollback from it, after its checks failed.
+ *
+ * A restore someone ran holds deploys: nothing is published over it, so the next push cannot quietly bring back what
+ * was restored away, until a run started by hand asks to resume. That run may also publish the release the restore
+ * replaced again.
  */
-export async function checkOrder(entries: Entry[], release: string, repository: Repository): Promise<void> {
+export async function checkOrder(
+  entries: Entry[],
+  release: string,
+  repository: Repository,
+  resume = false,
+): Promise<void> {
   const current = entries.at(-1);
   const newest = entries.findLast((entry) => entry.action === 'publish');
   if (current === undefined || newest === undefined) return;
+  if (current.action === 'restore' && !resume) {
+    throw new Error(
+      `Not publishing ${release}: deploys are held, since run ${current.run} restored ${current.release}. Nothing was changed. To publish over the restore, run the Deploy workflow on main by hand with "Publish over a restore" checked.`,
+    );
+  }
   const relation = await repository.compare(newest.release, release);
   if (relation === 'ahead') return;
   const rolledBackFrom = current.action === 'rollback' ? entries.at(-2) : undefined;
-  if (relation === 'identical' && (current.release === release || rolledBackFrom?.release === release)) return;
+  if (relation === 'identical' && (resume || current.release === release || rolledBackFrom?.release === release)) return;
   const reason =
     relation === 'identical'
-      ? `run ${newest.run} published it, and run ${current.run} has since restored ${current.release}`
+      ? `run ${newest.run} published it, and the site has since gone back to ${current.release}`
       : relation === 'behind'
         ? `it is older than ${newest.release}, which run ${newest.run} published`
         : `it and ${newest.release}, which run ${newest.run} published, have diverged`;
@@ -321,37 +340,69 @@ async function saveCopy(files: SiteFile[], release: string, { store }: Context):
   await writeJson(store, `${RECORDS}${release}/manifest.json`, manifestOf(release, files));
 }
 
-/** Records the release as started, writes its pages, waits for the invalidation, and records it as published. */
+/**
+ * The pages the bucket holds that this release does not: every key but the release's own files, the assets, which
+ * earlier pages may still load, and the release records. Throws, before any page is written, on a key no release would
+ * write, which could be anything, and whose path, as one to invalidate, could even be a wildcard.
+ */
+async function stalePages(files: SiteFile[], store: Store): Promise<string[]> {
+  const own = new Set(files.map(({ path }) => path));
+  const stale = (await store.list()).filter((key) => !isAsset(key) && !key.startsWith(RECORDS) && !own.has(key)).sort();
+  const odd = stale.filter((key) => !PLAIN_PATH.test(key));
+  if (odd.length > 0) {
+    throw new Error(
+      `No page was changed: the bucket holds ${odd.join(', ')}, which no release would write. Check, and remove by hand what does not belong.`,
+    );
+  }
+  return stale;
+}
+
+/**
+ * Records the release as started, writes its pages, deletes the pages the bucket holds that the release does not, waits
+ * for the invalidation of them all, and records the release as published.
+ */
 async function publishPages(
   files: SiteFile[],
   replaced: string[],
   entries: Entry[],
   { action, release }: Pick<Entry, 'action' | 'release'>,
   { store, cdn, run, now }: Context,
-): Promise<string[]> {
+): Promise<{ removed: string[]; invalidated: string[] }> {
+  const removed = await stalePages(files, store);
   const entry: Entry = { action, release, run, started: now() };
   entries.push(entry);
   await writeHistory(store, entries);
   for (const file of pageOrder(files)) await writeFile(store, file.path, file);
-  const paths = [...invalidationPaths(files), ...replaced.map((path) => `/${path}`)].sort();
-  await cdn.invalidate(paths, `${run}-${action}-${release}`);
+  for (const key of removed) await store.remove(key);
+  const pages = invalidationPaths([...files, ...removed.map((path) => ({ path }))]);
+  const invalidated = [...pages, ...replaced.map((path) => `/${path}`)].sort();
+  await cdn.invalidate(invalidated, `${run}-${action}-${release}`);
   entry.published = now();
   await writeHistory(store, entries);
-  return paths;
+  return { removed, invalidated };
 }
 
-/** Publishes the built site in dir as the release of commit release. */
-export async function publish(dir: string, release: string, repository: Repository, context: Context): Promise<Outcome> {
+/**
+ * Publishes the built site in dir as the release of commit release. resume is set by a run started by hand to publish
+ * over a restore, which otherwise holds deploys.
+ */
+export async function publish(
+  dir: string,
+  release: string,
+  repository: Repository,
+  context: Context,
+  resume = false,
+): Promise<Outcome> {
   requireCommit(release);
   const files = siteFiles(dir);
   const entries = await readHistory(context.store);
-  await checkOrder(entries, release, repository);
+  await checkOrder(entries, release, repository, resume);
   const saved = await hasCopy(files, release, context);
   const assets = await uploadAssets(files, context);
   if (saved) context.log(`The copy of ${release} is already saved.`);
   else await saveCopy(files, release, context);
-  const invalidated = await publishPages(files, assets.replaced, entries, { action: 'publish', release }, context);
-  return { release, ...assets, invalidated };
+  const pages = await publishPages(files, assets.replaced, entries, { action: 'publish', release }, context);
+  return { release, ...assets, ...pages };
 }
 
 /**
@@ -432,8 +483,8 @@ async function republish(
     writeFileSync(target, file.body);
   }
   const assets = await uploadAssets(files, context);
-  const invalidated = await publishPages(files, assets.replaced, entries, { action, release }, context);
-  return { release, ...assets, invalidated };
+  const pages = await publishPages(files, assets.replaced, entries, { action, release }, context);
+  return { release, ...assets, ...pages };
 }
 
 /** Records the current release as verified; only the run that published it may, after its smoke test passed. */

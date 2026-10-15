@@ -61,6 +61,16 @@ export function s3Store(bucket: string, aws: Aws = runAws): Store {
         return readFileSync(file);
       }),
 
+    async list() {
+      // The CLI reads every page of the listing before it applies the query; an empty bucket has no Contents.
+      const args = ['s3api', 'list-objects-v2', '--bucket', bucket, '--query', 'Contents[].Key'];
+      return (JSON.parse(await aws([...args, '--output', 'json'])) as string[] | null) ?? [];
+    },
+
+    async remove(key) {
+      await aws(['s3api', 'delete-object', '--bucket', bucket, '--key', key]);
+    },
+
     write: (key, body, { sha256, contentType, cacheControl }) =>
       inScratch(async (dir) => {
         const file = join(dir, 'body');

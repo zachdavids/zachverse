@@ -25,13 +25,14 @@ function report(lines: string[]): void {
   if (summary) appendFileSync(summary, `${lines.join('\n')}\n\n`);
 }
 
-function outcomeLines(title: string, { release, uploaded, replaced, kept, invalidated }: Outcome): string[] {
+function outcomeLines(title: string, { release, uploaded, replaced, kept, removed, invalidated }: Outcome): string[] {
   return [
     `### ${title} ${release}`,
     '',
     `- Assets uploaded: ${uploaded.length === 0 ? 'none' : uploaded.join(', ')}`,
     `- Assets replaced, and invalidated: ${replaced.length === 0 ? 'none' : replaced.join(', ')}`,
     `- Assets already in place: ${kept.length === 0 ? 'none' : kept.join(', ')}`,
+    `- Pages removed: ${removed.length === 0 ? 'none' : removed.join(', ')}`,
     `- Paths invalidated: ${invalidated.join(', ')}`,
   ];
 }
@@ -54,9 +55,15 @@ async function main(command: string | undefined, args: string[]): Promise<void> 
   };
   if (command === 'publish') {
     const repository = githubRepository(required('GITHUB_REPOSITORY'), required('GITHUB_TOKEN'));
-    report(outcomeLines('Published', await publish(args[0]!, required('GITHUB_SHA'), repository, context)));
+    // Set by a Deploy run started by hand to publish over a restore, which otherwise holds deploys.
+    const resume = process.env.RESUME_DEPLOYS === 'true';
+    report(outcomeLines('Published', await publish(args[0]!, required('GITHUB_SHA'), repository, context, resume)));
   } else if (command === 'restore') {
-    report(outcomeLines('Restored', await restore(args[0]!, args[1]!, context)));
+    report([
+      ...outcomeLines('Restored', await restore(args[0]!, args[1]!, context)),
+      '',
+      'Deploys are held: pushes to main publish nothing until the Deploy workflow is run on main by hand with "Publish over a restore" checked.',
+    ]);
   } else if (command === 'rollback') {
     const outcome = await rollBack(args[0]!, context);
     // The workflow smoke-tests and records the rolled-back release only when this names one.

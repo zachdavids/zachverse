@@ -224,10 +224,10 @@ describe('every synthesis of an app built by createStacks', () => {
         const extra = extraStack(app);
         new iam.Policy(extra, 'Grant', {
           roles: [iam.Role.fromRoleName(extra, 'DeployRole', 'zachverse-github-site-deploy')],
-          statements: [new iam.PolicyStatement({ actions: ['s3:DeleteObject'], resources: ['arn:aws:s3:::bucket/index.html'] })],
+          statements: [new iam.PolicyStatement({ actions: ['s3:DeleteObjectVersion'], resources: ['arn:aws:s3:::bucket/index.html'] })],
         });
       },
-      [fatal('deploy-role', 'GrantD7D271C4: s3:DeleteObject is not an allowed deploy action',
+      [fatal('deploy-role', 'GrantD7D271C4: s3:DeleteObjectVersion is not an allowed deploy action',
         resource('GrantD7D271C4', 'Extra/Grant/Resource', 'Extra.template.json'))],
     ],
     [
