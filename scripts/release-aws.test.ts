@@ -172,17 +172,30 @@ describe('s3Store', () => {
   });
 
   it('passes on every other error, still removing its temporary files', async () => {
+    // As runAws rejects for a service error: head-object gets a bare status (a HEAD reply has no body to name an error
+    // in), get-object a named code. Reading any of these as "missing" would make a denied or throttled read of the
+    // history look like no history at all.
+    const shaped = (code: string) => Object.assign(new Error(`aws s3api op: ${code}: denied`), { code });
+    for (const code of ['403', '500', '503']) {
+      const error = shaped(code);
+      await expect(s3Store('bucket', vi.fn<Aws>().mockRejectedValue(error)).head('x')).rejects.toBe(error);
+    }
+    for (const code of ['AccessDenied', 'SlowDown', 'InternalError', 'ExpiredToken']) {
+      const error = shaped(code);
+      await expect(s3Store('bucket', vi.fn<Aws>().mockRejectedValue(error)).read('x')).rejects.toBe(error);
+    }
     let file = '';
-    const denied = vi.fn<Aws>(async (args) => {
+    const failing = vi.fn<Aws>(async (args) => {
       file = args.find((arg) => arg.includes('zachverse-release-')) ?? '';
-      throw new Error('aws s3api put-object: An error occurred (AccessDenied)');
+      // A failure before AWS answers, such as no network, has no code.
+      throw new Error('aws s3api put-object: Could not connect to the endpoint URL');
     });
-    const store = s3Store('bucket', denied);
-    await expect(store.head('x')).rejects.toThrow('(AccessDenied)');
-    await expect(store.read('x')).rejects.toThrow('(AccessDenied)');
+    const store = s3Store('bucket', failing);
+    await expect(store.head('x')).rejects.toThrow('Could not connect');
+    await expect(store.read('x')).rejects.toThrow('Could not connect');
     expect(existsSync(dirname(file))).toBe(false);
     await expect(store.write('x', Buffer.from(''), { sha256: '00', contentType: 't', cacheControl: 'c' })).rejects.toThrow(
-      '(AccessDenied)',
+      'Could not connect',
     );
     expect(existsSync(dirname(file))).toBe(false);
     await expect(s3Store('bucket', vi.fn<Aws>().mockRejectedValue('not an Error')).head('x')).rejects.toBe('not an Error');

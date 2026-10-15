@@ -197,7 +197,8 @@ jobs:
     name: Check the release in a browser, through CloudFront
     needs: deploy
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Long enough for both installs' retries, below.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -206,10 +207,18 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - run: npm ci
-      # Chromium's headless shell and the system libraries it needs, from npm's registry, Ubuntu's mirrors, and Playwright's
-      # CDN. The release is already live, and a failed install would roll it back, so a download error is retried before
-      # it counts (ADR 0006, "Limits").
+      # The packages, from npm's registry. The release is already live, and a failed install would roll it back, so an
+      # error is retried before it counts (ADR 0006, "Limits"); npm ci starts over each time.
+      - name: Install packages
+        run: |
+          for attempt in 1 2 3; do
+            npm ci && exit 0
+            echo "::warning::Installing packages failed (attempt $attempt of 3)."
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+          exit 1
+      # Chromium's headless shell and the system libraries it needs, from Playwright's CDN and Ubuntu's mirrors, retried
+      # for the same reason.
       - name: Install Chromium
         run: |
           for attempt in 1 2 3; do
