@@ -1,0 +1,54 @@
+{
+  "Comment": "Milestone 8, step 2 of 2: the cutover. Replace the Droplet's apex A/AAAA and the www CNAME with A and AAAA aliases to the site distribution (E3R8NEUOW8Z97U), in one atomic batch. The deletions name the records exactly as step 1 leaves them, so the batch fails whole if anything else has changed. Reverse: 2026-10-15-website-cutover.reverse.json.",
+  "Changes": [
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": { "Name": "zachdavids.com.", "Type": "A", "TTL": 300, "ResourceRecords": [{ "Value": "159.203.37.93" }] }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "TTL": 300,
+        "ResourceRecords": [{ "Value": "2604:a880:cad:d0::46:6001" }]
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": { "Name": "www.zachdavids.com.", "Type": "CNAME", "TTL": 300, "ResourceRecords": [{ "Value": "zachdavids.com" }] }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "A",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "www.zachdavids.com.",
+        "Type": "A",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "www.zachdavids.com.",
+        "Type": "AAAA",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    }
+  ]
+}

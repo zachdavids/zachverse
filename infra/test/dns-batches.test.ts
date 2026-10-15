@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { batchDirectoryViolations, dnsBatchViolations } from './support/dns-batch';
+import { applyBatch, batchDirectoryViolations, dnsBatchViolations, type Zone, zoneOf } from './support/dns-batch';
 
 const DNS_DIR = path.join(__dirname, '..', 'dns');
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -340,5 +340,126 @@ describe('dnsBatchViolations', () => {
       'change 1 (undefined undefined ): unknown action',
       'change 1 (undefined undefined ): only website routing and ACM validation records may change',
     ]);
+  });
+});
+
+// The zone as read on 2026-10-15 (aws route53 list-resource-record-sets), when milestone 8's batches were written. The
+// website records are exact; the others stand in for what is there, with values the website batches must not touch.
+const ZONE_2026_10_15 = [
+  { Name: 'zachdavids.com.', Type: 'A', TTL: 1800, ResourceRecords: [{ Value: '159.203.37.93' }] },
+  { Name: 'zachdavids.com.', Type: 'AAAA', TTL: 1800, ResourceRecords: [{ Value: '2604:a880:cad:d0::46:6001' }] },
+  { Name: 'www.zachdavids.com.', Type: 'CNAME', TTL: 1800, ResourceRecords: [{ Value: 'zachdavids.com' }] },
+  {
+    Name: 'zachdavids.com.',
+    Type: 'MX',
+    TTL: 1800,
+    ResourceRecords: ['1 aspmx.l.google.com.', '5 alt1.aspmx.l.google.com.', '5 alt2.aspmx.l.google.com.', '10 alt3.aspmx.l.google.com.', '10 alt4.aspmx.l.google.com.'].map((Value) => ({ Value })),
+  },
+  { Name: 'zachdavids.com.', Type: 'NS', TTL: 172800, ResourceRecords: [{ Value: 'ns-1989.awsdns-56.co.uk.' }] },
+  { Name: 'zachdavids.com.', Type: 'SOA', TTL: 900, ResourceRecords: [{ Value: 'ns-1989.awsdns-56.co.uk. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400' }] },
+  { Name: 'zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=spf1 include:_spf.google.com ~all"' }] },
+  { Name: '_dmarc.zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=DMARC1; p=none"' }] },
+  { Name: 'google._domainkey.zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=DKIM1; k=rsa"' }] },
+  ...SITE_CERTIFICATE_RECORDS.map(([name, value]) => ({ Name: `${name}.`, Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: `${value}.` }] })),
+];
+// The site distribution, E3R8NEUOW8Z97U, as ADR 0003's "Deployed state" records it.
+const SITE_DISTRIBUTION = 'd15987dzppdzr.cloudfront.net';
+
+describe('the milestone 8 cutover batches', () => {
+  const batch = (file: string) => JSON.parse(readFileSync(path.join(DNS_DIR, file), 'utf8'));
+  const ttl = batch('2026-10-15-website-ttl.json');
+  const ttlReverse = batch('2026-10-15-website-ttl.reverse.json');
+  const cutover = batch('2026-10-15-website-cutover.json');
+  const cutoverReverse = batch('2026-10-15-website-cutover.reverse.json');
+  const start = zoneOf(ZONE_2026_10_15);
+  const website = (zone: Zone) => [...zone.entries()].filter(([key]) => /^(?:www\.)?zachdavids\.com (?:A|AAAA|CNAME)$/.test(key));
+  const others = (zone: Zone) => [...zone.entries()].filter(([key]) => !/^(?:www\.)?zachdavids\.com (?:A|AAAA|CNAME)$/.test(key));
+
+  it('records the distribution they alias in ADR 0003', () => {
+    expect(readFileSync(path.join(__dirname, '..', '..', 'docs', 'adr', '0003-site-distribution-design.md'), 'utf8')).toContain(
+      `\`E3R8NEUOW8Z97U\` (\`${SITE_DISTRIBUTION}\`)`,
+    );
+  });
+
+  it('give every website routing batch a reverse batch, and no reverse batch without its forward one', () => {
+    const files = readdirSync(DNS_DIR).filter((file) => file.endsWith('.json'));
+    const routing = files.filter((file) => file !== '2026-10-13-acm-validation.json');
+    const forward = routing.filter((file) => !file.endsWith('.reverse.json'));
+    expect(routing.filter((file) => file.endsWith('.reverse.json')).sort()).toEqual(
+      forward.map((file) => file.replace(/\.json$/, '.reverse.json')).sort(),
+    );
+  });
+
+  it('lower the TTLs, then point both names at the site distribution in A and AAAA aliases, touching nothing else', () => {
+    const lowered = applyBatch(start, ttl);
+    expect(website(lowered).map(([key, rrs]) => [key, rrs.TTL])).toEqual([
+      ['zachdavids.com A', 300],
+      ['zachdavids.com AAAA', 300],
+      ['www.zachdavids.com CNAME', 300],
+    ]);
+    const cut = applyBatch(lowered, cutover);
+    const alias = { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: `${SITE_DISTRIBUTION}.`, EvaluateTargetHealth: false };
+    expect(website(cut).map(([key, rrs]) => [key, rrs.AliasTarget, rrs.TTL])).toEqual([
+      ['zachdavids.com A', alias, undefined],
+      ['zachdavids.com AAAA', alias, undefined],
+      ['www.zachdavids.com A', alias, undefined],
+      ['www.zachdavids.com AAAA', alias, undefined],
+    ]);
+    // The email, delegation, and certificate validation records are exactly as they were.
+    expect(others(cut)).toEqual(others(start));
+  });
+
+  it('undo each step exactly with its reverse batch, back to the zone as it was', () => {
+    const lowered = applyBatch(start, ttl);
+    expect(applyBatch(applyBatch(lowered, cutover), cutoverReverse)).toEqual(lowered);
+    expect(applyBatch(lowered, ttlReverse)).toEqual(start);
+  });
+
+  it('fail whole, changing nothing, on a zone that differs from the one they were written for', () => {
+    // The cutover without the TTL step first, and the TTL step after someone changed the Droplet's address.
+    expect(() => applyBatch(start, cutover)).toThrow('change 0 (DELETE zachdavids.com A): it does not match the zone');
+    const moved = zoneOf([{ ...ZONE_2026_10_15[0]!, ResourceRecords: [{ Value: '192.0.2.1' }] }, ...ZONE_2026_10_15.slice(1)]);
+    expect(() => applyBatch(moved, ttl)).toThrow('change 0 (DELETE zachdavids.com A): it does not match the zone');
+    // Applied twice, each refuses the second time.
+    expect(() => applyBatch(applyBatch(applyBatch(start, ttl), cutover), cutover)).toThrow('it does not match the zone');
+  });
+});
+
+describe('applyBatch', () => {
+  const a = { Name: 'zachdavids.com.', Type: 'A', TTL: 300, ResourceRecords: [{ Value: '192.0.2.1' }, { Value: '192.0.2.2' }] };
+  const zone = zoneOf([a]);
+
+  it('creates, upserts, and deletes, matching a deletion in any case and value order', () => {
+    const cname = { Name: 'www.zachdavids.com.', Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: 'zachdavids.com' }] };
+    const created = applyBatch(zone, { Changes: [{ Action: 'CREATE', ResourceRecordSet: cname }] });
+    expect([...created.keys()]).toEqual(['zachdavids.com A', 'www.zachdavids.com CNAME']);
+    const upserted = applyBatch(created, { Changes: [{ Action: 'UPSERT', ResourceRecordSet: { ...a, TTL: 60 } }] });
+    expect(upserted.get('zachdavids.com A')?.TTL).toBe(60);
+    const reordered = { ...a, Name: 'ZachDavids.com', ResourceRecords: [...a.ResourceRecords].reverse() };
+    expect([...applyBatch(zone, { Changes: [{ Action: 'DELETE', ResourceRecordSet: reordered }] }).keys()]).toEqual([]);
+  });
+
+  it('refuses a creation of what exists, a deletion that does not match, and a CNAME beside other records', () => {
+    expect(() => applyBatch(zone, { Changes: [{ Action: 'CREATE', ResourceRecordSet: a }] })).toThrow(
+      'change 0 (CREATE zachdavids.com A): it already exists',
+    );
+    for (const differing of [{ ...a, TTL: 60 }, { ...a, ResourceRecords: [{ Value: '192.0.2.1' }] }, { ...a, Type: 'AAAA' }]) {
+      expect(() => applyBatch(zone, { Changes: [{ Action: 'DELETE', ResourceRecordSet: differing }] })).toThrow(
+        'it does not match the zone',
+      );
+    }
+    const apexCname = { Name: 'zachdavids.com.', Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: 'example.com' }] };
+    expect(() => applyBatch(zone, { Changes: [{ Action: 'CREATE', ResourceRecordSet: apexCname }] })).toThrow(
+      'zachdavids.com would hold a CNAME beside other records',
+    );
+    // An alias is matched by its target.
+    const alias = { Name: 'zachdavids.com.', Type: 'A', AliasTarget: { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: 'd1.cloudfront.net.', EvaluateTargetHealth: false } };
+    const aliased = zoneOf([alias]);
+    const other = { ...alias, AliasTarget: { ...alias.AliasTarget, DNSName: 'd2.cloudfront.net.' } };
+    expect(() => applyBatch(aliased, { Changes: [{ Action: 'DELETE', ResourceRecordSet: other }] })).toThrow(
+      'it does not match the zone',
+    );
+    const upperCase = { ...alias, AliasTarget: { ...alias.AliasTarget, DNSName: 'D1.CloudFront.net' } };
+    expect(applyBatch(aliased, { Changes: [{ Action: 'DELETE', ResourceRecordSet: upperCase }] }).size).toBe(0);
   });
 });

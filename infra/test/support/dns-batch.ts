@@ -77,6 +77,56 @@ export function dnsBatchViolations(batch: Json): string[] {
   return out;
 }
 
+/** A zone's record sets, keyed by "<name> <type>", the name in lower case without its final dot. */
+export type Zone = ReadonlyMap<string, Json>;
+
+const recordKey = (rrs: Json) => `${normalize(String(rrs.Name))} ${rrs.Type}`;
+
+/** A record set as Route 53 compares one a DELETE names: values in any order, names and targets in any case. */
+function comparable(rrs: Json): string {
+  const values = (rrs.ResourceRecords ?? []).map((record: Json) => String(record.Value).toLowerCase().replace(/\.$/, ''));
+  const alias = rrs.AliasTarget && {
+    zone: rrs.AliasTarget.HostedZoneId,
+    name: normalize(String(rrs.AliasTarget.DNSName)),
+    health: rrs.AliasTarget.EvaluateTargetHealth,
+  };
+  return JSON.stringify({ key: recordKey(rrs), ttl: rrs.TTL, values: values.sort(), alias });
+}
+
+/**
+ * The zone after Route 53 applies `batch` to it, which it does all or nothing: a CREATE of a record set that exists
+ * fails, a DELETE must name a record set exactly (its TTL and values, or its alias target), an UPSERT replaces one, and a
+ * name with a CNAME may hold nothing else. Throws, naming the change, where Route 53 would refuse the batch.
+ */
+export function applyBatch(zone: Zone, batch: Json): Zone {
+  const next = new Map(zone);
+  (batch.Changes as Json[]).forEach((change, i) => {
+    const rrs = change.ResourceRecordSet;
+    const key = recordKey(rrs);
+    const where = `change ${i} (${change.Action} ${key})`;
+    const current = next.get(key);
+    if (change.Action === 'CREATE' && current !== undefined) throw new Error(`${where}: it already exists`);
+    if (change.Action === 'DELETE') {
+      if (current === undefined || comparable(current) !== comparable(rrs)) {
+        throw new Error(`${where}: it does not match the zone`);
+      }
+      next.delete(key);
+    } else {
+      next.set(key, rrs);
+    }
+  });
+  for (const key of next.keys()) {
+    const [name, type] = key.split(' ');
+    if (type === 'CNAME' && [...next.keys()].some((other) => other !== key && other.startsWith(`${name} `))) {
+      throw new Error(`${name} would hold a CNAME beside other records`);
+    }
+  }
+  return next;
+}
+
+/** The zone a list of record sets makes. */
+export const zoneOf = (records: Json[]): Zone => new Map(records.map((rrs) => [recordKey(rrs), rrs]));
+
 /**
  * Checks every file under `dir` except its README as a change batch, whatever its
  * name or folder: the AWS CLI applies any file it is given, so none may skip review.
