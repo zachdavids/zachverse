@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { type Aws, cloudfrontCdn, runAws, s3Store } from './release-aws.ts';
+import { type Aws, awsVersion, cloudfrontCdn, runAws, s3Store } from './release-aws.ts';
 
 const execFile = vi.hoisted(() => vi.fn());
 vi.mock('node:child_process', () => ({ execFile }));
@@ -10,9 +10,10 @@ afterEach(() => {
   execFile.mockReset();
 });
 
-// The AWS CLI's message for a missing key, which it prints when the caller may list the bucket.
+// How runAws rejects for a missing key, which S3 reports when the caller may list the bucket: head-object's code is a
+// bare 404, and get-object's NoSuchKey (what CLI 2.37 prints for both, with --cli-error-format json).
 const missing = (operation: string, code: string) =>
-  new Error(`aws s3api ${operation}: An error occurred (${code}) when calling the ${operation} operation: Not Found`);
+  Object.assign(new Error(`aws s3api ${operation}: ${code}: Not Found`), { code });
 
 describe('runAws', () => {
   type Callback = (error: Error | null, stdout: string, stderr: string) => void;
@@ -24,23 +25,61 @@ describe('runAws', () => {
     await expect(runAws(['s3api', 'head-object', '--key', 'x'])).resolves.toBe('{"ok":true}');
     expect(execFile).toHaveBeenCalledExactlyOnceWith(
       'aws',
-      ['s3api', 'head-object', '--key', 'x', '--region', 'us-east-1'],
+      ['s3api', 'head-object', '--key', 'x', '--region', 'us-east-1', '--cli-error-format', 'json'],
       { maxBuffer: 16 * 1024 * 1024 },
       expect.any(Function),
     );
   });
 
-  it("rejects with the CLI's error message, or the process error when the CLI printed none", async () => {
+  it("rejects with AWS's error code and message on one line, from the CLI's JSON error", async () => {
+    // As CLI 2.37 prints a service error with --cli-error-format json, indented over several lines.
+    const json = (code: string, message: unknown) => `{\n    "Code": "${code}",\n    "Message": ${JSON.stringify(message)}\n}\n`;
+    for (const [stderr, message, code] of [
+      [json('404', 'Not Found'), 'aws s3api head-object: 404: Not Found', '404'],
+      [json('AccessDenied', 'Access\nDenied'), 'aws s3api head-object: AccessDenied: Access Denied', 'AccessDenied'],
+      [`\n${json('Throttling', null)}`, 'aws s3api head-object: Throttling: ', 'Throttling'],
+    ]) {
+      execFile.mockImplementationOnce((_file: string, _args: string[], _options: object, callback: Callback) =>
+        callback(new Error('exit 254'), '', stderr!),
+      );
+      const error = await runAws(['s3api', 'head-object']).catch((rejection: unknown) => rejection);
+      expect(error).toEqual(expect.objectContaining({ message, code }));
+    }
+  });
+
+  it("rejects with the last line of the CLI's text, or the process error when the CLI printed none", async () => {
+    // Failures before AWS answers, such as an unknown option, stay text, after a usage message.
     execFile.mockImplementationOnce((_file: string, _args: string[], _options: object, callback: Callback) =>
-      callback(new Error('exit 254'), '', 'An error occurred (AccessDenied) when calling the PutObject operation\n'),
+      callback(new Error('exit 252'), '', '\nusage: aws [options]\n\naws: [ERROR]: Unknown options: --cli-error-format\n'),
     );
-    await expect(runAws(['s3api', 'put-object'])).rejects.toThrow(
-      'aws s3api put-object: An error occurred (AccessDenied) when calling the PutObject operation',
-    );
+    const unknown = await runAws(['s3api', 'put-object']).catch((rejection: unknown) => rejection);
+    expect(unknown).toEqual(expect.objectContaining({ message: 'aws s3api put-object: aws: [ERROR]: Unknown options: --cli-error-format' }));
+    expect((unknown as { code?: unknown }).code).toBeUndefined();
+    // Braces that are not AWS's error JSON stay text too.
+    for (const stderr of ['{not json}\n', '{"Message": "no code"}\n']) {
+      execFile.mockImplementationOnce((_file: string, _args: string[], _options: object, callback: Callback) =>
+        callback(new Error('exit 255'), '', stderr),
+      );
+      await expect(runAws(['s3api', 'put-object'])).rejects.toThrow(`aws s3api put-object: ${stderr.trim()}`);
+    }
     execFile.mockImplementationOnce((_file: string, _args: string[], _options: object, callback: Callback) =>
       callback(new Error('spawn aws ENOENT'), '', ''),
     );
     await expect(runAws(['cloudfront', 'wait'])).rejects.toThrow('aws cloudfront wait: spawn aws ENOENT');
+  });
+});
+
+describe('awsVersion', () => {
+  it("reports the CLI's version line, or unknown when the CLI does not run", async () => {
+    execFile.mockImplementationOnce((_file: string, _args: string[], callback: (error: Error | null, stdout: string) => void) =>
+      callback(null, 'aws-cli/2.37.13 Python/3.13.11 Linux/6.8.0 exe/x86_64.ubuntu.24\n'),
+    );
+    expect(await awsVersion()).toBe('aws-cli/2.37.13 Python/3.13.11 Linux/6.8.0 exe/x86_64.ubuntu.24');
+    expect(execFile.mock.calls[0]?.slice(0, 2)).toEqual(['aws', ['--version']]);
+    execFile.mockImplementationOnce((_file: string, _args: string[], callback: (error: Error | null, stdout: string) => void) =>
+      callback(new Error('spawn aws ENOENT'), ''),
+    );
+    expect(await awsVersion()).toBe('unknown');
   });
 });
 

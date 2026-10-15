@@ -10,8 +10,9 @@ afterEach(() => {
 });
 
 // A box for an element, as layout would give it.
-function place(element: Element, box: { left: number; right: number; width: number; height: number }) {
-  element.getBoundingClientRect = () => ({ ...box, top: 0, bottom: box.height, x: box.left, y: 0, toJSON: () => box }) as DOMRect;
+function place(element: Element, box: { left: number; right: number; top: number; width: number; height: number }) {
+  const bottom = box.top + box.height;
+  element.getBoundingClientRect = () => ({ ...box, bottom, x: box.left, y: box.top, toJSON: () => box }) as DOMRect;
 }
 
 describe('measure', () => {
@@ -36,7 +37,7 @@ describe('measure', () => {
         },
       },
     });
-    place(document.querySelector('h1')!, { left: 16, right: 304, width: 288, height: 40 });
+    place(document.querySelector('h1')!, { left: 16, right: 304, top: 24, width: 288, height: 40 });
     Object.defineProperty(document.documentElement, 'scrollWidth', { value: 320, configurable: true });
     Object.defineProperty(document.documentElement, 'clientWidth', { value: 320, configurable: true });
 
@@ -44,7 +45,8 @@ describe('measure', () => {
       release,
       scrollWidth: 320,
       clientWidth: 320,
-      heading: { text: 'A Name', left: 16, right: 304, width: 288, height: 40 },
+      viewportHeight: window.innerHeight,
+      heading: { text: 'A Name', left: 16, right: 304, top: 24, bottom: 64, width: 288, height: 40, visible: true },
       stylesheets: [
         { href: `${location.origin}/assets/index-AbCd1234.css`, rules: 12 },
         { href: `${location.origin}/assets/missing-AbCd1234.css`, rules: null },
@@ -64,6 +66,7 @@ describe('measure', () => {
         release: null,
         scrollWidth: 500,
         clientWidth: 320,
+        viewportHeight: window.innerHeight,
         heading: null,
         stylesheets: [],
         scripts: [],
@@ -75,11 +78,40 @@ describe('measure', () => {
   });
 });
 
+describe("measure: the heading's visibility", () => {
+  const headingOf = (html: string) => {
+    document.body.innerHTML = html;
+    place(document.querySelector('h1')!, { left: 16, right: 304, top: 24, width: 288, height: 40 });
+    return measure().heading!;
+  };
+
+  it('reads a heading hidden or fully transparent through its own style, where the browser cannot say', () => {
+    expect(headingOf('<h1 style="visibility: hidden">A</h1>').visible).toBe(false);
+    expect(headingOf('<h1 style="opacity: 0">A</h1>').visible).toBe(false);
+    expect(headingOf('<h1 style="opacity: 0.5">A</h1>').visible).toBe(true);
+  });
+
+  it("asks the browser's checkVisibility, which also sees an ancestor's opacity, where it has one", () => {
+    document.body.innerHTML = '<div style="opacity: 0"><h1>A</h1></div>';
+    const heading = document.querySelector('h1')!;
+    place(heading, { left: 16, right: 304, top: 24, width: 288, height: 40 });
+    const asked: unknown[] = [];
+    Object.assign(heading, { checkVisibility: (options: unknown) => (asked.push(options), false) });
+    expect(measure().heading!.visible).toBe(false);
+    expect(asked).toEqual([{ opacityProperty: true, visibilityProperty: true }]);
+  });
+});
+
 describe('measureFocus', () => {
   it('reads the focused element and the styles that would show its focus', () => {
     document.body.innerHTML = '<a href="/x" style="outline: 2px solid blue; box-shadow: none">x</a>';
     document.querySelector('a')!.focus();
-    expect(measureFocus()).toMatchObject({ tag: 'a', outlineStyle: expect.any(String), boxShadow: expect.any(String) });
+    expect(measureFocus()).toMatchObject({
+      tag: 'a',
+      outlineStyle: expect.any(String),
+      outlineColor: expect.any(String),
+      boxShadow: expect.any(String),
+    });
   });
 
   it('reads nothing when nothing has the focus', () => {

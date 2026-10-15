@@ -58,12 +58,6 @@ jobs:
         run: npm run build
         env:
           RELEASE_COMMIT: ${{ github.sha }}
-      # Chromium's headless shell, and the system libraries it needs, for the browser check.
-      - run: npx playwright install --with-deps --only-shell chromium
-      - name: Check the pages in a browser
-        run: npm run check:browser
-        env:
-          RELEASE_COMMIT: ${{ github.sha }}
       - name: Check prerendered output
         run: npm run check:dist
         env:
@@ -87,6 +81,14 @@ jobs:
           # highest ID, which may be the earlier attempt's. This deletes that one first, as a best effort; the deploy
           # job's digest check fails on files that differ from this build's.
           overwrite: true
+      # Chromium's headless shell, and the system libraries it needs, for the browser check. Playwright checks nothing
+      # but the size of what it downloads, so Chromium runs only once the site's files are fixed in the digest and the
+      # artifact; the deploy job still waits for this job, and so for the check (ADR 0006).
+      - run: npx playwright install --with-deps --only-shell chromium
+      - name: Check the pages in a browser
+        run: npm run check:browser
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
 
   deploy:
     name: Deploy (publish, and smoke-test over HTTP)
@@ -205,7 +207,17 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: npm ci
-      - run: npx playwright install --with-deps --only-shell chromium
+      # Chromium's headless shell and the system libraries it needs, from npm's registry, Ubuntu's mirrors, and Playwright's
+      # CDN. The release is already live, and a failed install would roll it back, so a download error is retried before
+      # it counts (ADR 0006, "Limits").
+      - name: Install Chromium
+        run: |
+          for attempt in 1 2 3; do
+            npx playwright install --with-deps --only-shell chromium && exit 0
+            echo "::warning::Installing Chromium failed (attempt $attempt of 3)."
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+          exit 1
       - name: Check the live release in Chromium
         env:
           CLOUDFRONT_DOMAIN: ${{ needs.deploy.outputs.domain }}
@@ -289,9 +301,9 @@ jobs:
       - name: Record the release as verified
         if: needs.deploy.result == 'success' && needs.browser.result == 'success'
         run: node scripts/release.ts verified
-      # If publishing failed partway, or the smoke test or the browser check failed, the last verified release goes back
-      # out, is smoke-tested, and is recorded as verified again only if that passes. Nothing is rolled back when this run
-      # changed nothing.
+      # If publishing failed partway, the smoke test or the browser check failed, or the browser job could not run its
+      # check, the newest release that passed its checks or was restored goes back out, is smoke-tested, and is recorded
+      # as verified again only if that passes. Nothing is rolled back when this run changed nothing.
       - name: Roll back to the last verified release
         id: rollback
         if: needs.deploy.result != 'success' || needs.browser.result != 'success'

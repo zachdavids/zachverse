@@ -9,6 +9,8 @@ import { isDeepStrictEqual } from 'node:util';
 /** Where the copy of each release and the release history live. The bucket policy keeps CloudFront from serving them. */
 export const RECORDS = '_releases/';
 const HISTORY = `${RECORDS}history.json`;
+/** Replaced assets whose invalidation has not yet completed; see writeAssets. */
+const PENDING = `${RECORDS}pending-invalidation.json`;
 
 /** For assets: their names carry a content hash, so a name never gets other content. */
 export const IMMUTABLE = 'public, max-age=31536000, immutable';
@@ -45,9 +47,14 @@ const CONTENT_TYPES = new Map([
 // Path segments CloudFront invalidates as written: invalidation paths need other characters encoded, and "~" never
 // works (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/invalidation-specifying-objects.html).
 const PLAIN_PATH = /^[\w.-]+(?:\/[\w.-]+)*$/;
+// A "." or ".." segment would name another object than its path suggests, and another file when restored to disk.
+const isPlainPath = (path: string) => PLAIN_PATH.test(path) && !path.split('/').some((segment) => /^\.\.?$/.test(segment));
+/** Where the hashed assets live; infra/lib/site-stack.ts keeps the deploy role from deleting anything under it. */
+export const ASSETS = 'assets/';
 // The content hash Vite puts in an asset's name: a hyphen and 8 characters before the extension. A word of 8 letters
 // passes too, so tests/repo-policy.test.ts keeps public/, which Vite copies unhashed, from holding an assets/ directory.
-const HASHED_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
+// check:dist applies the same rule.
+export const HASHED_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 
 export interface SiteFile {
@@ -70,7 +77,10 @@ export interface Entry {
   action: 'publish' | 'restore' | 'rollback';
   /** The commit whose build is the release. */
   release: string;
-  /** The workflow run, as "<run ID>-<attempt>". */
+  /**
+   * The workflow run, as "<run ID>-<attempt>". The run ID says whose entry it is: a re-run of any of the run's jobs is
+   * the same run. The attempt is kept for the record, and keeps each attempt's invalidation reference its own.
+   */
   run: string;
   started: string;
   /** Set once every file is written and the invalidation has completed. */
@@ -124,15 +134,14 @@ export function sha256(body: Buffer): string {
 }
 
 export function isAsset(path: string): boolean {
-  return path.startsWith('assets/');
+  return path.startsWith(ASSETS);
 }
 
 const isIndex = (path: string) => /(?:^|\/)index\.html$/.test(path);
 
 /** One file of a release, with the headers it is served with. Throws for a file no release may hold. */
 export function describeFile(path: string, body: Buffer): SiteFile {
-  // A "." or ".." segment would name another object than its path suggests, and another file when restored to disk.
-  if (!PLAIN_PATH.test(path) || path.split('/').some((segment) => /^\.\.?$/.test(segment))) {
+  if (!isPlainPath(path)) {
     throw new Error(`${JSON.stringify(path)}: a file's path may hold only letters, digits, "_", "-", "." and "/".`);
   }
   if (path.startsWith(RECORDS)) throw new Error(`${path} would overwrite the release records under ${RECORDS}.`);
@@ -213,7 +222,7 @@ const isOptionalText = (value: unknown) => value === undefined || isText(value);
 function isEntry(value: unknown): value is Entry {
   return (
     isRecord(value) &&
-    (value.action === 'publish' || value.action === 'restore' || value.action === 'rollback') &&
+    ACTIONS.has(value.action) &&
     typeof value.release === 'string' &&
     COMMIT.test(value.release) &&
     isText(value.run) &&
@@ -223,17 +232,61 @@ function isEntry(value: unknown): value is Entry {
   );
 }
 
+/**
+ * The history's format. Raise it whenever an entry kind is added or a field changes type, so that older release code,
+ * as in a re-run of an old run or after a revert, refuses the history rather than misreading it. An added field needs no
+ * new format: readers ignore fields they do not know.
+ */
+const HISTORY_FORMAT = 1;
+const ACTIONS: ReadonlySet<unknown> = new Set(['publish', 'restore', 'rollback']);
+
 export async function readHistory(store: Store): Promise<Entry[]> {
   const history = await readJson(store, HISTORY);
   if (history === undefined) return [];
-  if (!isRecord(history) || !Array.isArray(history.entries) || !history.entries.every(isEntry)) {
-    throw new Error(`${HISTORY} is not a release history. Restore its previous version before releasing again.`);
+  const broken = () =>
+    new Error(`${HISTORY} is not a release history. Restore its previous version before releasing again.`);
+  if (!isRecord(history) || !Array.isArray(history.entries)) throw broken();
+  // Histories from before the marker are format 1.
+  const format = history.format ?? 1;
+  if (!Number.isInteger(format) || (format as number) < 1) throw broken();
+  const unknown = history.entries.find((entry) => isRecord(entry) && typeof entry.action === 'string' && !ACTIONS.has(entry.action));
+  if ((format as number) > HISTORY_FORMAT || unknown !== undefined) {
+    const what = unknown === undefined ? `format ${format}` : `an entry of the kind "${(unknown as Entry).action}"`;
+    throw new Error(
+      `${HISTORY} has ${what}, which newer release code wrote and this commit's does not know. Nothing was changed. Do not put back an older version of the history: run release code that knows it.`,
+    );
   }
+  if (!history.entries.every(isEntry)) throw broken();
   return history.entries as Entry[];
 }
 
 async function writeHistory(store: Store, entries: Entry[]): Promise<void> {
-  await writeJson(store, HISTORY, { entries });
+  await writeJson(store, HISTORY, { format: HISTORY_FORMAT, entries });
+}
+
+/** The run ID in "<run ID>-<attempt>": entries with the same one belong to the same workflow run. */
+const runIdOf = (run: string) => run.split('-')[0];
+
+/** The current release, as the messages name it. */
+function describeEntry(entry: Entry | undefined): string {
+  if (entry === undefined) return 'none yet';
+  const state = entry.verified !== undefined ? 'verified' : entry.published !== undefined ? 'not verified' : 'unfinished';
+  return `${entry.release} (${entry.action} by run ${entry.run}, ${state})`;
+}
+
+/** The asset paths a replacement left to invalidate. They become invalidation paths, so each must be a plain asset path. */
+async function readPending(store: Store): Promise<string[]> {
+  const record = await readJson(store, PENDING);
+  if (record === undefined) return [];
+  const isAssetPath = (path: unknown) => typeof path === 'string' && isAsset(path) && isPlainPath(path);
+  if (!isRecord(record) || !Array.isArray(record.assets) || !record.assets.every(isAssetPath)) {
+    throw new Error(`${PENDING} is not a list of assets to invalidate. Nothing was changed. Check it, and fix it by hand.`);
+  }
+  return record.assets as string[];
+}
+
+async function writePending(store: Store, assets: string[]): Promise<void> {
+  await writeJson(store, PENDING, { assets });
 }
 
 async function readManifest(store: Store, release: string): Promise<Manifest | undefined> {
@@ -259,8 +312,8 @@ async function readManifest(store: Store, release: string): Promise<Manifest | u
  * current release is an automatic rollback from it, after its checks failed.
  *
  * A restore someone ran holds deploys: nothing is published over it, so the next push cannot quietly bring back what
- * was restored away, until a run started by hand asks to resume. That run may also publish the release the restore
- * replaced again.
+ * was restored away, until a run started by hand asks to resume (release.ts honours that on a run's first attempt only).
+ * That run may also publish the release the restore replaced again.
  */
 export async function checkOrder(
   entries: Entry[],
@@ -269,13 +322,13 @@ export async function checkOrder(
   resume = false,
 ): Promise<void> {
   const current = entries.at(-1);
-  const newest = entries.findLast((entry) => entry.action === 'publish');
-  if (current === undefined || newest === undefined) return;
-  if (current.action === 'restore' && !resume) {
+  if (current?.action === 'restore' && !resume) {
     throw new Error(
       `Not publishing ${release}: deploys are held, since run ${current.run} restored ${current.release}. Nothing was changed. To publish over the restore, run the Deploy workflow on main by hand with "Publish over a restore" checked.`,
     );
   }
+  const newest = entries.findLast((entry) => entry.action === 'publish');
+  if (current === undefined || newest === undefined) return;
   const relation = await repository.compare(newest.release, release);
   if (relation === 'ahead') return;
   const rolledBackFrom = current.action === 'rollback' ? entries.at(-2) : undefined;
@@ -292,23 +345,39 @@ export async function checkOrder(
 }
 
 /**
- * Uploads each asset the bucket lacks, or holds with other bytes or headers. A replaced one, as after a change to the
- * header table, may still be cached as immutable, so its path is invalidated with the pages'.
+ * Sorts the release's assets, without writing any: those the bucket lacks, to upload; those it holds with other bytes or
+ * headers, as after a change to the header table, to replace; and the rest, to keep.
  */
-async function uploadAssets(files: SiteFile[], { store }: Context) {
+async function planAssets(files: SiteFile[], { store }: Context) {
   const uploaded: string[] = [];
   const replaced: string[] = [];
   const kept: string[] = [];
   for (const file of files.filter(({ path }) => isAsset(path))) {
     const head = await store.head(file.path);
-    if (head?.sha256 === file.sha256 && head.contentType === file.contentType && head.cacheControl === file.cacheControl) {
-      kept.push(file.path);
-      continue;
-    }
-    (head === undefined ? uploaded : replaced).push(file.path);
-    await writeFile(store, file.path, file);
+    const same =
+      head?.sha256 === file.sha256 && head.contentType === file.contentType && head.cacheControl === file.cacheControl;
+    (same ? kept : head === undefined ? uploaded : replaced).push(file.path);
   }
   return { uploaded, replaced, kept };
+}
+
+/**
+ * Uploads and replaces the planned assets, and returns the asset paths to invalidate. A replaced asset may still be
+ * cached as immutable, so before it is overwritten its path joins the pending record, which every publish, restore, and
+ * rollback invalidates until an invalidation that includes it completes: a run that fails in between leaves it to the
+ * next, which would otherwise find the new copy in place and never invalidate it.
+ */
+async function writeAssets(
+  files: SiteFile[],
+  { uploaded, replaced }: { uploaded: string[]; replaced: string[] },
+  pending: string[],
+  { store }: Context,
+): Promise<string[]> {
+  const toInvalidate = [...new Set([...pending, ...replaced])].sort();
+  if (toInvalidate.length > pending.length) await writePending(store, toInvalidate);
+  const writes = new Set([...uploaded, ...replaced]);
+  for (const file of files) if (writes.has(file.path)) await writeFile(store, file.path, file);
+  return toInvalidate;
 }
 
 function manifestOf(release: string, files: SiteFile[]): Manifest {
@@ -342,41 +411,43 @@ async function saveCopy(files: SiteFile[], release: string, { store }: Context):
 
 /**
  * The pages the bucket holds that this release does not: every key but the release's own files, the assets, which
- * earlier pages may still load, and the release records. Throws, before any page is written, on a key no release would
- * write, which could be anything, and whose path, as one to invalidate, could even be a wildcard.
+ * earlier pages may still load, and the release records. Throws, before any write, on a key no release would write,
+ * which could be anything, and whose path, as one to invalidate, could even be a wildcard.
  */
 async function stalePages(files: SiteFile[], store: Store): Promise<string[]> {
   const own = new Set(files.map(({ path }) => path));
   const stale = (await store.list()).filter((key) => !isAsset(key) && !key.startsWith(RECORDS) && !own.has(key)).sort();
-  const odd = stale.filter((key) => !PLAIN_PATH.test(key));
+  const odd = stale.filter((key) => !isPlainPath(key));
   if (odd.length > 0) {
     throw new Error(
-      `No page was changed: the bucket holds ${odd.join(', ')}, which no release would write. Check, and remove by hand what does not belong.`,
+      `Nothing was changed: the bucket holds ${odd.join(', ')}, which no release would write. Check, and remove by hand what does not belong.`,
     );
   }
   return stale;
 }
 
 /**
- * Records the release as started, writes its pages, deletes the pages the bucket holds that the release does not, waits
- * for the invalidation of them all, and records the release as published.
+ * Records the release as started, writes its pages, deletes the stale ones, waits for the invalidation of them all and
+ * of the assets to invalidate, clears the pending record, and records the release as published.
  */
 async function publishPages(
   files: SiteFile[],
-  replaced: string[],
+  assetsToInvalidate: string[],
+  removed: string[],
   entries: Entry[],
   { action, release }: Pick<Entry, 'action' | 'release'>,
   { store, cdn, run, now }: Context,
 ): Promise<{ removed: string[]; invalidated: string[] }> {
-  const removed = await stalePages(files, store);
   const entry: Entry = { action, release, run, started: now() };
   entries.push(entry);
   await writeHistory(store, entries);
   for (const file of pageOrder(files)) await writeFile(store, file.path, file);
   for (const key of removed) await store.remove(key);
   const pages = invalidationPaths([...files, ...removed.map((path) => ({ path }))]);
-  const invalidated = [...pages, ...replaced.map((path) => `/${path}`)].sort();
+  const invalidated = [...pages, ...assetsToInvalidate.map((path) => `/${path}`)].sort();
+  // The attempt is part of the reference: CloudFront answers a reused one with the earlier invalidation.
   await cdn.invalidate(invalidated, `${run}-${action}-${release}`);
+  if (assetsToInvalidate.length > 0) await writePending(store, []);
   entry.published = now();
   await writeHistory(store, entries);
   return { removed, invalidated };
@@ -395,13 +466,19 @@ export async function publish(
 ): Promise<Outcome> {
   requireCommit(release);
   const files = siteFiles(dir);
-  const entries = await readHistory(context.store);
+  const { store } = context;
+  const entries = await readHistory(store);
+  // Everything that can refuse the release does so before the first write.
   await checkOrder(entries, release, repository, resume);
   const saved = await hasCopy(files, release, context);
-  const assets = await uploadAssets(files, context);
+  const pending = await readPending(store);
+  const removed = await stalePages(files, store);
+  const assets = await planAssets(files, context);
+  const assetsToInvalidate = await writeAssets(files, assets, pending, context);
   if (saved) context.log(`The copy of ${release} is already saved.`);
   else await saveCopy(files, release, context);
-  const pages = await publishPages(files, assets.replaced, entries, { action: 'publish', release }, context);
+  const action = 'publish';
+  const pages = await publishPages(files, assetsToInvalidate, removed, entries, { action, release }, context);
   return { release, ...assets, ...pages };
 }
 
@@ -437,21 +514,25 @@ export async function restore(requested: string, outDir: string, context: Contex
 }
 
 /**
- * After the release this run started fails to publish or fails its smoke test, publishes the last release before it
- * that passed its smoke test again, as restore does, and writes its files to outDir for the smoke test. Returns
- * undefined, changing nothing, when this run started no release that is still current and unverified (it was refused,
- * or failed before writing a page), or when no earlier release passed its smoke test.
+ * After the release this run started fails to publish or fails its checks, publishes again, as restore does, the newest
+ * release before it that passed its checks or that someone restored, and writes its files to outDir for the smoke test.
+ * A restore counts even if its own checks failed: it names a release that had passed them, and rolling back past it
+ * would put back the release it restored away from. Returns undefined, changing nothing, when the current release is
+ * not one this run (any attempt of it) started and left unverified, as when it was refused or failed before writing a
+ * page, or when there is no such earlier release.
  */
 export async function rollBack(outDir: string, context: Context): Promise<Outcome | undefined> {
   const entries = await readHistory(context.store);
   const current = entries.at(-1);
-  if (current?.run !== context.run || current.verified !== undefined) {
-    context.log('This run left no unverified release in place, so there is nothing to roll back.');
+  if (current === undefined || runIdOf(current.run) !== runIdOf(context.run) || current.verified !== undefined) {
+    context.log(
+      `Nothing to roll back: the current release is ${describeEntry(current)}, not one run ${context.run} started and left unverified.`,
+    );
     return undefined;
   }
-  const target = entries.slice(0, -1).findLast((entry) => entry.verified !== undefined);
+  const target = entries.slice(0, -1).findLast((entry) => entry.verified !== undefined || entry.action === 'restore');
   if (target === undefined) {
-    context.log(`No release before ${current.release} passed its smoke test, so there is none to roll back to.`);
+    context.log(`No release before ${current.release} passed its checks or was restored, so there is none to roll back to.`);
     return undefined;
   }
   return republish(target.release, 'rollback', entries, outDir, context);
@@ -477,22 +558,30 @@ async function republish(
     }
     files.push(file);
   }
+  const pending = await readPending(store);
+  const removed = await stalePages(files, store);
+  const assets = await planAssets(files, context);
   for (const file of files) {
     const target = join(outDir, ...file.path.split('/'));
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, file.body);
   }
-  const assets = await uploadAssets(files, context);
-  const pages = await publishPages(files, assets.replaced, entries, { action, release }, context);
+  const assetsToInvalidate = await writeAssets(files, assets, pending, context);
+  const pages = await publishPages(files, assetsToInvalidate, removed, entries, { action, release }, context);
   return { release, ...assets, ...pages };
 }
 
-/** Records the current release as verified; only the run that published it may, after its smoke test passed. */
+/**
+ * Records the current release as verified. Only the run that finished publishing it may, in any attempt: a re-run of
+ * the failed jobs that passes the checks finishes what the earlier attempt started.
+ */
 export async function recordVerified({ store, run, now }: Context): Promise<Entry> {
   const entries = await readHistory(store);
   const current = entries.at(-1);
-  if (current?.run !== run || current.published === undefined) {
-    throw new Error(`Run ${run} did not publish the current release, so nothing was recorded as verified.`);
+  if (current === undefined || runIdOf(current.run) !== runIdOf(run) || current.published === undefined) {
+    throw new Error(
+      `Nothing was recorded as verified: the current release is ${describeEntry(current)}, and only one that run ${run} finished publishing can be.`,
+    );
   }
   current.verified = now();
   await writeHistory(store, entries);

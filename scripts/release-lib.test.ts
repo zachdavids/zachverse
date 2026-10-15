@@ -213,7 +213,14 @@ describe('checkOrder', () => {
   it('lets the first release through without asking GitHub', async () => {
     const { repository, compared } = repositoryAnswering('behind');
     await checkOrder([], A, repository);
-    await checkOrder([entry(A, { action: 'restore' })], B, repository);
+    expect(compared).toEqual([]);
+  });
+
+  it('holds deploys after a restore even with no publish before it, as in a history edited by hand', async () => {
+    const { repository, compared } = repositoryAnswering('ahead');
+    await expect(checkOrder([entry(A, { action: 'restore' })], B, repository)).rejects.toThrow(
+      `Not publishing ${B}: deploys are held, since run 90-1 restored ${A}.`,
+    );
     expect(compared).toEqual([]);
   });
 
@@ -283,6 +290,7 @@ describe('publish', () => {
     // The first release is compared with nothing.
     expect(compared).toEqual([]);
     expect(historyOf(objects)).toEqual({
+      format: 1,
       entries: [
         { action: 'publish', release: A, run: '100-1', started: '2026-10-15T00:00:00Z', published: '2026-10-15T00:00:01Z' },
       ],
@@ -373,8 +381,11 @@ describe('publish', () => {
       Buffer.from('{'),
       Buffer.from('[]'),
       Buffer.from('{"entries": {}}'),
+      json({ format: 0, entries: [] }).body,
+      json({ format: '1', entries: [] }).body,
+      json({ format: 1.5, entries: [] }).body,
+      json({ entries: [{ ...entry(A), action: 7 }] }).body,
       ...[
-        { action: 'deploy' },
         { release: 'main' },
         { run: '' },
         { started: 5 },
@@ -386,6 +397,18 @@ describe('publish', () => {
       const { log, repository, context } = fakes(new Map([['_releases/history.json', { ...json({}), body }]]));
       await expect(publish(site(), B, repository, context), body.toString()).rejects.toThrow(
         /^_releases\/history\.json is not (?:JSON|a release history)\. Restore its previous version/,
+      );
+      expect(log).toEqual([]);
+    }
+
+    // A history that newer release code wrote is not broken: putting back an older version would lose its newest entries.
+    for (const [record, what] of [
+      [{ format: 2, entries: [] }, 'format 2'],
+      [{ entries: [{ ...entry(A), action: 'deploy' }] }, 'an entry of the kind "deploy"'],
+    ] as const) {
+      const { log, repository, context } = fakes(new Map([history([]), ['_releases/history.json', json(record)]]));
+      await expect(publish(site(), B, repository, context)).rejects.toThrow(
+        `_releases/history.json has ${what}, which newer release code wrote and this commit's does not know. Nothing was changed. Do not put back an older version of the history: run release code that knows it.`,
       );
       expect(log).toEqual([]);
     }
@@ -584,29 +607,66 @@ describe('rollBack', () => {
     expect(objects.get('robots.txt')?.body.toString()).toBe('A');
   });
 
-  it("changes nothing when this run left no unverified release in place", async () => {
+  it('changes nothing, and names the current release, when it is not one this run started and left unverified', async () => {
     const verified = fakes();
     await publish(site(), A, verified.repository, verified.context);
     await recordVerified(verified.context);
-    for (const [objects, run] of [
-      [new Map<string, StoredObject>(), '100-1'], // nothing published
-      [await failedB(), '101-1'], // another run's release, as when this run's publish was refused
-      [verified.objects, '100-1'], // this run's release, verified
+    for (const [objects, run, current] of [
+      [new Map<string, StoredObject>(), '100-1', 'none yet'], // nothing published
+      // another run's release, as when this run's publish was refused
+      [await failedB(), '101-1', `${B} (publish by run 100-1, not verified)`],
+      [verified.objects, '100-2', `${A} (publish by run 100-1, verified)`], // this run's release, verified
     ] as const) {
       const { log, messages, context } = fakes(objects);
       expect(await rollBack(tempDir(), { ...context, run })).toBeUndefined();
       expect(log).toEqual([]);
-      expect(messages).toEqual(['This run left no unverified release in place, so there is nothing to roll back.']);
+      expect(messages).toEqual([
+        `Nothing to roll back: the current release is ${current}, not one run ${run} started and left unverified.`,
+      ]);
     }
   });
 
-  it('changes nothing when no earlier release passed its smoke test', async () => {
+  it('rolls back in a later attempt of the run that published the release, as after re-running the failed jobs', async () => {
+    const { objects, log, context } = fakes(await failedB());
+    expect((await rollBack(tempDir(), { ...context, run: '100-2' }))?.release).toBe(A);
+    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+    // The attempt keeps its own invalidation reference.
+    expect(log.filter((line) => line.startsWith('invalidate'))).toEqual([
+      `invalidate / /404.html /favicon.svg /index.html /robots.txt (100-2-rollback-${A})`,
+    ]);
+  });
+
+  it('changes nothing when no earlier release passed its checks or was restored', async () => {
     const first = fakes();
     await publish(site(), A, first.repository, first.context);
     const { log, messages, context } = fakes(first.objects);
     expect(await rollBack(tempDir(), context)).toBeUndefined();
     expect(log).toEqual([]);
-    expect(messages).toEqual([`No release before ${A} passed its smoke test, so there is none to roll back to.`]);
+    expect(messages).toEqual([`No release before ${A} passed its checks or was restored, so there is none to roll back to.`]);
+  });
+
+  it('rolls back to a restore whose own checks failed, not past it to the release it restored away from', async () => {
+    const timedOut = { invalidate: async () => Promise.reject(new Error('waiter timed out')) };
+    // Whether the restore finished publishing or stopped partway, it is not verified.
+    for (const restoreCdn of [undefined, timedOut]) {
+      const first = fakes();
+      await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+      await recordVerified(first.context);
+      const second = fakes(first.objects);
+      const b = { ...second.context, run: '200-1' };
+      await publish(site({ 'robots.txt': 'B' }), B, second.repository, b);
+      await recordVerified(b);
+      const third = fakes(second.objects);
+      const restoring = restore(A, tempDir(), { ...third.context, run: '300-1', cdn: restoreCdn ?? third.context.cdn });
+      if (restoreCdn) await expect(restoring).rejects.toThrow('waiter timed out');
+      else await restoring;
+      // A run started by hand to resume publishes C, which fails its checks.
+      const fourth = fakes(third.objects);
+      await publish(site({ 'robots.txt': 'C' }), C, fourth.repository, { ...fourth.context, run: '400-1' }, true);
+      const { objects, context } = fakes(fourth.objects);
+      expect((await rollBack(tempDir(), { ...context, run: '400-1' }))?.release).toBe(A);
+      expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+    }
   });
 
   it('rolls back past an earlier failed release to the last verified one', async () => {
@@ -628,6 +688,68 @@ describe('rollBack', () => {
     await checkOrder(entries, B, afterB.repository);
     const restored = [...entries, entry(A, { action: 'restore', run: '103-1', verified: 'then' })];
     await expect(checkOrder(restored, B, afterB.repository)).rejects.toThrow(`Not publishing ${B}`);
+  });
+});
+
+describe('replaced assets', () => {
+  const CSS = 'assets/index-EfGh5678.css';
+  const timedOut = { invalidate: async () => Promise.reject(new Error('waiter timed out')) };
+  const pendingOf = (objects: Map<string, StoredObject>) =>
+    JSON.parse(objects.get('_releases/pending-invalidation.json')!.body.toString()) as { assets: string[] };
+
+  // A published and verified; then the CSS is found with other headers, as after a change to the header table.
+  async function verifiedAWithOldHeaders() {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    first.objects.set(CSS, { ...first.objects.get(CSS)!, contentType: 'text/plain' });
+    return first.objects;
+  }
+
+  it('records a replaced asset as pending before overwriting it, and clears it once its invalidation completes', async () => {
+    const { objects, log, repository, context } = fakes(await verifiedAWithOldHeaders());
+    const { replaced, invalidated } = await publish(site({ 'robots.txt': 'B' }), B, repository, context);
+    expect(replaced).toEqual([CSS]);
+    expect(invalidated).toContain(`/${CSS}`);
+    const order = log.filter((line) => /^(write _releases\/pending|write assets\/|invalidate)/.test(line));
+    expect(order).toEqual([
+      'write _releases/pending-invalidation.json',
+      `write ${CSS}`,
+      expect.stringMatching(/^invalidate .*\/assets\/index-EfGh5678\.css/),
+      'write _releases/pending-invalidation.json',
+    ]);
+    expect(pendingOf(objects)).toEqual({ assets: [] });
+  });
+
+  it('invalidates it in the rollback, and in a re-run, after the run that replaced it failed before invalidating', async () => {
+    for (const next of ['rollback', 're-run'] as const) {
+      const failed = fakes(await verifiedAWithOldHeaders());
+      await expect(
+        publish(site({ 'robots.txt': 'B' }), B, failed.repository, { ...failed.context, cdn: timedOut }),
+      ).rejects.toThrow('waiter timed out');
+      expect(pendingOf(failed.objects)).toEqual({ assets: [CSS] });
+
+      const { objects, repository, context } = fakes(failed.objects);
+      const outcome =
+        next === 'rollback'
+          ? await rollBack(tempDir(), context)
+          : await publish(site({ 'robots.txt': 'B' }), B, repository, { ...context, run: '100-2' });
+      // The CSS now has the right headers, so it is kept, but its path is still invalidated.
+      expect(outcome?.kept).toContain(CSS);
+      expect(outcome?.invalidated).toContain(`/${CSS}`);
+      expect(pendingOf(objects)).toEqual({ assets: [] });
+    }
+  });
+
+  it('refuses, before any write, a pending record that is not a list of plain asset paths', async () => {
+    for (const record of [{ assets: ['index.html'] }, { assets: ['assets/*'] }, { assets: 'assets/x.css' }, []]) {
+      const { log, objects, repository, context } = fakes(await verifiedAWithOldHeaders());
+      objects.set('_releases/pending-invalidation.json', json(record));
+      await expect(publish(site(), B, repository, context)).rejects.toThrow(
+        '_releases/pending-invalidation.json is not a list of assets to invalidate. Nothing was changed. Check it, and fix it by hand.',
+      );
+      expect(log).toEqual([]);
+    }
   });
 });
 
@@ -663,15 +785,15 @@ describe('removing pages', () => {
     expect(log.filter((line) => line.startsWith('remove'))).toEqual([]);
   });
 
-  it('fails before any write when the bucket holds a key no release would write', async () => {
+  it('fails before any write when the bucket holds a key no release would write, a dot segment included', async () => {
     const first = fakes();
     await publish(site(), A, first.repository, first.context);
-    first.objects.set('notes/a b.txt', first.objects.get('robots.txt')!);
+    for (const key of ['notes/a b.txt', 'notes/../x.txt']) first.objects.set(key, first.objects.get('robots.txt')!);
     const { log, repository, context } = fakes(first.objects);
     await expect(publish(site(), B, repository, context)).rejects.toThrow(
-      'No page was changed: the bucket holds notes/a b.txt, which no release would write. Check, and remove by hand what does not belong.',
+      'Nothing was changed: the bucket holds notes/../x.txt, notes/a b.txt, which no release would write. Check, and remove by hand what does not belong.',
     );
-    expect(log.filter((line) => !line.startsWith('write assets/') && !line.startsWith(`write _releases/${B}`))).toEqual([]);
+    expect(log).toEqual([]);
   });
 
   it('restoring an earlier release deletes the pages a later one added', async () => {
@@ -748,11 +870,22 @@ describe('recordVerified', () => {
     expect(historyOf(objects).entries[0]?.verified).toBe('2026-10-15T00:00:02Z');
   });
 
-  it('records nothing when this run did not publish the current release, or it did not finish', async () => {
-    for (const entries of [[], [entry(A, { run: '99-1' })], [entry(A, { run: '100-1', published: undefined })]]) {
-      const { log, context } = fakes(new Map([history(entries)]));
+  it('records the release in a later attempt of the run that published it, as after re-running the failed jobs', async () => {
+    const { objects, repository, context } = fakes();
+    await publish(site(), A, repository, context);
+    expect(await recordVerified({ ...context, run: '100-2' })).toMatchObject({ release: A, run: '100-1' });
+    expect(historyOf(objects).entries[0]?.verified).toBeDefined();
+  });
+
+  it('records nothing, naming the current release, when this run did not finish publishing it', async () => {
+    for (const [entries, current] of [
+      [[], 'none yet'],
+      [[entry(A, { run: '99-1' })], `${A} (publish by run 99-1, not verified)`],
+      [[entry(A, { run: '100-1', published: undefined })], `${A} (publish by run 100-1, unfinished)`],
+    ] as const) {
+      const { log, context } = fakes(new Map([history([...entries])]));
       await expect(recordVerified(context)).rejects.toThrow(
-        'Run 100-1 did not publish the current release, so nothing was recorded as verified.',
+        `Nothing was recorded as verified: the current release is ${current}, and only one that run 100-1 finished publishing can be.`,
       );
       expect(log).toEqual([]);
     }
@@ -762,5 +895,10 @@ describe('recordVerified', () => {
 describe('readHistory', () => {
   it('reads an empty history from a bucket without one', async () => {
     expect(await readHistory(fakes().store)).toEqual([]);
+  });
+
+  it('reads a history from before the format marker as format 1', async () => {
+    const { store } = fakes(new Map([['_releases/history.json', json({ entries: [entry(A)] })]]));
+    expect(await readHistory(store)).toEqual([entry(A)]);
   });
 });

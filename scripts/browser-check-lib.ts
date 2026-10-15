@@ -11,7 +11,19 @@ export interface Measure {
   release: string | null;
   scrollWidth: number;
   clientWidth: number;
-  heading: { text: string; left: number; right: number; width: number; height: number } | null;
+  /** The window's height, which the main heading must fit inside. */
+  viewportHeight: number;
+  heading: {
+    text: string;
+    left: number;
+    right: number;
+    top: number;
+    bottom: number;
+    width: number;
+    height: number;
+    /** Neither hidden nor fully transparent, itself or through an ancestor. */
+    visible: boolean;
+  } | null;
   /** Each linked stylesheet and its rule count, or null when it did not load. */
   stylesheets: { href: string; rules: number | null }[];
   scripts: string[];
@@ -22,6 +34,7 @@ export interface Focus {
   tag: string;
   outlineStyle: string;
   outlineWidth: string;
+  outlineColor: string;
   boxShadow: string;
 }
 
@@ -62,6 +75,14 @@ export function measure(): Measure {
   const heading = document.querySelector('h1');
   const box = heading?.getBoundingClientRect();
   const root = document.scrollingElement ?? document.documentElement;
+  // Chromium's checkVisibility also sees an ancestor's opacity; jsdom lacks it, and its own style is what it has.
+  const visible = (element: Element) => {
+    if (typeof element.checkVisibility === 'function') {
+      return element.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+    }
+    const style = getComputedStyle(element);
+    return style.visibility !== 'hidden' && style.opacity !== '0';
+  };
   const sheetRules = (link: HTMLLinkElement) => {
     try {
       return link.sheet ? link.sheet.cssRules.length : null;
@@ -74,10 +95,20 @@ export function measure(): Measure {
     release: document.querySelector('meta[name="zachverse-release"]')?.getAttribute('content') ?? null,
     scrollWidth: root.scrollWidth,
     clientWidth: root.clientWidth,
+    viewportHeight: window.innerHeight,
     heading:
       heading && box
-        ? // An element's textContent is never null.
-          { text: heading.textContent!.trim(), left: box.left, right: box.right, width: box.width, height: box.height }
+        ? {
+            // An element's textContent is never null.
+            text: heading.textContent!.trim(),
+            left: box.left,
+            right: box.right,
+            top: box.top,
+            bottom: box.bottom,
+            width: box.width,
+            height: box.height,
+            visible: visible(heading),
+          }
         : null,
     stylesheets: [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')].map((link) => ({
       href: link.href,
@@ -96,6 +127,7 @@ export function measureFocus(): Focus | null {
     tag: element.tagName.toLowerCase(),
     outlineStyle: style.outlineStyle,
     outlineWidth: style.outlineWidth,
+    outlineColor: style.outlineColor,
     boxShadow: style.boxShadow,
   };
 }
@@ -104,10 +136,13 @@ export function measureFocus(): Focus | null {
 export function pageProblems(report: PageReport, expected: { status: number; release: string | null }): string[] {
   const found: string[] = [];
   if (report.status !== expected.status) found.push(`status ${report.status}, not ${expected.status}`);
-  // A 404 page's own response is the one failure its browser should see, and Chromium also logs it as an error.
+  // A 404 page's own response is the one failure its browser should see, and Chromium logs it as an error too: that one
+  // message, at the page's own URL, and no other.
   const ownFailure = (url: string) => expected.status === 404 && url === report.url;
+  const ownFailureLogged = ({ text, url }: { text: string; url: string }) =>
+    ownFailure(url) && text.startsWith('Failed to load resource: the server responded with a status of 404');
   found.push(...report.pageErrors.map((error) => `a script threw: ${error}`));
-  found.push(...report.consoleErrors.filter(({ url }) => !ownFailure(url)).map(({ text }) => `console error: ${text}`));
+  found.push(...report.consoleErrors.filter((error) => !ownFailureLogged(error)).map(({ text }) => `console error: ${text}`));
   found.push(...report.failedRequests.map((request) => `a request failed: ${request}`));
   found.push(
     ...report.responses
@@ -128,7 +163,14 @@ export function pageProblems(report: PageReport, expected: { status: number; rel
   const { heading } = page;
   if (heading === null || heading.text === '' || heading.width === 0 || heading.height === 0) {
     found.push('the page shows no main heading');
-  } else if (heading.left < 0 || heading.right > page.clientWidth) {
+  } else if (!heading.visible) {
+    found.push('the main heading is hidden, or fully transparent');
+  } else if (
+    heading.left < 0 ||
+    heading.right > page.clientWidth ||
+    heading.top < 0 ||
+    heading.bottom > page.viewportHeight
+  ) {
     found.push('the main heading runs off the screen');
   }
   if (page.release !== expected.release) {
@@ -137,11 +179,19 @@ export function pageProblems(report: PageReport, expected: { status: number; rel
   return found;
 }
 
+// A computed colour that shows nothing: Chromium writes a fully transparent one as rgba(r, g, b, 0).
+const TRANSPARENT = /^(?:transparent|rgba\([^)]*,\s*0(?:\.0+)?\))$/;
+
 /** Problems with where a Tab press put the focus: it must land on an element that shows it has the focus. */
 export function focusProblems(focus: Focus | null | undefined): string[] {
   if (!focus) return ['a Tab press focused nothing'];
-  const outlined = focus.outlineStyle !== 'none' && focus.outlineWidth !== '0px';
-  return outlined || focus.boxShadow !== 'none' ? [] : [`the focused <${focus.tag}> shows no focus indicator`];
+  const outlined =
+    focus.outlineStyle !== 'none' && focus.outlineWidth !== '0px' && !TRANSPARENT.test(focus.outlineColor);
+  // A shadow whose colours are all transparent shows nothing; one in a colour syntax this cannot read gets the benefit.
+  const colours = focus.boxShadow.match(/rgba?\([^)]*\)/g) ?? [];
+  const shadowed =
+    focus.boxShadow !== 'none' && !(colours.length > 0 && colours.every((colour) => TRANSPARENT.test(colour)));
+  return outlined || shadowed ? [] : [`the focused <${focus.tag}> shows no focus indicator`];
 }
 
 /** Checks the home page at a phone's width and a desktop's, its keyboard focus, and the 404 page. */
@@ -208,6 +258,9 @@ export async function serve(dir: string): Promise<{ origin: string; close: () =>
   };
 }
 
+/** How long a page is watched after its network goes quiet, before it is measured. */
+export const SETTLE_MS = 2000;
+
 /** Loads url in its own browser context, collecting what failed, and measures the page; with tab, also the focus. */
 export async function open(browser: Browser, url: string, width: number, tab: boolean): Promise<PageReport> {
   const context = await browser.newContext({ viewport: { width, height: 800 } });
@@ -226,8 +279,10 @@ export async function open(browser: Browser, url: string, width: number, tab: bo
     });
     page.on('requestfailed', (request) => report.failedRequests.push(`${request.url()} (${request.failure()?.errorText})`));
     page.on('response', (response) => report.responses.push({ url: response.url(), status: response.status() }));
-    // Waits until the network has been idle for half a second, so scripts and stylesheets have loaded and run.
+    // Waits until the network has been idle for half a second, so scripts and stylesheets have loaded and run, then a
+    // little longer, for errors a script reports late.
     const response = await page.goto(url, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(SETTLE_MS);
     const measured = await page.evaluate(measure);
     let focus;
     if (tab) {

@@ -1,13 +1,14 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, posix, relative } from 'node:path';
+import { isAbsolute, join, posix, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { resolveConfig } from 'vite';
 import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
-import { RECORDS } from '../scripts/release-lib.ts';
+import { ASSETS, RECORDS } from '../scripts/release-lib.ts';
 import { site } from '../src/content.ts';
 import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
 
@@ -80,18 +81,29 @@ const ci = workflows.find(({ file }) => /^ci\.ya?ml$/.test(file))?.workflow;
 const deploy = workflows.find(({ file }) => /^deploy\.ya?ml$/.test(file))?.workflow;
 const restoreWorkflow = workflows.find(({ file }) => /^restore\.ya?ml$/.test(file))?.workflow;
 
-// The checks CI's web job runs, which the deploy workflow also runs before it uploads the site.
-const WEB_STEPS = [
+// The checks CI's web job runs, which the deploy workflow's build job runs too: these before it uploads the site, and
+// the browser check after, since Playwright downloads Chromium checking nothing but its size (ADR 0006).
+const WEB_CHECKS = [
   'actions/checkout',
   'actions/setup-node',
   'npm ci',
   'npm run typecheck',
   'npm run test:coverage',
   'npm run build',
-  'npx playwright install --with-deps --only-shell chromium',
-  'npm run check:browser',
   'npm run check:dist',
 ];
+const BROWSER_CHECK = ['npx playwright install --with-deps --only-shell chromium', 'npm run check:browser'];
+const WEB_STEPS = [...WEB_CHECKS, ...BROWSER_CHECK];
+
+// The browser job's install, retried: the release it checks is already live, and a failed install would roll it back.
+const INSTALL_RETRIED = [
+  'for attempt in 1 2 3; do',
+  '  npx playwright install --with-deps --only-shell chromium && exit 0',
+  '  echo "::warning::Installing Chromium failed (attempt $attempt of 3)."',
+  '  if [ "$attempt" -lt 3 ]; then sleep 30; fi',
+  'done',
+  'exit 1',
+].join('\n');
 
 // GitHub resolves action names case-insensitively.
 const actionName = (uses = '') => uses.split('@')[0]!.toLowerCase();
@@ -928,11 +940,11 @@ describe('Deploy workflow', () => {
     expect(groups.map(mayJoinDeployGroup)).toEqual([true, true, true, true, true, true, true, false, false, true]);
   });
 
-  it('stops any ref but main, then builds and checks the site as CI does, in a browser too, before uploading it', () => {
+  it('stops any ref but main, then builds and checks the site as CI does, and in a browser once it is uploaded', () => {
     // The production environment and the role's trust also refuse other refs; this stops them before the build.
     const [first] = build?.steps ?? [];
     expect(first?.run).toMatch(MAIN_ONLY);
-    expectRequiredSteps(deploy, 'deploy.yml', 'build', [...WEB_STEPS, 'actions/upload-artifact']);
+    expectRequiredSteps(deploy, 'deploy.yml', 'build', [...WEB_CHECKS, 'actions/upload-artifact', ...BROWSER_CHECK]);
     expect(plan(deploy, 'build').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
     // No environment, so no AWS access or variables, and no dependency cache.
     expect(build?.environment).toBeUndefined();
@@ -942,8 +954,8 @@ describe('Deploy workflow', () => {
     const named = (build?.steps ?? []).filter((step) => envOf(step).RELEASE_COMMIT !== undefined);
     expect(named.map((step) => [step.run?.trim(), envOf(step).RELEASE_COMMIT])).toEqual([
       ['npm run build', '${{ github.sha }}'],
-      ['npm run check:browser', '${{ github.sha }}'],
       ['npm run check:dist', '${{ github.sha }}'],
+      ['npm run check:browser', '${{ github.sha }}'],
     ]);
   });
 
@@ -1015,8 +1027,10 @@ describe('Deploy workflow', () => {
       'run', // the browser
       'node scripts/browser-check.ts live',
     ]);
-    expect(plan(deploy, 'browser').slice(2, 4)).toEqual(['npm ci', 'npx playwright install --with-deps --only-shell chromium']);
+    expect(plan(deploy, 'browser').slice(2, 4)).toEqual(['npm ci', INSTALL_RETRIED]);
     expect(conditional(browser?.steps ?? [])).toEqual([]);
+    // Nothing it produces reaches the role jobs but its result.
+    expect(browser?.outputs).toBeUndefined();
     const [setup] = positions(browser?.steps ?? [], 'actions/setup-node').map((index) => browser!.steps![index]);
     expect(setup?.with).toEqual({ 'node-version-file': '.nvmrc', 'package-manager-cache': false });
     // It checks the site at its own hostname, connected to the distribution the deploy job published to, and the
@@ -1107,6 +1121,86 @@ describe('Deploy workflow', () => {
   });
 });
 
+describe('Jobs with the deploy role', () => {
+  const roleJobs = [
+    {
+      where: 'deploy.yml deploy',
+      job: deploy?.jobs.deploy,
+      env: {
+        ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
+        ROLE_ARN: '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
+        BUCKET: '${{ vars.SITE_BUCKET }}',
+        DISTRIBUTION_ID: '${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}',
+        DIGEST: '${{ needs.build.outputs.digest }}',
+      },
+      reads: ['${{ needs.build.outputs.digest }}', '${{ inputs.resume }}'],
+    },
+    {
+      where: 'deploy.yml verify',
+      job: deploy?.jobs.verify,
+      env: {
+        ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
+        ROLE_ARN: '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
+        BUCKET: '${{ vars.SITE_BUCKET }}',
+        DISTRIBUTION_ID: '${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}',
+      },
+      reads: [],
+    },
+    {
+      where: 'restore.yml restore',
+      job: restoreWorkflow?.jobs.restore,
+      env: {
+        ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
+        ROLE_ARN: '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
+        BUCKET: '${{ vars.SITE_BUCKET }}',
+        DISTRIBUTION_ID: '${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}',
+        RELEASE: '${{ inputs.release }}',
+      },
+      reads: ['${{ inputs.release }}'],
+    },
+  ];
+
+  it('set their variables once, at the job, and no step sets one again', () => {
+    for (const { where, job, env } of roleJobs) {
+      expect(job?.env, where).toEqual(env);
+      const again = (job?.steps ?? []).flatMap((step) => Object.keys(envOf(step)).filter((name) => name in env));
+      expect(again, where).toEqual([]);
+    }
+  });
+
+  // A job that runs packages, such as the browser job, could put anything in an output, and an input is whatever was
+  // typed. A job with the role takes only the build's digest, which it checks the download against, and its own input.
+  it("read no job's outputs and no input but their own, and other jobs only for their results", () => {
+    for (const { where, job, reads } of roleJobs) {
+      const unexpected = strings(job)
+        .flatMap(expressions)
+        .map((expression) => {
+          let rest = expression;
+          for (const read of reads) rest = rest.split(read).join('');
+          // GitHub reads context names in any case.
+          return rest.replace(/\bneeds\.[\w-]+\.result\b/gi, '');
+        })
+        .filter((rest) => /\b(?:needs|inputs)\b|\bgithub\s*(?:\.\s*event\b|\[)/i.test(rest));
+      expect(unexpected, where).toEqual([]);
+    }
+  });
+});
+
+describe('Browser downloads', () => {
+  // Playwright downloads Chromium from wherever these say, checking nothing but its size, and a proxy sees every request.
+  it('are never redirected: no workflow sets a Playwright or proxy variable', () => {
+    const named = /^(?:playwright_\w+|(?:https?|all|no|ftp)_proxy)$/i;
+    const assigned = /\b(?:playwright_\w+|(?:https?|all|no|ftp)_proxy)\s*=/i;
+    for (const { file, workflow } of workflows) {
+      const envs = [workflow.env, ...Object.values(workflow.jobs ?? {}).flatMap((job) => [job.env, ...(job.steps ?? []).map((step) => step.env)])];
+      const names = envs.flatMap((env) => (env && typeof env === 'object' ? Object.keys(env) : []));
+      expect(names.filter((name) => named.test(name)), file).toEqual([]);
+      const scripts = Object.values(workflow.jobs ?? {}).flatMap((job) => (job.steps ?? []).map((step) => step.run ?? ''));
+      expect(scripts.filter((run) => assigned.test(run)), file).toEqual([]);
+    }
+  });
+});
+
 describe('Restore workflow', () => {
   const test = restoreWorkflow?.jobs.test;
   const job = restoreWorkflow?.jobs.restore;
@@ -1178,25 +1272,40 @@ describe('Release and smoke-test scripts', () => {
     expect(read('infra/lib/site-stack.ts')).toContain(`export const RELEASE_RECORDS = '${RECORDS}';`);
   });
 
+  it("keep the assets under the prefix whose objects the deploy role's policy keeps it from deleting", () => {
+    // A release deletes the pages it lacks but never an asset, which an earlier page may still load (ADR 0006).
+    expect(read('infra/lib/site-stack.ts')).toContain(`this.bucket.arnForObjects('${ASSETS}*')`);
+  });
+
+  it('check the site at the hostnames the distribution serves', () => {
+    // The smoke test and the browser check reach site.origin; infra/lib/config.ts gives the distribution its aliases.
+    const host = new URL(site.origin).host;
+    const config = read('infra/lib/config.ts');
+    expect(config).toContain(`domainName: '${host}',`);
+    expect(config).toContain(`wwwDomainName: 'www.${host}',`);
+  });
+
+  // The deploy and restore jobs run them with the deploy role and install no packages: an import of a package would
+  // fail there, and installing one would run its code beside the role's credentials. tsconfig.release.json gives tsc
+  // the two entry points, with Node's types and no DOM, and tsc follows every import it can see: re-exports, type-only
+  // imports, and dynamic ones with a literal specifier.
+  const roleScripts = () => {
+    const repo = fileURLToPath(root);
+    const loaded = tsc(['-p', 'tsconfig.release.json', '--listFilesOnly'])
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((file) => relative(repo, file).split(sep).join('/'));
+    const libs = /^node_modules\/(?:@types\/node|undici-types|typescript\/lib|@typescript\/typescript-[\w-]+\/lib)\//;
+    return {
+      packages: loaded.filter((file) => file.startsWith('node_modules/') && !libs.test(file)),
+      own: loaded.filter((file) => !file.startsWith('node_modules/')).sort(),
+    };
+  };
+
   it("import only Node's built-in modules and the repository's own files", () => {
-    // The deploy and restore jobs run them with the deploy role and install no packages: an import of a package would
-    // fail there, and installing one would run its code beside the role's credentials.
-    const seen = new Set<string>();
-    const queue = ['scripts/release.ts', 'scripts/smoke.ts'];
-    const packages: string[] = [];
-    while (queue.length > 0) {
-      const file = queue.shift()!;
-      if (seen.has(file)) continue;
-      seen.add(file);
-      // Type-only imports are erased before Node runs the file.
-      for (const [, specifier] of read(file).matchAll(/^import\s+(?!type\s)[^'"]*['"]([^'"]+)['"]/gm)) {
-        if (specifier!.startsWith('.')) queue.push(posix.normalize(posix.join(posix.dirname(file), specifier!)));
-        else if (!specifier!.startsWith('node:')) packages.push(`${file}: ${specifier}`);
-      }
-    }
+    const { packages, own } = roleScripts();
     expect(packages).toEqual([]);
-    // The walk reached every module the two entries load.
-    expect([...seen].sort()).toEqual([
+    expect(own).toEqual([
       'scripts/release-aws.ts',
       'scripts/release-github.ts',
       'scripts/release-lib.ts',
@@ -1206,6 +1315,28 @@ describe('Release and smoke-test scripts', () => {
       'scripts/smoke.ts',
       'src/content.ts',
     ]);
+    // What tsc cannot follow: require, createRequire, and an import whose specifier is computed.
+    const unfollowed = /\brequire\s*\(|\bcreateRequire\b|\bimport\s*\(\s*(?!['"])/;
+    expect(own.filter((file) => unfollowed.test(read(file)))).toEqual([]);
+  });
+
+  it('load under plain Node where no package can be found, as the jobs with the role run them', () => {
+    // Their tests import them under Vitest, beside the installed packages, so this is the first plain load short of a
+    // job that holds the role.
+    const dir = mkdtempSync(join(tmpdir(), 'role-scripts-'));
+    try {
+      for (const file of roleScripts().own) cpSync(fileURLToPath(new URL(file, root)), join(dir, file));
+      for (const entry of ['release', 'smoke']) {
+        const env = { PATH: process.env.PATH ?? '', SystemRoot: process.env.SystemRoot ?? '' };
+        const result = spawnSync(process.execPath, [join(dir, 'scripts', `${entry}.ts`)], { encoding: 'utf8', env });
+        expect({ status: result.status, stderr: result.stderr.trim() }, entry).toEqual({
+          status: 1,
+          stderr: expect.stringMatching(new RegExp(`^::error::Usage: node scripts/${entry}\\.ts `)),
+        });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
