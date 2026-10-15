@@ -3,19 +3,15 @@ import { App } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
 import { SiteStack } from '../lib/site-stack';
-import type { CfnTemplate } from './support/synth';
-import {
-  cdkContext,
-  PRICING_MODES,
-  productionConfig,
-  synthesizeSite,
-  TEST_CERTIFICATE_ARN,
-  TEST_WEB_ACL_ARN,
-} from './support/synth';
+import type { CfnTemplate } from '../lib/guardrails/template';
+import { cdkContext, PRICING_MODES, productionConfig, synthesizeSite, TEST_WEB_ACL_ARN } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
 
+// The certificate for both hostnames, requested out of band on 2026-10-13 (ADR 0002) and validated by
+// infra/dns/2026-10-13-acm-validation.json.
+const CERTIFICATE_ARN = 'arn:aws:acm:us-east-1:426499248998:certificate/f285dc12-6f64-4d9b-8309-043d5e90f354';
 const DISTRIBUTION = 'SiteDistribution3FF9535D';
 const BUCKET = 'SiteBucket397A1860';
 const BUCKET_POLICY = 'SiteBucketPolicy3AC1D0F8';
@@ -173,7 +169,7 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
     const config = distributionConfig();
     expect(config.Aliases).toEqual(['zachdavids.com', 'www.zachdavids.com']);
     expect(config.ViewerCertificate).toEqual({
-      AcmCertificateArn: productionConfig().certificateArn,
+      AcmCertificateArn: CERTIFICATE_ARN,
       MinimumProtocolVersion: 'TLSv1.2_2021',
       SslSupportMethod: 'sni-only',
     });
@@ -217,6 +213,11 @@ describe('site stack (pay-as-you-go)', () => {
   it('has no web ACL or pricing-plan subscription before the plan is enabled', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
     template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
+  });
+
+  // Milestone 7 enables the plan for production (ADR 0003), in a reviewed change to this test.
+  it('is what production deploys until then', () => {
+    expect(productionConfig()).toEqual(PRICING_MODES['pay-as-you-go']);
   });
 
   it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
@@ -279,8 +280,8 @@ const error = (message: unknown) => expect.objectContaining({ message });
 const ANY_ID = 'abcdef01-2345-4789-8bcd-ef0123456789';
 
 describe('site stack configuration errors', () => {
-  // The site stack's template, with cdk.json's context. It builds the stack itself: createStacks leaves it out until
-  // certificateArn is set.
+  // The site stack's template, with cdk.json's context. It builds the stack on its own: these errors come from the
+  // site stack itself, in any app.
   const synthesizeWith = (certificateArn: string | undefined) => () => {
     const config = productionConfig({ certificateArn });
     const env = { account: config.account, region: config.region };
@@ -299,15 +300,15 @@ describe('site stack configuration errors', () => {
     );
   });
 
-  // Each ARN changes one part of TEST_CERTIFICATE_ARN, which every other test synthesizes successfully.
+  // Each ARN changes one part of CERTIFICATE_ARN, which every other test synthesizes successfully.
   it.each([
-    ['another partition', TEST_CERTIFICATE_ARN.replace('arn:aws:', 'arn:aws-cn:')],
-    ['another service', TEST_CERTIFICATE_ARN.replace(':acm:', ':acm-pca:')],
-    ['another ACM resource type', TEST_CERTIFICATE_ARN.replace(':certificate/', ':certificate-authority/')],
-    ['another Region', TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:')],
-    ['another account', TEST_CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:')],
+    ['another partition', CERTIFICATE_ARN.replace('arn:aws:', 'arn:aws-cn:')],
+    ['another service', CERTIFICATE_ARN.replace(':acm:', ':acm-pca:')],
+    ['another ACM resource type', CERTIFICATE_ARN.replace(':certificate/', ':certificate-authority/')],
+    ['another Region', CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:')],
+    ['another account', CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:')],
   ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
-    expect(certificateArn).not.toBe(TEST_CERTIFICATE_ARN);
+    expect(certificateArn).not.toBe(CERTIFICATE_ARN);
     expect(synthesizeWith(certificateArn)).toThrow(
       error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
     );
@@ -315,25 +316,25 @@ describe('site stack configuration errors', () => {
 
   // Paste errors that CloudFront would otherwise reject only at deploy time.
   it.each([
-    ['no certificate ID', TEST_CERTIFICATE_ARN.replace(/\/.*$/, '')],
-    ['an empty certificate ID', TEST_CERTIFICATE_ARN.replace(/\/.*$/, '/')],
-    ['a truncated certificate ID', TEST_CERTIFICATE_ARN.slice(0, -1)],
-    ['a trailing newline', `${TEST_CERTIFICATE_ARN}\n`],
-    ['an extra path segment', `${TEST_CERTIFICATE_ARN}/extra`],
-    ['the ARN pasted twice', TEST_CERTIFICATE_ARN.repeat(2)],
-    ['a letter that is not hex in the certificate ID', TEST_CERTIFICATE_ARN.replace(/0{8}-/, '0000000o-')],
-    ['an uppercase certificate ID', TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID.toUpperCase())],
-    ['a misplaced dash in the certificate ID', TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
+    ['no certificate ID', CERTIFICATE_ARN.replace(/\/.*$/, '')],
+    ['an empty certificate ID', CERTIFICATE_ARN.replace(/\/.*$/, '/')],
+    ['a truncated certificate ID', CERTIFICATE_ARN.slice(0, -1)],
+    ['a trailing newline', `${CERTIFICATE_ARN}\n`],
+    ['an extra path segment', `${CERTIFICATE_ARN}/extra`],
+    ['the ARN pasted twice', CERTIFICATE_ARN.repeat(2)],
+    ['a letter that is not hex in the certificate ID', CERTIFICATE_ARN.replace(/\/[0-9a-f]/, '/o')],
+    ['an uppercase certificate ID', CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID.toUpperCase())],
+    ['a misplaced dash in the certificate ID', CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, '0000000-00000-0000-0000-000000000000')],
   ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
-    expect(certificateArn).not.toBe(TEST_CERTIFICATE_ARN);
+    expect(certificateArn).not.toBe(CERTIFICATE_ARN);
     expect(synthesizeWith(certificateArn)).toThrow(
       error(`certificateArn must end in the certificate ID (a UUID): ${certificateArn}`),
     );
   });
 
   it.each([
-    ['a colon before the certificate ID', TEST_CERTIFICATE_ARN.replace(':certificate/', ':certificate:')],
-    ['a slash before the resource type', TEST_CERTIFICATE_ARN.replace(':certificate/', ':/certificate/')],
+    ['a colon before the certificate ID', CERTIFICATE_ARN.replace(':certificate/', ':certificate:')],
+    ['a slash before the resource type', CERTIFICATE_ARN.replace(':certificate/', ':/certificate/')],
   ])('rejects a certificate ARN with %s', (_case, certificateArn) => {
     expect(synthesizeWith(certificateArn)).toThrow(
       error(`certificateArn must have the form arn:aws:acm:us-east-1:<account>:certificate/<ID>: ${certificateArn}`),
@@ -341,7 +342,7 @@ describe('site stack configuration errors', () => {
   });
 
   it('accepts a certificate ID with any lowercase hex digit', () => {
-    const certificateArn = TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID);
+    const certificateArn = CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID);
     const json = synthesizeWith(certificateArn)();
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.ViewerCertificate.AcmCertificateArn).toBe(certificateArn);
   });
@@ -355,14 +356,14 @@ describe('site stack configuration errors', () => {
   });
 
   it('checks ownership against the configured account', () => {
-    const otherAccount = productionConfig({ account: '111111111111', certificateArn: TEST_CERTIFICATE_ARN });
+    const otherAccount = productionConfig({ account: '111111111111', certificateArn: CERTIFICATE_ARN });
     expect(() => synthesizeSite(otherAccount)).toThrow(
-      error(`certificateArn must be an ACM certificate in us-east-1 owned by 111111111111: ${TEST_CERTIFICATE_ARN}`),
+      error(`certificateArn must be an ACM certificate in us-east-1 owned by 111111111111: ${CERTIFICATE_ARN}`),
     );
   });
 
   it('requires a us-east-1 certificate even when the stack targets another Region', () => {
-    const certificateArn = TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
+    const certificateArn = CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
     expect(() => synthesizeSite(productionConfig({ region: 'us-east-2', certificateArn }))).toThrow(
       error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
     );
@@ -439,7 +440,7 @@ describe('web ACL configuration errors', () => {
   it('checks ownership against the configured account', () => {
     const otherAccount = productionConfig({
       account: '111111111111',
-      certificateArn: TEST_CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:'),
+      certificateArn: CERTIFICATE_ARN.replace(':426499248998:', ':111111111111:'),
       pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN },
     });
     expect(() => synthesizeSite(otherAccount)).toThrow(

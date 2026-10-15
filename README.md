@@ -10,7 +10,7 @@ Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) 
 | `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML |
 | `scripts/` | Prerender step and post-build output check |
 | `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows and CI steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
-| `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and synthesized-template checks |
+| `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and the template guardrails (`infra/lib/guardrails/`), which run in every synthesis and in the tests |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
 | `docs/` | Architecture decisions (`docs/adr/`) and milestone status (`docs/progress.md`) |
 | `docs/org-policy/` | The SCP change behind ADR 0002's us-east-1 decision: backup, the policies as applied, a comparison script, and apply, verify, and rollback steps |
@@ -36,6 +36,6 @@ npm run test:coverage  # the same, with the 100% coverage gate CI enforces
 npm run cdk -- diff  # the CDK CLI typechecks and runs the tests before every synth, diff, and deploy (cdk.json "build")
 ```
 
-Until milestone 4 sets `certificateArn` in `infra/lib/config.ts`, the app leaves out the site stack and says why on stderr, so `cdk synth`, `diff`, and `deploy` cover only `ZachverseIdentity` (ADR 0004). A `certificateArn` set to an invalid ARN fails synthesis (an empty string counts as unset). The tests check the site stack with a placeholder certificate meanwhile. The CDK bootstrap (`npm run bootstrap` in `infra/`) changes the account and was already run; ADR 0004's runbook covers it.
+The app always synthesizes both stacks, `ZachverseIdentity` and `ZachverseSite`. `certificateArn` in `infra/lib/config.ts` names the site certificate (ADR 0002), and an empty or malformed one fails synthesis. Every synthesis also runs the template guardrails as a CDK validation plugin, and `bin/zachverse.ts` makes any violation fail the synthesis, so every CLI command that synthesizes the app fails on one, even with `--build ''` (which skips only the typecheck and the tests) or `--ignore-errors`. Changed code, or an assembly synthesized earlier and passed with `--app` (or `CDK_APP`), still gets past them (ADR 0003, "Limits"). The CDK bootstrap (`npm run bootstrap` in `infra/`) changes the account and was already run; ADR 0004's runbook covers it.
 
 Both packages' `.npmrc` files stop dependencies' install scripts from running and stop `npx` from downloading packages that aren't installed. To run one package's install script deliberately, use `npm rebuild <package> --ignore-scripts=false`.

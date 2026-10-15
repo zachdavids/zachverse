@@ -1,10 +1,8 @@
 // Guardrail checks over synthesized CloudFormation templates. Each returns a
 // list of human-readable violations (empty = pass), so the same functions can
 // be pointed at deliberately bad templates to prove they detect problems.
-import { ACM_VALIDATION_NAME } from './dns-batch';
-import type { CfnResource, CfnTemplate } from './synth';
-
-type Json = any;
+// ./plugin.ts runs them in every synthesis of the app; the tests also call them directly.
+import type { CfnResource, CfnTemplate, Json } from './template';
 
 const asArray = <T>(value: T | T[] | undefined): T[] =>
   value === undefined ? [] : Array.isArray(value) ? value : [value];
@@ -101,6 +99,9 @@ export function retentionViolations(template: CfnTemplate): string[] {
 // ---------------------------------------------------------------------------
 // Route 53 write permissions
 // ---------------------------------------------------------------------------
+
+/** An ACM DNS validation record name for the site's hostnames: _<32 hex digits> on the apex or www, normalized. */
+export const ACM_VALIDATION_NAME = /^_[0-9a-f]{32}\.(?:www\.)?zachdavids\.com$/;
 
 export interface DnsWriteAllowance {
   hostedZoneId: string;
@@ -449,11 +450,20 @@ export function deployRoleViolations(
   roleName: string,
   allowedActions: ReadonlySet<string>,
 ): string[] {
-  const out: string[] = [];
+  return deployRoleViolationsByTemplate(templates, roleName, allowedActions).flat();
+}
+
+/** deployRoleViolations, with the violations found in each template listed apart, in the order of the templates. */
+export function deployRoleViolationsByTemplate(
+  templates: CfnTemplate[],
+  roleName: string,
+  allowedActions: ReadonlySet<string>,
+): string[][] {
   // Role names are unique regardless of case, so IAM finds the role by its name in any case.
   const isRoleName = (name: string) => name.toLowerCase() === roleName.toLowerCase();
 
-  for (const template of templates) {
+  return templates.map((template) => {
+    const out: string[] = [];
     const checkDocument = (where: string, document: Json) => {
       // A document wrapped in Fn::If, or given as a JSON string, has no readable Statement.
       if (document?.Statement === undefined) {
@@ -515,8 +525,8 @@ export function deployRoleViolations(
       }
       if (roles.some((r) => isDeployRole(r))) checkDocument(id, props?.PolicyDocument);
     }
-  }
-  return out;
+    return out;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -764,5 +774,32 @@ function statementViolations(node: Json): string[] {
     }
     out.push(...statementViolations(value));
   }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Stack environment
+// ---------------------------------------------------------------------------
+
+/** Where a stack deploys, which the manifest records rather than the template; a CDK Stack has these properties. */
+export interface StackEnvironment {
+  readonly account: string;
+  readonly region: string;
+  readonly terminationProtection: boolean;
+}
+
+// The Website account and us-east-1 (ADR 0002); never the Management or Identity Delegated Admin accounts.
+const WEBSITE_ACCOUNT = '426499248998';
+const WEBSITE_REGION = 'us-east-1';
+
+/**
+ * Every stack must deploy to the Website account in us-east-1, with termination protection. A stack without an
+ * environment has tokens for its account and Region, and deploys wherever the CLI's credentials point.
+ */
+export function environmentViolations(stack: StackEnvironment): string[] {
+  const out: string[] = [];
+  if (stack.account !== WEBSITE_ACCOUNT) out.push(`account must be ${WEBSITE_ACCOUNT}, the Website account, not ${stack.account}`);
+  if (stack.region !== WEBSITE_REGION) out.push(`Region must be ${WEBSITE_REGION}, not ${stack.region}`);
+  if (!stack.terminationProtection) out.push('termination protection must be on');
   return out;
 }

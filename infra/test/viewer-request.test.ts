@@ -265,7 +265,9 @@ describe.each(handlers)('%s', (_name, handler) => {
       ['an empty value as a bare name', { flag: { value: '' } }, '?flag'],
       ['every value of a repeated name', { tag: { value: 'a', multiValue: [{ value: 'a' }, { value: '' }, { value: 'b' }] } }, '?tag=a&tag&tag=b'],
       [
-        'several names in order',
+        // In the order of CloudFront's querystring object, which on the deployed function was not always the
+        // request's (ADR 0003, "Limits").
+        'several names in the order CloudFront lists them',
         { utm_source: { value: 'x' }, flag: { value: '' }, tag: { value: 'a', multiValue: [{ value: 'a' }, { value: 'b' }] } },
         '?utm_source=x&flag&tag=a&tag=b',
       ],
@@ -274,8 +276,9 @@ describe.each(handlers)('%s', (_name, handler) => {
       expect(response.headers.location.value).toBe(`https://zachdavids.com/notes/${search}`);
     });
 
-    // Assumes CloudFront passes the path and query through percent-encoded, as the
-    // viewer sent them; re-encoding or decoding them would corrupt the redirect.
+    // CloudFront passes the path and query through percent-encoded, as the viewer sent
+    // them (checked on the deployed distribution on 2026-10-14); re-encoding or decoding
+    // them would corrupt the redirect.
     it('copies an encoded path and query into the location verbatim', () => {
       const querystring = { q: { value: 'a%20b%26c%3Dd' }, 'k%5B0%5D': { value: '1' } };
       const response = handler(viewerRequest('/caf%C3%A9/50%25%20off', 'www.zachdavids.com', querystring));

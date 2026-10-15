@@ -9,7 +9,7 @@ import {
   prohibitedResourceViolations,
   retentionViolations,
   WEBSITE_DEPLOY_ACTIONS,
-} from './support/checks';
+} from '../lib/guardrails/checks';
 import { PRICING_MODES, productionConfig, synthesizeAll } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.

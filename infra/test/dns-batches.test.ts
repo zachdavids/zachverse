@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -16,10 +16,27 @@ const validation = {
     ResourceRecords: [{ Value: '_fedcba9876543210fedcba9876543210.xlfgrmvvlj.acm-validations.aws.' }],
   },
 };
+const KEEP_VALIDATION = 'ACM validation records may not be deleted: ACM renews a certificate for these names only while they resolve';
+// The site certificate's validation records (name, value) as 2026-10-13-acm-validation.json commits them. Spelled out
+// here, so that changing that batch fails a test.
+const SITE_CERTIFICATE_RECORDS: [string, string][] = [
+  ['_b40f1ffc2ab3868060f332c640e2a09d.zachdavids.com', '_5f63bd73e2b7c7642a7cd21db702f0c0.wzccmgtwzk.acm-validations.aws'],
+  ['_895a096eaa6d6a29533d586c1c17504c.www.zachdavids.com', '_80eb6249f8a344f353cb6d193b5f9bd7.wzccmgtwzk.acm-validations.aws'],
+];
 
 describe('committed DNS change batches', () => {
   it('only touch website routing or ACM validation records', () => {
     expect(batchDirectoryViolations(DNS_DIR)).toEqual([]);
+  });
+
+  it("include the site certificate's validation batch, which passes, and no batch could undo it", () => {
+    const batch = JSON.parse(readFileSync(path.join(DNS_DIR, '2026-10-13-acm-validation.json'), 'utf8'));
+    expect(dnsBatchViolations(batch)).toEqual([]);
+    const reverse = { Changes: batch.Changes.map((change: object) => ({ ...change, Action: 'DELETE' })) };
+    expect(dnsBatchViolations(reverse)).toEqual([
+      `change 0 (DELETE CNAME _b40f1ffc2ab3868060f332c640e2a09d.zachdavids.com): ${KEEP_VALIDATION}`,
+      `change 1 (DELETE CNAME _895a096eaa6d6a29533d586c1c17504c.www.zachdavids.com): ${KEEP_VALIDATION}`,
+    ]);
   });
 });
 
@@ -169,6 +186,43 @@ describe('dnsBatchViolations', () => {
       ]);
     },
   );
+
+  // ACM renews a certificate only while its validation records resolve, so no batch may delete one, with no exception.
+  it.each([
+    ['on the apex', `${VALIDATION_NAME}.`],
+    ['on www', `${WWW_VALIDATION_NAME}.`],
+    ['named in upper case without the trailing dot', VALIDATION_NAME.toUpperCase()],
+  ])('rejects deleting an ACM validation record %s', (_case, name) => {
+    const change = withRecordSet({ ...validation, Action: 'DELETE' }, { Name: name });
+    expect(dnsBatchViolations({ Changes: [change] })).toEqual([
+      `change 0 (DELETE CNAME ${name.toLowerCase().replace(/\.$/, '')}): ${KEEP_VALIDATION}`,
+    ]);
+  });
+
+  // ACM renews the site certificate only while its validation names resolve to the values ACM gave them.
+  it.each(SITE_CERTIFICATE_RECORDS.flatMap(([name, value]) => ['CREATE', 'UPSERT'].map((action) => [action, name, value])))(
+    "rejects %s of the site certificate's validation record %s with another value",
+    (action, name, value) => {
+      const change = withRecordSet({ ...validation, Action: action }, { Name: `${name}.` });
+      const violation = `change 0 (${action} CNAME ${name}): the site certificate validates through this record, so its value must stay ${value}`;
+      expect(dnsBatchViolations({ Changes: [change] })).toEqual([violation]);
+      // The whole value is compared, not only its token.
+      const otherDomain = withRecordSet(change, { ResourceRecords: [{ Value: value.replace('.wzccmgtwzk.', '.xlfgrmvvlj.') }] });
+      expect(dnsBatchViolations({ Changes: [otherDomain] })).toEqual([violation]);
+      // Its own value passes, in any case and without the trailing dot.
+      const own = withRecordSet(change, { ResourceRecords: [{ Value: value.toUpperCase() }] });
+      expect(dnsBatchViolations({ Changes: [own] })).toEqual([]);
+    },
+  );
+
+  it('rejects deleting an ACM validation record even next to its replacement', () => {
+    const replacement = withRecordSet(validation, {
+      ResourceRecords: [{ Value: '_0123456789abcdef0123456789abcdef.xlfgrmvvlj.acm-validations.aws.' }],
+    });
+    expect(dnsBatchViolations({ Changes: [{ ...validation, Action: 'DELETE' }, replacement] })).toEqual([
+      `change 0 (DELETE CNAME ${VALIDATION_NAME}): ${KEEP_VALIDATION}`,
+    ]);
+  });
 
   it('accepts IPv6 aliases and www validation records, with names and values in any case and without the trailing dot', () => {
     const changes = [

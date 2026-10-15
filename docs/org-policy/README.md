@@ -64,7 +64,7 @@ echo "Applied: ZachverseRegionFloor $F, ZachverseWebsiteUsEast1 $W. Record both 
 SCPs and RCPs do not apply to the management account itself, so the policies' effects are verified from the Website account. Run these there (`--profile default`, temporary `AccountFullAccessRole` credentials):
 
 - `aws cloudformation list-stacks --region us-east-1`
-- `aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --region us-east-1` (returns `ParameterNotFound` before bootstrap)
+- `aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --region us-east-1` (returns `ParameterNotFound` before bootstrap; in Git Bash, prefix it with `MSYS_NO_PATHCONV=1`, or Git Bash turns the name into a Windows path)
 - `aws ecr describe-repositories --region us-east-1`
 - `aws pricing-plan-manager list-subscriptions --region us-east-1`
 - `iam:SimulatePrincipalPolicy` for the us-east-1 actions in ADR 0002

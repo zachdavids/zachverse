@@ -1,0 +1,23 @@
+{
+  "Comment": "Milestone 4: ACM DNS validation for zachdavids.com and www.zachdavids.com. Kept while the certificate is in use; no reverse batch.",
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "_b40f1ffc2ab3868060f332c640e2a09d.zachdavids.com.",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{ "Value": "_5f63bd73e2b7c7642a7cd21db702f0c0.wzccmgtwzk.acm-validations.aws." }]
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "_895a096eaa6d6a29533d586c1c17504c.www.zachdavids.com.",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{ "Value": "_80eb6249f8a344f353cb6d193b5f9bd7.wzccmgtwzk.acm-validations.aws." }]
+      }
+    }
+  ]
+}

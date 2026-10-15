@@ -1,10 +1,7 @@
-import { App } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createStacks } from '../lib/app';
-import { production } from '../lib/config';
-import type { CfnResource } from './support/synth';
-import { PRICING_MODES, productionConfig, synthesizeAll } from './support/synth';
+import type { CfnResource } from '../lib/guardrails/template';
+import { PRICING_MODES, synthesizeAll } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -38,31 +35,6 @@ describe.each(Object.entries(PRICING_MODES))('stack environments (%s)', (_mode, 
       'Zachverse website hosting for zachdavids.com: S3 origin and CloudFront distribution',
     );
   });
-});
-
-it('synthesizes only the identity stack until the certificate ARN is configured', () => {
-  expect(production.certificateArn).toBeUndefined();
-  const { identity, site } = createStacks(new App(), production);
-  expect(identity.stackName).toBe('ZachverseIdentity');
-  expect(site).toBeUndefined();
-});
-
-// The identity stack deploys alone until milestone 4 sets the certificate. Adding the site stack must not change it (a
-// cross-stack reference would add an output to it), which also lets the checks on the full app cover it as deployed.
-it('synthesizes the same identity stack with or without the site stack', () => {
-  const alone = synthesizeAll(productionConfig({ certificateArn: undefined }));
-  const [identity, site] = synthesizeAll(productionConfig());
-  expect(alone.map((s) => s.stack.stackName)).toEqual(['ZachverseIdentity']);
-  expect(site!.stack.stackName).toBe('ZachverseSite');
-  expect(alone[0]!.json).toEqual(identity!.json);
-});
-
-it('targets the Website account and us-east-1 with termination protection while certificateArn is unset', () => {
-  const [identity, ...rest] = synthesizeAll(productionConfig({ certificateArn: undefined }));
-  expect(rest).toEqual([]);
-  expect(identity!.stack.account).toBe(EXPECTED_ACCOUNT);
-  expect(identity!.stack.region).toBe(EXPECTED_REGION);
-  expect(identity!.stack.terminationProtection).toBe(true);
 });
 
 // Changing a logical ID makes CloudFormation replace the resource (for the
