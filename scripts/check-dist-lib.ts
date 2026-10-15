@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { profile, site } from '../src/content.ts';
 import { escapeHtml } from './prerender-lib.ts';
 import { ASSETS, HASHED_NAME, isAsset, siteFiles } from './release-lib.ts';
+import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
 
 // The file CloudFront serves for a path, as infra/functions/viewer-request.js maps it.
 function servedFile(path: string): string {
@@ -167,7 +168,13 @@ export function releaseProblems(rootDir: URL): string[] {
   const publicFiles = filesIn(new URL('public/', rootDir));
   const failures: string[] = [];
   try {
-    siteFiles(fileURLToPath(dist));
+    const requests = distributionRequests(siteFiles(fileURLToPath(dist)));
+    if (requests > SMOKE_REQUEST_BUDGET) {
+      failures.push(
+        `dist/ would take the smoke test ${requests} requests through the distribution, more than its budget of ` +
+          `${SMOKE_REQUEST_BUDGET}, half the web ACL's rate limit for one address (ADR 0007)`,
+      );
+    }
   } catch (error) {
     failures.push(`dist/ cannot be released: ${(error as Error).message}`);
   }

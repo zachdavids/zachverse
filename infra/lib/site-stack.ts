@@ -107,8 +107,9 @@ export class SiteStack extends Stack {
 
     // The Free flat-rate plan requires a web ACL on the distribution, and covers its cost; on pay-as-you-go the web ACL
     // would be billed, so it exists only with the plan (ADR 0007). Each resource references the one before it, so
-    // CloudFormation creates the web ACL, then attaches it to the distribution, then subscribes them, and removes them
-    // in the reverse order.
+    // CloudFormation creates the web ACL, then attaches it to the distribution, then subscribes them. Rolling the update
+    // back is not the reverse: CloudFormation restores the distribution first, which CloudFront refuses while a
+    // subscription holds it (ADR 0007, "If a step fails").
     if (config.pricingPlan) {
       const webAcl = new wafv2.CfnWebACL(this, 'SiteWebAcl', {
         name: 'zachverse-site',
@@ -176,7 +177,9 @@ export class SiteStack extends Stack {
 
 /**
  * Requests one viewer IP address may send in 5 minutes, the window the Free plan's rate limiting counts over, before
- * the web ACL blocks it. A visitor's browser sends far fewer: it keeps the hashed assets for a year (ADR 0006).
+ * the web ACL blocks it. A visitor's browser sends far fewer: it keeps the hashed assets for a year (ADR 0006). The
+ * smoke test sends all its requests from one runner address, so check:dist holds each build to half this limit
+ * (SMOKE_REQUEST_BUDGET in scripts/smoke-lib.ts).
  */
 export const RATE_LIMIT_PER_IP = 1000;
 

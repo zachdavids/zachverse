@@ -1,6 +1,6 @@
 # Website DNS change batches
 
-The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CDK. It also carries Google Workspace email records (MX, SPF, DKIM, and later DMARC), which must never change as part of website work.
+The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CDK. It also carries Google Workspace email records (MX, SPF, DKIM, and DMARC), which must never change as part of website work.
 
 Website DNS changes are committed here as Route 53 change batches (the JSON for `aws route53 change-resource-record-sets --change-batch file://...`). Applying one is an administrative step. No stack may define DNS resources or grant DNS write access. The template guardrails (`infra/lib/guardrails/`) reject both. They run inside every synthesis and fail it, so the CDK CLI's synth, diff, and deploy fail on a DNS resource or a DNS-write grant even with `--build ''` or `--ignore-errors`, and the tests run them in CI. These are template checks, not access controls: CloudFormation deploys stacks through the CDK execution role, which can write DNS, and the templates of an assembly synthesized earlier and passed with `--app` are not checked again, so deploy only reviewed commits (ADR 0003, "Limits", lists what these checks miss).
 
@@ -14,7 +14,7 @@ Before applying any batch:
 
 - Public delegation must equal the zone's four name servers: a `.com` name server, such as `a.gtld-servers.net`, must list exactly `ns-1989.awsdns-56.co.uk`, `ns-163.awsdns-20.com`, `ns-980.awsdns-58.net`, and `ns-1399.awsdns-46.org` for `zachdavids.com`. Otherwise resolvers may not see the zone's records.
 - A website-routing batch, such as the milestone 8 cutover, also waits until no registrar operation for the domain is pending, its transfer to Route 53 Domains included. An additive ACM validation batch may be applied while one is pending, as long as delegation matches, since the zone serves its records whatever the registrar.
-- While the zone is attached to the Free flat-rate plan (ADR 0007), it may hold at most 50 records, the Free tier's limit. Check `ResourceRecordSetCount` (`aws route53 get-hosted-zone --id Z03492543O0YEY0RDZZ0J`) before a batch that adds records; the zone had 10 on 2026-10-15.
+- While the zone is attached to the Free flat-rate plan (ADR 0007), it may hold at most 50 records, the Free tier's limit. Check `ResourceRecordSetCount` (`aws route53 get-hosted-zone --id Z03492543O0YEY0RDZZ0J`) before a batch that adds records; the zone had 11 on 2026-10-15, after a DMARC record was added.
 
 Review rules, beyond what the tests check:
 
