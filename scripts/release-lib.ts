@@ -233,9 +233,10 @@ function isEntry(value: unknown): value is Entry {
 }
 
 /**
- * The history's format. Raise it whenever an entry kind is added or a field changes type, so that older release code,
- * as in a re-run of an old run or after a revert, refuses the history rather than misreading it. An added field needs no
- * new format: readers ignore fields they do not know.
+ * The history's format. Raise it for a new entry kind, a field that changes type, any new top-level field, or any field
+ * older code must act on, so that older release code, as in a re-run of an old run or after a revert, refuses the
+ * history rather than misreading it. Only an informational field inside entries needs no new format: older code ignores
+ * it and writes it back unchanged, since it keeps each entry whole.
  */
 const HISTORY_FORMAT = 1;
 const ACTIONS: ReadonlySet<unknown> = new Set(['publish', 'restore', 'rollback']);
@@ -331,7 +332,11 @@ export async function checkOrder(
   if (current === undefined || newest === undefined) return;
   const relation = await repository.compare(newest.release, release);
   if (relation === 'ahead') return;
-  const rolledBackFrom = current.action === 'rollback' ? entries.at(-2) : undefined;
+  // The release a rollback replaced: the entry before the run's rollbacks, of which a re-run of its jobs may add more.
+  const rolledBackFrom =
+    current.action === 'rollback'
+      ? entries.findLast((entry) => entry.action !== 'rollback' || runIdOf(entry.run) !== runIdOf(current.run))
+      : undefined;
   if (relation === 'identical' && (resume || current.release === release || rolledBackFrom?.release === release)) return;
   const reason =
     relation === 'identical'

@@ -95,7 +95,15 @@ const WEB_CHECKS = [
 const BROWSER_CHECK = ['npx playwright install --with-deps --only-shell chromium', 'npm run check:browser'];
 const WEB_STEPS = [...WEB_CHECKS, ...BROWSER_CHECK];
 
-// The browser job's install, retried: the release it checks is already live, and a failed install would roll it back.
+// The browser job's installs, retried: the release it checks is already live, and a failed install would roll it back.
+const NPM_CI_RETRIED = [
+  'for attempt in 1 2 3; do',
+  '  npm ci && exit 0',
+  '  echo "::warning::Installing packages failed (attempt $attempt of 3)."',
+  '  if [ "$attempt" -lt 3 ]; then sleep 30; fi',
+  'done',
+  'exit 1',
+].join('\n');
 const INSTALL_RETRIED = [
   'for attempt in 1 2 3; do',
   '  npx playwright install --with-deps --only-shell chromium && exit 0',
@@ -1023,11 +1031,11 @@ describe('Deploy workflow', () => {
     expect((browser?.steps ?? []).map(kind)).toEqual([
       'actions/checkout',
       'actions/setup-node',
-      'run', // npm ci
-      'run', // the browser
+      'run', // npm ci, retried
+      'run', // the browser, retried
       'node scripts/browser-check.ts live',
     ]);
-    expect(plan(deploy, 'browser').slice(2, 4)).toEqual(['npm ci', INSTALL_RETRIED]);
+    expect(plan(deploy, 'browser').slice(2, 4)).toEqual([NPM_CI_RETRIED, INSTALL_RETRIED]);
     expect(conditional(browser?.steps ?? [])).toEqual([]);
     // Nothing it produces reaches the role jobs but its result.
     expect(browser?.outputs).toBeUndefined();
@@ -1125,6 +1133,7 @@ describe('Jobs with the deploy role', () => {
   const roleJobs = [
     {
       where: 'deploy.yml deploy',
+      workflow: deploy,
       job: deploy?.jobs.deploy,
       env: {
         ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
@@ -1137,6 +1146,7 @@ describe('Jobs with the deploy role', () => {
     },
     {
       where: 'deploy.yml verify',
+      workflow: deploy,
       job: deploy?.jobs.verify,
       env: {
         ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
@@ -1148,6 +1158,7 @@ describe('Jobs with the deploy role', () => {
     },
     {
       where: 'restore.yml restore',
+      workflow: restoreWorkflow,
       job: restoreWorkflow?.jobs.restore,
       env: {
         ACCOUNT_ID: '${{ vars.AWS_ACCOUNT_ID }}',
@@ -1168,11 +1179,12 @@ describe('Jobs with the deploy role', () => {
     }
   });
 
-  // A job that runs packages, such as the browser job, could put anything in an output, and an input is whatever was
-  // typed. A job with the role takes only the build's digest, which it checks the download against, and its own input.
-  it("read no job's outputs and no input but their own, and other jobs only for their results", () => {
-    for (const { where, job, reads } of roleJobs) {
-      const unexpected = strings(job)
+  // A job that runs packages, such as the browser job, could put anything in an output, and an input or the event is
+  // whatever someone typed or pushed. A job with the role takes only the build's digest, which it checks the download
+  // against, and its own input. The workflow's env reaches every job, so it counts too.
+  it("read no job's outputs but the build's digest, no input but their own, and other jobs only for their results", () => {
+    for (const { where, workflow, job, reads } of roleJobs) {
+      const unexpected = strings([workflow?.env, job])
         .flatMap(expressions)
         .map((expression) => {
           let rest = expression;
@@ -1180,7 +1192,8 @@ describe('Jobs with the deploy role', () => {
           // GitHub reads context names in any case.
           return rest.replace(/\bneeds\.[\w-]+\.result\b/gi, '');
         })
-        .filter((rest) => /\b(?:needs|inputs)\b|\bgithub\s*(?:\.\s*event\b|\[)/i.test(rest));
+        // github is allowed only for a property other than its event: not whole, as in toJSON(github), nor by index.
+        .filter((rest) => /\b(?:needs|inputs)\b|\bgithub\b(?!\s*\.\s*(?!event\b)\w)/i.test(rest));
       expect(unexpected, where).toEqual([]);
     }
   });
@@ -1188,9 +1201,11 @@ describe('Jobs with the deploy role', () => {
 
 describe('Browser downloads', () => {
   // Playwright downloads Chromium from wherever these say, checking nothing but its size, and a proxy sees every request.
-  it('are never redirected: no workflow sets a Playwright or proxy variable', () => {
-    const named = /^(?:playwright_\w+|(?:https?|all|no|ftp)_proxy)$/i;
-    const assigned = /\b(?:playwright_\w+|(?:https?|all|no|ftp)_proxy)\s*=/i;
+  // Playwright reads PLAYWRIGHT_ settings, and npm passes npm_config_ and npm_package_config_ ones through to npx;
+  // any npm_config_ setting can also load an npmrc that holds them.
+  it('are never redirected: no workflow sets a Playwright, npm config, or proxy variable, and package.json sets no config', () => {
+    const named = /playwright[-_]|^npm_config_|^(?:https?|all|no|ftp)_proxy$/i;
+    const assigned = /(?:playwright[-_][\w-]*|npm_config_\w+|(?:https?|all|no|ftp)_proxy)\s*(?:=|<<)/i;
     for (const { file, workflow } of workflows) {
       const envs = [workflow.env, ...Object.values(workflow.jobs ?? {}).flatMap((job) => [job.env, ...(job.steps ?? []).map((step) => step.env)])];
       const names = envs.flatMap((env) => (env && typeof env === 'object' ? Object.keys(env) : []));
@@ -1198,6 +1213,7 @@ describe('Browser downloads', () => {
       const scripts = Object.values(workflow.jobs ?? {}).flatMap((job) => (job.steps ?? []).map((step) => step.run ?? ''));
       expect(scripts.filter((run) => assigned.test(run)), file).toEqual([]);
     }
+    expect(readJson<Record<string, unknown>>('package.json').config).toBeUndefined();
   });
 });
 
@@ -1295,7 +1311,8 @@ describe('Release and smoke-test scripts', () => {
       .split(/\r?\n/)
       .filter(Boolean)
       .map((file) => relative(repo, file).split(sep).join('/'));
-    const libs = /^node_modules\/(?:@types\/node|undici-types|typescript\/lib|@typescript\/typescript-[\w-]+\/lib)\//;
+    // Node's types, and TypeScript's standard-library declarations, which TypeScript 7 keeps in a platform package.
+    const libs = /^node_modules\/(?:(?:@types\/node|undici-types)\/|(?:typescript|@typescript\/typescript-[\w-]+)\/lib\/lib\.[\w.]+\.d\.ts$)/;
     return {
       packages: loaded.filter((file) => file.startsWith('node_modules/') && !libs.test(file)),
       own: loaded.filter((file) => !file.startsWith('node_modules/')).sort(),
@@ -1325,10 +1342,12 @@ describe('Release and smoke-test scripts', () => {
     // job that holds the role.
     const dir = mkdtempSync(join(tmpdir(), 'role-scripts-'));
     try {
-      for (const file of roleScripts().own) cpSync(fileURLToPath(new URL(file, root)), join(dir, file));
+      // The package.json the jobs run them under, and nothing readable outside dir, so no package above it is found.
+      for (const file of [...roleScripts().own, 'package.json']) cpSync(fileURLToPath(new URL(file, root)), join(dir, file));
       for (const entry of ['release', 'smoke']) {
         const env = { PATH: process.env.PATH ?? '', SystemRoot: process.env.SystemRoot ?? '' };
-        const result = spawnSync(process.execPath, [join(dir, 'scripts', `${entry}.ts`)], { encoding: 'utf8', env });
+        const args = ['--permission', `--allow-fs-read=${dir}`, join(dir, 'scripts', `${entry}.ts`)];
+        const result = spawnSync(process.execPath, args, { encoding: 'utf8', env });
         expect({ status: result.status, stderr: result.stderr.trim() }, entry).toEqual({
           status: 1,
           stderr: expect.stringMatching(new RegExp(`^::error::Usage: node scripts/${entry}\\.ts `)),

@@ -14,7 +14,7 @@
 3. **`browser`**, without the role: the browser check again, on the live release through CloudFront.
 4. **`verify`**, with the role: records the release as verified if the smoke test and the browser check passed, and otherwise rolls back.
 
-The jobs with the role install no packages. The browser checks, which need Playwright and the Chromium it downloads, run only in jobs without it, and nothing those jobs produce reaches a job with the role but their result.
+The jobs with the role install no packages. The browser checks, which need Playwright and the Chromium it downloads, run only in jobs without it. Of what those jobs produce, only their results reach a job with the role, apart from the build job's digest and `site` artifact, which it records and uploads before Playwright downloads Chromium.
 
 **Publishing.** After its access check, the deploy job runs `node scripts/release.ts publish site`. Everything that can refuse the release does so before the first write:
 
@@ -55,7 +55,7 @@ Content types come from a fixed table in `scripts/release-lib.ts`; a file with a
 **Release records.** `_releases/` holds the copies, the history, and the pending invalidations.
 - **Not part of the site:** the bucket policy denies CloudFront `s3:GetObject` there (`infra/lib/site-stack.ts`). A request for a record gets S3's 403, which the distribution leaves unmapped (ADR 0003). A path there with no object behind it gets the usual 404, since S3 says a key is missing when the caller may list the bucket, as CloudFront may. The smoke test asks for the history, which exists by then.
 - **Kept:** the deploy role reads and writes the records but may not delete them. Bucket versioning keeps each overwritten version for 90 days.
-- **Format marker:** the history carries `"format": 1`, and a history without one reads as format 1. The format changes whenever an entry kind is added or a field changes type; an added field needs no new format, since readers ignore fields they don't know. So release code older than the history refuses it rather than misreading it, as in a re-run of an old run, or after a revert. Its message says newer code wrote the history, not to put an older version back, which would lose the newest entries.
+- **Format marker:** the history carries `"format": 1`, and a history without one reads as format 1. The format changes for a new entry kind, a field that changes type, any new top-level field, or any field older code must act on. Only an informational field inside entries needs none: older code ignores it and writes it back unchanged. So release code older than the history refuses it rather than misreading it, as in a re-run of an old run, or after a revert. Its message says newer code wrote the history, not to put an older version back, which would lose the newest entries.
 
 **One publication at a time.** The deploy workflow and the Restore workflow share the concurrency group `deploy-refs/heads/main`. Concurrency groups span a repository's workflows, and `tests/repo-policy.test.ts` keeps the repository's other workflows and jobs out of it.
 - One run publishes at a time, and neither workflow cancels a run in progress.
@@ -77,15 +77,15 @@ A failed check fails its job, and the release is never recorded as verified, so 
 
 **Browser check.** `scripts/browser-check.ts` loads the pages in headless Chromium through Playwright, as a visitor's browser does, for what an HTTP check cannot see. It runs on the way to every release:
 - in CI on each pull request, and in the build job, on the built pages served locally the way CloudFront serves them (`npm run check:browser`);
-- then in the browser job, on the live release at `zachdavids.com`, with Chromium resolving the site's hostnames to the distribution, so it too runs before DNS points at CloudFront. That job installs Chromium after the release is live, and a failed install would roll the release back, so it retries a failed install twice, 30 seconds apart.
+- then in the browser job, on the live release at `zachdavids.com`, with Chromium resolving the site's hostnames to the distribution, so it too runs before DNS points at CloudFront. That job installs its packages and Chromium after the release is live, and a failed install would roll the release back, so it retries each install twice, 30 seconds apart.
 
 It loads the home page in a 320-pixel and a 1280-pixel window, and a missing page. It watches each for 2 seconds after its network goes quiet, then checks that:
 
 - no script threw, nothing logged a console error, and no request failed or got an error status. The 404 page's own status, and the one console message Chromium logs for it, are the exceptions;
 - every script and stylesheet the page links loaded, and every stylesheet has rules;
 - the page does not scroll sideways;
-- its main heading is neither hidden nor fully transparent, itself or through an ancestor, and lies inside the window;
-- a Tab press on the home page moves the focus to an element that shows it, with an outline or a shadow in a colour that is not fully transparent;
+- its main heading has text and a box inside the window, its computed `visibility` is `visible`, and neither it nor an ancestor has an opacity of 0 (Chromium's `checkVisibility`);
+- a Tab press on the home page moves the focus to an element with an outline (a style, a width, and a colour that is not fully transparent) or a box shadow with a layer of some size in such a colour. Neither is compared with the element's unfocused look, and contrast is not judged;
 - the page names the release expected: none in CI, the run's commit in the deploy workflow.
 
 React reports a page whose markup differs from what its scripts render as a console error, so the check catches that as well.
@@ -121,7 +121,7 @@ A history entry belongs to the workflow run, in any attempt: the run ID decides,
 ## When a release fails
 
 - **A check failed.** The verify job rolled back to the last good release, and the run failed. Push a fix, or run the Restore workflow for another verified release.
-- **A job failed for another reason,** such as a network error or an outage, and nothing was rolled back. Re-run the run's failed jobs. The verify job can then record or roll back what an earlier attempt published.
+- **A job failed for another reason,** such as a network error or an outage, and nothing was rolled back. Re-run the run's failed jobs. The verify job can then record or roll back what an earlier attempt published. A re-run never counts "Publish over a restore", though: if a run started with it failed before publishing anything, the restore is still the current release, so start a new Deploy run on `main` by hand with the box checked instead.
 - **The verify job already rolled back** (as after a browser job that could not install Chromium during an outage). Re-run all jobs instead, once the cause is gone: re-running only the failed ones would check the rolled-back release against this run's commit, and fail. A full re-run publishes the release again, as a retry.
 - **A run was cancelled partway.** The site may be partly updated, with an unfinished history entry. Re-running all jobs publishes the same release again; the Restore workflow puts back a verified one.
 - **The release scripts themselves are broken.** Publishing, the automatic rollback, and Restore all run the scripts of the commit at hand, so a defect the unit tests miss can stop all three.
@@ -147,11 +147,12 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - assets kept, uploaded, or replaced and invalidated, by checksum and headers;
   - a replaced asset recorded as pending before it is overwritten, and invalidated by the rollback and by a re-run after its own run failed first;
   - a stale, diverged, or replaced release refused before any write, and every release over a restore unless a run's first attempt resumes;
-  - a copy with other files, a history, manifest, or pending record that is not what it should be, a history from newer release code, or a key no release writes, all refused before any write;
+  - a copy with other files, a history, manifest, or pending record that is not what it should be, a history from newer release code, or a key no release writes, all refused before any write, in a publish, a restore, and a rollback;
+  - a field it does not know inside a history entry kept through every rewrite, as the format rule relies on;
   - a re-run of a restore restoring the same release;
-  - a rollback after a failed check or a publish that stopped partway, past earlier failed releases, in a later attempt of the run, and to a restore whose own checks failed; none when the run changed nothing or no earlier release passed or was restored;
+  - a rollback after a failed check or a publish that stopped partway, past earlier failed releases, in a later attempt of the run, and to a restore whose own checks failed; none when the run changed nothing or no earlier release passed or was restored; and a publish of the release a run rolled back allowed again, however many of its attempts rolled back;
   - a damaged copy, a missing file, or a never-verified release not restored;
-  - the AWS adapter reading AWS's error codes from the CLI's JSON errors;
+  - the AWS adapter reading AWS's error codes from the CLI's JSON errors, with only S3's two missing-key codes read as missing;
   - each smoke and browser check failing for the fault it looks for, and the home-page check passing the build's real prerendered page.
 - **The browser check in real Chromium**, against copies of a fresh build broken on purpose: the first round's ten breakages, and the second review's eleven experiments, all as expected. The ten were a script that throws, a console error, a layout wider than a phone, a missing stylesheet, a missing script, no focus indicator, a hidden heading, a heading off the screen, pages that name another release, and a hydration mismatch. In the second round, every breakage failed and the unbroken build passed. The breakages were:
   - a heading hidden, made transparent, or moved above or below the window;
@@ -160,17 +161,18 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - a console error on the 404 page.
 - **`tests/repo-policy.test.ts`** pins the jobs that may assume the deploy role: the deploy and verify jobs, and the Restore workflow's restore job.
   - It pins their steps in order, the verify job's conditions exactly, their settings (no container, services, matrix, or shell override), their permissions and role inputs, and their variables.
-  - No step may set those variables again, and the jobs read no job's outputs but the build's digest, no input but their own, and other jobs only for their results.
+  - No step may set those variables again, and the jobs read no job's outputs but the build's digest, no input but their own, nothing from the event, and other jobs only for their results. The workflow's own `env`, which reaches every job, counts too.
   - It pins their shared concurrency group, which no other workflow or job may join.
-  - It keeps the browser job out of the environment, without variables, an OIDC token, or outputs, and no workflow may set a Playwright or proxy variable.
+  - It keeps the browser job out of the environment, without variables, an OIDC token, or outputs. No workflow may set a Playwright, npm config, or proxy variable, in `env` or in a script, and `package.json` sets no `config`.
   - It also pins the Deploy workflow's `resume` input, the Restore workflow's test job, and the release scripts' commands.
-  - For the scripts the role jobs run, `tsc` on a Node-only project (`tsconfig.release.json`) must load nothing from `node_modules` but Node's types. A scan rejects what `tsc` cannot follow, and both entry points must load under plain Node, copied where no package can be found.
+  - For the scripts the role jobs run, `tsc` on a Node-only project (`tsconfig.release.json`) must load nothing from `node_modules` but Node's types. A scan rejects what `tsc` cannot follow, and both entry points must load under plain Node, copied beside the repository's `package.json` and run under Node's permission model, which lets them read nothing outside the copy, so no package above it can load.
   - It forbids `NODE_` variables in the role jobs.
-  - Mutations caught: the six workflow changes the second review's mutations represent, and six import forms that the earlier check missed.
+  - Mutations caught: the six workflow changes the second review's mutations represent, six import forms that the earlier check missed, and the third review's six bypasses: a Playwright download host set through npm config, through `$GITHUB_ENV`'s multiline form, or in `package.json`; event data through the workflow's `env` or `toJSON(github)`; and a dynamic import of `typescript`.
 - **`infra/test/site-stack.test.ts`** pins the bucket policy's statements, the release-record deny included, and the deploy policy's, with its page deletion and its deny of deleting assets or release records.
-- **Two reviews:**
+- **Reviews:**
   - The first, of the change in five areas with each finding checked by two independent skeptics, confirmed 21 findings, all addressed.
   - The second, of the pipeline, the scripts, and the design, after the browser check, page removal, and holds were added, raised 18 distinct findings, each checked by two skeptics. All but a few were confirmed, none of high severity, and all are addressed here.
+  - A third, of the second's fixes, confirmed 14 low-severity findings (two rollbacks in one run blocking a retry, `npm ci` not retried, mixed colour syntaxes in the focus check, gaps in the policy tests, and overstated docs), all addressed here; mutations show the new tests catch each regression it described.
   - CodeQL flagged two patterns in the smoke test's own tests (a local server echoing the request path, and a host matched by substring), both fixed.
 - **Deployed before the merge:** the release-record deny, with ADR 0004's runbook on 2026-10-15 from `398c15b`. Through CloudFront, at both hostnames, an object written under `_releases/` as a probe got 403 `AccessDenied`, and a missing key there 404 `NoSuchKey` (ADR 0003, "Deployed state").
 
@@ -178,8 +180,8 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
 
 - **Before the merge:** no release, check against the live distribution, or restore can run, since the environment and the role's trust admit only `main`. The first release, its checks through CloudFront, and the restore rehearsal follow the merge, and `docs/progress.md` records them. The rehearsal needs a second release after the first, which any later commit to `main` makes, since every release's pages name their commit, and it ends by resuming deploys.
 - **Infrastructure first:** the release-record deny and the deploy role's page deletion must be live before a release. Otherwise its smoke test fails on the 403 check, and a publish with a page to remove fails partway, after writing its pages. A rollback of the site stack past them would bring those failures back (see "Three kinds of rollback").
-- **What the browser check sees:** what Chromium sees, in two window sizes and after one Tab press, watching each page for 2 seconds after its network goes quiet. It cannot judge how a page looks beyond what it measures, other browsers can differ, and an error later than that goes unseen. It checks the home page and the 404 page, which are all the placeholder has.
-- **Outages during the browser job:** an outage of npm's registry, Ubuntu's mirrors, or Playwright's CDN that outlasts the retries fails the browser job, and the verify job rolls back a release that passed its smoke test. Re-run all jobs once it is over.
+- **What the browser check sees:** what Chromium sees, in two window sizes and after one Tab press, watching each page for 2 seconds after its network goes quiet. It judges nothing about a page's look beyond what it measures: a heading drawn in a transparent colour, clipped, filtered, masked, or covered still passes, and so does a focus indicator that also shows without the focus. Other browsers can differ, and an error later than 2 seconds goes unseen. It checks the home page and the 404 page, which are all the placeholder has.
+- **Outages during the browser job:** an outage of npm's registry, Ubuntu's mirrors, or Playwright's CDN that outlasts the retries (three attempts of each install, 30 seconds apart, after npm's own retries) fails the browser job, and the verify job rolls back a release that passed its smoke test. Re-run all jobs once it is over.
 - **Unchecked Chromium:** Playwright's download of Chromium is checked only by size. In the build job it runs after the upload, and in the browser job without the role; there, a tampered browser could pass or fail the check, which decides only between recording the release and rolling it back.
 - **Restores and rollbacks** check what they put back with the smoke test only: the release passed the browser check when it first went out, and its copy goes back with every file's SHA-256 checked.
 - **Cancelled during the browser check:** a run cancelled then leaves the published release live, never verified, with nothing rolled back. A later rollback skips it, and Restore refuses it.

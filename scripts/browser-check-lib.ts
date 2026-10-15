@@ -179,18 +179,40 @@ export function pageProblems(report: PageReport, expected: { status: number; rel
   return found;
 }
 
-// A computed colour that shows nothing: Chromium writes a fully transparent one as rgba(r, g, b, 0).
-const TRANSPARENT = /^(?:transparent|rgba\([^)]*,\s*0(?:\.0+)?\))$/;
+// A colour that shows nothing: transparent, or an alpha of 0, written after three commas, as in rgba(), or after a
+// slash, as in the oklch(), lab(), and color() values Chromium computes for other colour spaces (src/styles.test.ts reads
+// authored colours the same way).
+const ZERO_ALPHA =
+  /^(?:transparent|#[\da-f]{3}0|#[\da-f]{6}00|[a-z-]+\((?:[^,()]*,){3}\s*0*\.?0+%?\s*\)|[a-z-]+\([^()]*\/\s*0*\.?0+%?\s*\))$/i;
+
+/** A computed box-shadow's layers, split at the commas outside parentheses. */
+function shadowLayers(boxShadow: string): string[] {
+  const layers: string[] = [];
+  let depth = 0;
+  let start = 0;
+  [...boxShadow].forEach((character, i) => {
+    if (character === '(') depth++;
+    else if (character === ')') depth--;
+    else if (character === ',' && depth === 0) {
+      layers.push(boxShadow.slice(start, i).trim());
+      start = i + 1;
+    }
+  });
+  return [...layers, boxShadow.slice(start).trim()];
+}
+
+/** Whether a computed box-shadow layer shows: a colour, which Chromium writes first, that is not transparent, and some size. */
+function layerShows(layer: string): boolean {
+  const [, colour, rest] = /^([a-z-]+\([^()]*\)|\S*)\s*(.*)$/i.exec(layer)!;
+  const lengths = rest!.split(/\s+/).map((token) => Number.parseFloat(token)).filter((length) => !Number.isNaN(length));
+  return !ZERO_ALPHA.test(colour!) && lengths.some((length) => length !== 0);
+}
 
 /** Problems with where a Tab press put the focus: it must land on an element that shows it has the focus. */
 export function focusProblems(focus: Focus | null | undefined): string[] {
   if (!focus) return ['a Tab press focused nothing'];
-  const outlined =
-    focus.outlineStyle !== 'none' && focus.outlineWidth !== '0px' && !TRANSPARENT.test(focus.outlineColor);
-  // A shadow whose colours are all transparent shows nothing; one in a colour syntax this cannot read gets the benefit.
-  const colours = focus.boxShadow.match(/rgba?\([^)]*\)/g) ?? [];
-  const shadowed =
-    focus.boxShadow !== 'none' && !(colours.length > 0 && colours.every((colour) => TRANSPARENT.test(colour)));
+  const outlined = focus.outlineStyle !== 'none' && focus.outlineWidth !== '0px' && !ZERO_ALPHA.test(focus.outlineColor);
+  const shadowed = focus.boxShadow !== 'none' && shadowLayers(focus.boxShadow).some(layerShows);
   return outlined || shadowed ? [] : [`the focused <${focus.tag}> shows no focus indicator`];
 }
 
