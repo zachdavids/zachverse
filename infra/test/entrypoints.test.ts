@@ -6,7 +6,7 @@ import { App, Stack } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import type { createStacks } from '../lib/app';
-import { cdkContext, createApp, productionConfig } from './support/synth';
+import { cdkContext, createApp, productionConfig, TEST_CERTIFICATE_ARN } from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -97,19 +97,21 @@ describe('CDK entry point', () => {
     vi.doUnmock('../lib/app');
     vi.resetModules();
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    process.exitCode = undefined;
     for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
   it('lets a configuration error fail the synth instead of swallowing it', async () => {
+    // Set, so createStacks adds the site stack, but to a certificate in another Region, which the site stack rejects.
+    const certificateArn = TEST_CERTIFICATE_ARN.replace(':us-east-1:', ':us-east-2:');
     vi.doMock('../lib/config', async (importOriginal) => {
       const actual = await importOriginal<typeof import('../lib/config')>();
-      return { ...actual, production: { ...actual.production, certificateArn: undefined } };
+      return { ...actual, production: { ...actual.production, certificateArn } };
     });
 
     await expect(import('../bin/zachverse.js')).rejects.toThrow(
-      new Error(
-        'certificateArn is not set. Request the us-east-1 ACM certificate and add its ARN to infra/lib/config.ts (docs/adr/0002).',
-      ),
+      new Error(`certificateArn must be an ACM certificate in us-east-1 owned by 426499248998: ${certificateArn}`),
     );
   });
 
@@ -142,7 +144,10 @@ describe('CDK entry point', () => {
       };
     });
 
+    const skipped = vi.spyOn(console, 'error');
     const { beforeExit, exit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
+    expect(skipped.mock.calls.filter(([m]) => String(m).includes('ZachverseSite skipped'))).toEqual([]);
+    expect(process.exitCode ?? 0).toBe(0);
     // One app, so one synthesis, and no beforeExit or exit listener added, before or after that synthesis. Node calls
     // the listener once the event loop is empty, so calling it now misses work bin/ defers longer than
     // listenersAddedBy waits (a delayed timer, an I/O callback).
@@ -154,10 +159,41 @@ describe('CDK entry point', () => {
     const [app, config] = calls[0]!;
     expect(App.isApp(app)).toBe(true);
     expect(config).toEqual(productionConfig());
-    expect(app.node.findAll().filter((c) => Stack.isStack(c)).map((s) => s.node.id)).toEqual(['ZachverseSite']);
+    expect(app.node.findAll().filter((c) => Stack.isStack(c)).map((s) => s.node.id)).toEqual([
+      'ZachverseIdentity',
+      'ZachverseSite',
+    ]);
     // Every file in the assembly, call stacks in the metadata aside, including the manifest (each stack's environment,
     // termination protection, and deployment roles), the templates, the asset manifests, the stack metadata, and the
     // construct tree.
+    expect(assemblyFiles(outdir)).toEqual(assemblyFiles(reference));
+  });
+
+  it('synthesizes only the identity stack, and says why, while certificateArn is unset', async () => {
+    // As above, with the certificate unset in both the checked app and bin/'s config.
+    const reference = temporaryDirectory();
+    createApp(productionConfig({ certificateArn: undefined }), { outdir: reference, autoSynth: false }).synth();
+
+    const outdir = temporaryDirectory();
+    vi.stubEnv('CDK_CONTEXT_JSON', JSON.stringify(cdkContext));
+    vi.stubEnv('CDK_OUTDIR', outdir);
+    vi.doMock('../lib/config', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../lib/config')>();
+      return { ...actual, production: deepFreeze({ ...structuredClone(actual.production), certificateArn: undefined }) };
+    });
+    // Captured, so the test checks the message instead of printing it.
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const { beforeExit, exit } = await listenersAddedBy(() => import('../bin/zachverse.js'));
+    expect(beforeExit).toHaveLength(1);
+    expect(exit).toEqual([]);
+    expect(await listenersAddedBy(() => beforeExit[0]!.call(process, 0))).toEqual({ beforeExit: [], exit: [] });
+    expect(process.exitCode ?? 0).toBe(0);
+
+    expect(error.mock.calls).toEqual([
+      ['ZachverseSite skipped: set certificateArn in infra/lib/config.ts first (docs/adr/0002).'],
+    ]);
+    expect(new CloudAssembly(outdir).stacks.map((s) => s.stackName)).toEqual(['ZachverseIdentity']);
     expect(assemblyFiles(outdir)).toEqual(assemblyFiles(reference));
   });
 });

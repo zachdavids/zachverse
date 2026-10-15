@@ -7,21 +7,35 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Template } from 'aws-cdk-lib/assertions';
-import { App, CfnDynamicReference, CfnDynamicReferenceService, CfnParameter, Fn, NestedStack, RemovalPolicy, Stack } from 'aws-cdk-lib/core';
+import {
+  App,
+  CfnDynamicReference,
+  CfnDynamicReferenceService,
+  CfnParameter,
+  Fn,
+  NestedStack,
+  RemovalPolicy,
+  Stack,
+  Validations,
+} from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
+import { githubOidcSubject, production } from '../lib/config';
 import {
+  deployRoleViolations,
   dnsWriteViolations,
   freePlanViolations,
   freePlanWebAclViolations,
+  githubTrustViolations,
   MANAGED_CACHE_POLICY_IDS,
   MANAGED_ORIGIN_REQUEST_POLICY_IDS,
   MANAGED_RESPONSE_HEADERS_POLICY_IDS,
   prohibitedResourceViolations,
   retentionViolations,
+  WEBSITE_DEPLOY_ACTIONS,
 } from './support/checks';
 import type { CfnResource, CfnTemplate } from './support/synth';
-import { PRICING_MODES, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import { PRICING_MODES, synthesizeAll, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
 
 const ZONE_ID = 'Z03492543O0YEY0RDZZ0J';
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -127,6 +141,10 @@ describe('prohibitedResourceViolations', () => {
     ['AWS::Serverless::Function', LAMBDA],
     ['AWS::CertificateManager::Certificate', CERTIFICATE],
     ['AWS::CloudFormation::StackSet', 'StackSets are not allowed in this project'],
+    ...['IdentityPool', 'IdentityPoolRoleAttachment', 'UserPool'].map((name) => [
+      `AWS::Cognito::${name}`,
+      'website stacks need no Cognito resources, and an identity pool can exchange outside tokens for credentials',
+    ]),
     ['AWS::CloudFormation::Stack', NESTED],
     ['AWS::Serverless::Application', NESTED],
     ['AWS::ServiceCatalog::CloudFormationProvisionedProduct', NESTED],
@@ -414,10 +432,13 @@ describe('dnsWriteViolations', () => {
   });
 
   it('flags Allow with NotAction, which grants every action not listed', () => {
-    const statement = new iam.PolicyStatement({ notActions: ['s3:*'], resources: ['*'] });
-    expect(dnsWriteViolations(roleWith(statement), allowance)).toEqual([
-      `${POLICY}: Allow with NotAction is too broad to verify`,
-    ]);
+    const template = synth((s) => {
+      const role = new iam.Role(s, 'Role', { assumedBy: lambda });
+      role.addToPolicy(new iam.PolicyStatement({ notActions: ['s3:*'], resources: ['*'] }));
+      // CDK's template validation would otherwise print a warning about the NotAction this test needs.
+      Validations.of(s).acknowledge({ id: 'CloudFormation-Validate::W2512', reason: 'The NotAction is what this test checks.' });
+    });
+    expect(dnsWriteViolations(template, allowance)).toEqual([`${POLICY}: Allow with NotAction is too broad to verify`]);
   });
 
   it('flags an Action it cannot read: a CloudFormation token, or a statement wrapped in Fn::If', () => {
@@ -1082,11 +1103,525 @@ describe('freePlanWebAclViolations', () => {
 
 describe('a stack with no resources', () => {
   it('has no Resources section, and every check accepts it', () => {
-    const template = synth(() => {});
+    // CDK's template validation would otherwise print a warning about the empty template this test needs.
+    const template = synth((s) =>
+      Validations.of(s).acknowledge({ id: 'CloudFormation-Validate::F0001', reason: 'The empty template is what this test checks.' }),
+    );
     expect(template.Resources).toBeUndefined();
     expect(prohibitedResourceViolations(template)).toEqual([]);
     expect(retentionViolations(template)).toEqual([]);
     expect(dnsWriteViolations(template)).toEqual([]);
     expect(freePlanViolations(template)).toEqual([]);
+  });
+});
+
+describe('githubTrustViolations', () => {
+  const subject = githubOidcSubject(production.github);
+  const roleTrusting = (conditions: Record<string, unknown>, actions = ['sts:AssumeRoleWithWebIdentity']) =>
+    synth((s) => {
+      const provider = new iam.OidcProviderNative(s, 'GitHub', {
+        url: 'https://token.actions.githubusercontent.com',
+        clientIds: ['sts.amazonaws.com'],
+      });
+      const role = new iam.Role(s, 'Role', { assumedBy: new iam.WebIdentityPrincipal(provider.oidcProviderArn, conditions) });
+      if (actions.length > 1) {
+        (role.assumeRolePolicy as iam.PolicyDocument).addStatements(
+          new iam.PolicyStatement({ actions: ['sts:TagSession'], principals: [new iam.FederatedPrincipal(provider.oidcProviderArn)] }),
+        );
+      }
+    });
+
+  const AUD = 'token.actions.githubusercontent.com:aud';
+  const SUB = 'token.actions.githubusercontent.com:sub';
+  const REF = 'token.actions.githubusercontent.com:ref';
+  const ref = production.github.deployRef;
+  const exact = { [AUD]: 'sts.amazonaws.com', [SUB]: subject, [REF]: ref };
+  const ROLE = 'Role1ABCC5F0';
+
+  it('accepts the exact production-environment subject on main with the STS audience', () => {
+    expect(githubTrustViolations(roleTrusting({ StringEquals: exact }), subject, ref)).toEqual([]);
+  });
+
+  it.each([
+    ['a repository-wide wildcard', {
+      StringEquals: { [AUD]: 'sts.amazonaws.com', [REF]: ref },
+      StringLike: { [SUB]: 'repo:zachdavids@43345768/zachverse@1414719760:*' },
+    }, [
+      `${ROLE}: GitHub trust must use only StringEquals conditions (found StringEquals, StringLike)`,
+      `${ROLE}: subject must be exactly ${subject}`,
+    ]],
+    ['the old name-only subject format', { StringEquals: { ...exact, [SUB]: 'repo:zachdavids/zachverse:environment:production' } },
+      [`${ROLE}: subject must be exactly ${subject}`]],
+    ['a branch subject instead of the environment', {
+      StringEquals: { ...exact, [SUB]: 'repo:zachdavids@43345768/zachverse@1414719760:ref:refs/heads/main' },
+    }, [`${ROLE}: subject must be exactly ${subject}`]],
+    ['a missing audience', { StringEquals: { [SUB]: subject, [REF]: ref } }, [`${ROLE}: audience must be sts.amazonaws.com`]],
+    ['a missing ref', { StringEquals: { [AUD]: 'sts.amazonaws.com', [SUB]: subject } }, [`${ROLE}: ref must be exactly ${ref}`]],
+    ['a ref other than main', { StringEquals: { ...exact, [REF]: 'refs/heads/feature' } }, [`${ROLE}: ref must be exactly ${ref}`]],
+  ])('flags %s', (_case, conditions, expected) => {
+    expect(githubTrustViolations(roleTrusting(conditions), subject, ref)).toEqual(expected);
+  });
+
+  it('flags trust statements that allow more than AssumeRoleWithWebIdentity', () => {
+    // The second statement, which allows sts:TagSession, has no conditions.
+    const template = roleTrusting({ StringEquals: exact }, ['sts:AssumeRoleWithWebIdentity', 'sts:TagSession']);
+    expect(githubTrustViolations(template, subject, ref)).toEqual([
+      `${ROLE}: GitHub trust must allow only sts:AssumeRoleWithWebIdentity`,
+      `${ROLE}: GitHub trust must use only StringEquals conditions (found none)`,
+      `${ROLE}: audience must be sts.amazonaws.com`,
+      `${ROLE}: subject must be exactly ${subject}`,
+      `${ROLE}: ref must be exactly ${ref}`,
+    ]);
+  });
+
+  /** A raw template with GitHub's provider and a role trusting these statements, for shapes CDK will not generate. */
+  const trusting = (...statements: (object | null)[]): CfnTemplate => ({
+    Resources: {
+      Provider: { Type: 'AWS::IAM::OIDCProvider', Properties: { Url: 'https://token.actions.githubusercontent.com' } },
+      Role: { Type: 'AWS::IAM::Role', Properties: { AssumeRolePolicyDocument: { Statement: statements } } },
+    },
+  });
+  /** The deploy role's trust statement as the identity stack writes it, with parts replaced. */
+  const github = (change: object = {}) => ({
+    Effect: 'Allow',
+    Action: 'sts:AssumeRoleWithWebIdentity',
+    Principal: { Federated: { Ref: 'Provider' } },
+    Condition: { StringEquals: exact },
+    ...change,
+  });
+  const unconditioned = github({ Condition: undefined });
+  // What a statement trusting GitHub without conditions gets, which shows that the check read its principal.
+  const UNCONDITIONED = [
+    'Role: GitHub trust must use only StringEquals conditions (found none)',
+    'Role: audience must be sts.amazonaws.com',
+    `Role: subject must be exactly ${subject}`,
+    `Role: ref must be exactly ${ref}`,
+  ];
+
+  it.each<[string, object]>([
+    ['AssumeRoleWithWebIdentity, then another action', { Action: ['sts:AssumeRoleWithWebIdentity', 'sts:TagSession'] }],
+    ['another action, then AssumeRoleWithWebIdentity', { Action: ['sts:TagSession', 'sts:AssumeRoleWithWebIdentity'] }],
+    ['NotAction, which allows every action it does not list', { Action: undefined, NotAction: 'sts:TagSession' }],
+  ])('flags one GitHub trust statement that allows %s', (_case, change) => {
+    expect(githubTrustViolations(trusting(github(change)), subject, ref)).toEqual([
+      'Role: GitHub trust must allow only sts:AssumeRoleWithWebIdentity',
+    ]);
+  });
+
+  it.each<[string, unknown]>([
+    ['a Ref to the provider', { Ref: 'Provider' }],
+    // An OIDC provider's Arn attribute is its ARN, as its Ref is.
+    ["the provider's Arn attribute", { 'Fn::GetAtt': ['Provider', 'Arn'] }],
+    ['a literal provider ARN', 'arn:aws:iam::426499248998:oidc-provider/token.actions.githubusercontent.com'],
+    ['a list that includes the provider', ['cognito-identity.amazonaws.com', { Ref: 'Provider' }]],
+  ])('reads a Federated principal given as %s', (_case, federated) => {
+    const principal = { Principal: { Federated: federated } };
+    expect(githubTrustViolations(trusting(github(principal)), subject, ref)).toEqual([]);
+    expect(githubTrustViolations(trusting({ ...unconditioned, ...principal }), subject, ref)).toEqual(UNCONDITIONED);
+  });
+
+  // Matching the host in any letter case can only add checks.
+  it('recognizes the GitHub host in any letter case, in a provider ARN or Url', () => {
+    const arn = 'arn:aws:iam::426499248998:oidc-provider/TOKEN.ACTIONS.GITHUBUSERCONTENT.COM';
+    const template = trusting(unconditioned, { ...unconditioned, Principal: { Federated: arn } });
+    template.Resources.Provider!.Properties!.Url = 'https://Token.Actions.GitHubUserContent.com';
+    expect(githubTrustViolations(template, subject, ref)).toEqual([...UNCONDITIONED, ...UNCONDITIONED]);
+  });
+
+  // The host is compared whole: an enterprise issuer adds a path to GitHub's, and a host that only contains GitHub's
+  // names another issuer, whose tokens GitHub never signs.
+  const ENTERPRISE = 'token.actions.githubusercontent.com/acme';
+  const LONGER_HOST = 'token.actions.githubusercontent.com.example.org';
+  const IN_PATH = 'example.org/token.actions.githubusercontent.com';
+  it.each<[string, string, string[]]>([
+    ['an enterprise issuer Url', `https://${ENTERPRISE}`, UNCONDITIONED],
+    ["a Url whose host only starts with GitHub's", `https://${LONGER_HOST}`, []],
+    ["a Url with GitHub's host in its path", `https://${IN_PATH}`, []],
+  ])('reads the provider host whole: %s', (_case, url, expected) => {
+    const template = trusting(unconditioned);
+    template.Resources.Provider!.Properties!.Url = url;
+    expect(githubTrustViolations(template, subject, ref)).toEqual(expected);
+  });
+
+  it.each<[string, string, string[]]>([
+    ['an enterprise issuer ARN', ENTERPRISE, UNCONDITIONED],
+    ["an ARN whose host only starts with GitHub's", LONGER_HOST, []],
+    ["an ARN with GitHub's host in its path", IN_PATH, []],
+  ])('reads the provider host whole: %s', (_case, provider, expected) => {
+    const arn = `arn:aws:iam::426499248998:oidc-provider/${provider}`;
+    expect(githubTrustViolations(trusting({ ...unconditioned, Principal: { Federated: arn } }), subject, ref)).toEqual(expected);
+  });
+
+  it('ignores statements that trust only other principals', () => {
+    const template = trusting(
+      { Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { Service: 'lambda.amazonaws.com', AWS: 'arn:aws:iam::426499248998:root' } },
+      {
+        Effect: 'Allow',
+        Action: 'sts:AssumeRoleWithWebIdentity',
+        Principal: { Federated: ['cognito-identity.amazonaws.com', { Ref: 'Eks' }] },
+      },
+    );
+    template.Resources.Eks = {
+      Type: 'AWS::IAM::OIDCProvider',
+      Properties: { Url: 'https://oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE' },
+    };
+    expect(githubTrustViolations(template, subject, ref)).toEqual([]);
+  });
+
+  // Each could resolve to GitHub's provider during deployment, so the statement's conditions would go unchecked.
+  it.each<[string, unknown]>([
+    ['an Fn::Join', { 'Fn::Join': ['', ['arn:aws:iam::', { Ref: 'AWS::AccountId' }, ':oidc-provider/token.actions.githubusercontent.com']] }],
+    ['an Fn::Sub', { 'Fn::Sub': 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com' }],
+    ['an Fn::ImportValue', { 'Fn::ImportValue': 'GitHubOidcProviderArn' }],
+    ['the Arn attribute of a resource that is not an OIDC provider', { 'Fn::GetAtt': ['Custom', 'Arn'] }],
+    // A custom resource can return any ARN, as CDK's OpenIdConnectProvider does.
+    ['a Ref to a custom resource', { Ref: 'Custom' }],
+    ['a Ref to a parameter', { Ref: 'ProviderArn' }],
+    ['a Ref to an OIDC provider whose Url is computed', { Ref: 'ImportedUrl' }],
+    // CloudFormation substitutes a dynamic reference during deployment, wherever it appears in a string. The first is
+    // what CDK writes for StringParameter.valueForStringParameter(scope, name, 1).
+    ['an SSM dynamic reference', '{{resolve:ssm:/zachverse/github-oidc-provider-arn:1}}'],
+    ['a Secrets Manager dynamic reference', '{{resolve:secretsmanager:zachverse/github:SecretString:providerArn}}'],
+    ['an ARN that ends in a dynamic reference', 'arn:aws:iam::426499248998:oidc-provider/{{resolve:ssm:/zachverse/oidc-host}}'],
+    ['a Ref to an OIDC provider whose Url is a dynamic reference', { Ref: 'ResolvedUrl' }],
+  ])('flags a Federated principal given as %s, which it cannot resolve', (_case, federated) => {
+    const template = trusting({ ...unconditioned, Principal: { Federated: ['cognito-identity.amazonaws.com', federated] } });
+    template.Resources.Custom = { Type: 'Custom::AWSCDKOpenIdConnectProvider', Properties: {} };
+    template.Resources.ImportedUrl = { Type: 'AWS::IAM::OIDCProvider', Properties: { Url: { 'Fn::ImportValue': 'IssuerUrl' } } };
+    template.Resources.ResolvedUrl = { Type: 'AWS::IAM::OIDCProvider', Properties: { Url: '{{resolve:ssm:/zachverse/issuer-url}}' } };
+    const what = `Federated principal ${JSON.stringify(federated)}`;
+    expect(githubTrustViolations(template, subject, ref)).toEqual([
+      `Role: ${what} is not a literal ARN or an OIDC provider in this stack with a literal Url, so it cannot be verified`,
+    ]);
+  });
+
+  // "*" also matches tokens from GitHub's provider, for any repository unless conditions say otherwise.
+  it.each<[string, object]>([
+    ['"*"', { Principal: '*' }],
+    ['AWS "*"', { Principal: { AWS: '*' } }],
+    ['"*" among AWS principals', { Principal: { AWS: ['arn:aws:iam::426499248998:root', '*'] } }],
+    ['Federated "*"', { Principal: { Federated: '*' } }],
+    ['"*" with an Effect it cannot read', { Effect: { 'Fn::If': ['IsProd', 'Allow', 'Deny'] }, Principal: '*' }],
+  ])('flags a wildcard principal, %s', (_case, change) => {
+    expect(githubTrustViolations(trusting({ ...unconditioned, ...change }), subject, ref)).toEqual([
+      'Role: a wildcard principal trusts everyone, GitHub included',
+    ]);
+  });
+
+  // Each may resolve to "*" during deployment. CDK writes the first for new ArnPrincipal(parameter.valueAsString).
+  it.each<[string, string, unknown]>([
+    ['a Ref to a parameter', 'AWS', { Ref: 'Trusted' }],
+    ['an Fn::If', 'AWS', { 'Fn::If': ['IsProd', 'arn:aws:iam::426499248998:root', '*'] }],
+    ['an Fn::ImportValue', 'AWS', { 'Fn::ImportValue': 'TrustedPrincipal' }],
+    ['a dynamic reference', 'AWS', '{{resolve:ssm:/zachverse/trusted-principal}}'],
+    ['an Fn::Join', 'Service', { 'Fn::Join': ['', ['lambda.', { Ref: 'AWS::URLSuffix' }]] }],
+    ['an Fn::GetAtt', 'CanonicalUser', { 'Fn::GetAtt': ['Identity', 'S3CanonicalUserId'] }],
+  ])('flags a principal given as %s (%s), which it cannot read', (_case, type, value) => {
+    // Next to literal principals, which it reads.
+    const principal = { AWS: 'arn:aws:iam::426499248998:root', Service: 'lambda.amazonaws.com', [type]: value };
+    const statement = { Effect: 'Allow', Action: 'sts:AssumeRole', Principal: principal };
+    expect(githubTrustViolations(trusting(statement), subject, ref)).toEqual([
+      `Role: ${type} principal ${JSON.stringify(value)} cannot be verified (it may be "*")`,
+    ]);
+  });
+
+  it('flags NotPrincipal, which trusts everyone it does not name', () => {
+    const statement = { ...unconditioned, Principal: undefined, NotPrincipal: { AWS: 'arn:aws:iam::426499248998:root' } };
+    expect(githubTrustViolations(trusting(statement), subject, ref)).toEqual([
+      'Role: NotPrincipal trusts everyone it does not name, GitHub included',
+    ]);
+  });
+
+  it.each([
+    ['an Fn::If', { 'Fn::If': ['IsProd', 'Allow', 'Deny'] }],
+    ['a dynamic reference', '{{resolve:ssm:/zachverse/trust-effect}}'],
+  ])('flags GitHub trust whose Effect is %s, which may resolve to Allow', (_case, effect) => {
+    expect(githubTrustViolations(trusting(github({ Effect: effect })), subject, ref)).toEqual([
+      'Role: GitHub trust must have a literal Effect, Allow or Deny',
+    ]);
+  });
+
+  it('ignores Deny statements, which only take access away', () => {
+    const otherAccounts = { StringNotEquals: { 'aws:PrincipalAccount': '426499248998' } };
+    const template = trusting(
+      github(),
+      github({ Effect: 'Deny', Condition: { StringNotEquals: { [REF]: ref } } }),
+      { Effect: 'Deny', Action: 'sts:AssumeRole', Principal: { AWS: '*' }, Condition: otherAccounts },
+      { Effect: 'Deny', Action: 'sts:AssumeRole', Principal: { AWS: { Ref: 'Blocked' } } },
+    );
+    expect(githubTrustViolations(template, subject, ref)).toEqual([]);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ['wrapped in Fn::If', { AssumeRolePolicyDocument: { 'Fn::If': ['Trusting', { Statement: [unconditioned] }, { Ref: 'AWS::NoValue' }] } }],
+    ['given as a JSON string', { AssumeRolePolicyDocument: JSON.stringify({ Statement: [unconditioned] }) }],
+    ['missing', {}],
+  ])('flags a trust policy %s, which it cannot read', (_case, properties) => {
+    const template = trusting();
+    template.Resources.Role!.Properties = properties;
+    expect(githubTrustViolations(template, subject, ref)).toEqual([
+      'Role: a computed or missing AssumeRolePolicyDocument cannot be verified',
+    ]);
+  });
+
+  it.each<[string, object | null]>([
+    ['a trust statement wrapped in Fn::If', { 'Fn::If': ['Trusting', unconditioned, { Ref: 'AWS::NoValue' }] }],
+    ['a null trust statement', null],
+    ['a Principal wrapped in Fn::If', { ...unconditioned, Principal: { 'Fn::If': ['Trusting', unconditioned.Principal, { AWS: '*' }] } }],
+    ['a null Principal', { ...unconditioned, Principal: null }],
+  ])('flags %s, which it cannot read', (_case, statement) => {
+    expect(githubTrustViolations(trusting(statement), subject, ref)).toEqual([
+      'Role: a trust statement without a readable Principal cannot be verified',
+    ]);
+  });
+});
+
+describe('deployRoleViolations', () => {
+  const roleName = production.github.deployRoleName;
+  const withGrant = (statement: iam.PolicyStatement, managed = false) =>
+    synth((s) => {
+      const role = new iam.Role(s, 'Role', { roleName, assumedBy: new iam.AccountRootPrincipal() });
+      role.addToPolicy(statement);
+      if (managed) role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonS3FullAccess'));
+    });
+
+  const check = (template: CfnTemplate) => deployRoleViolations([template], roleName, WEBSITE_DEPLOY_ACTIONS);
+  const POLICY = 'RoleDefaultPolicy5FFB7DAB';
+
+  it('passes the real stacks', () => {
+    const templates = synthesizeAll().map((s) => s.json);
+    expect(deployRoleViolations(templates, roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([]);
+  });
+
+  it.each([
+    ['s3:* on the bucket', new iam.PolicyStatement({ actions: ['s3:*'], resources: ['arn:aws:s3:::bucket/*'] }),
+      [`${POLICY}: s3:* is not an allowed deploy action`, `${POLICY}: wildcard resource arn:aws:s3:::bucket/*`]],
+    ['object deletion', new iam.PolicyStatement({ actions: ['s3:DeleteObject'], resources: ['arn:aws:s3:::bucket/x'] }),
+      [`${POLICY}: s3:DeleteObject is not an allowed deploy action`]],
+    ['a wildcard resource', new iam.PolicyStatement({ actions: ['s3:PutObject'], resources: ['*'] }), [`${POLICY}: wildcard resource *`]],
+    ['DNS changes', new iam.PolicyStatement({ actions: ['route53:ChangeResourceRecordSets'], resources: ['arn:aws:route53:::hostedzone/Z1'] }),
+      [`${POLICY}: route53:ChangeResourceRecordSets is not an allowed deploy action`]],
+    ['IAM administration', new iam.PolicyStatement({ actions: ['iam:PassRole'], resources: ['arn:aws:iam::426499248998:role/x'] }),
+      [`${POLICY}: iam:PassRole is not an allowed deploy action`]],
+    ['assuming the CDK roles', new iam.PolicyStatement({ actions: ['sts:AssumeRole'], resources: ['arn:aws:iam::426499248998:role/cdk-x'] }),
+      [`${POLICY}: sts:AssumeRole is not an allowed deploy action`]],
+    ['stack changes', new iam.PolicyStatement({ actions: ['cloudformation:UpdateStack'], resources: ['arn:aws:cloudformation:us-east-1:426499248998:stack/x/*'] }),
+      [`${POLICY}: cloudformation:UpdateStack is not an allowed deploy action`,
+        `${POLICY}: wildcard resource arn:aws:cloudformation:us-east-1:426499248998:stack/x/*`]],
+  ])('flags %s', (_case, statement, expected) => {
+    expect(check(withGrant(statement))).toEqual(expected);
+  });
+
+  it('flags managed policies on the role', () => {
+    const template = withGrant(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: ['arn:aws:s3:::bucket/x'] }), true);
+    expect(check(template)).toEqual(['Role1ABCC5F0: managed policies are not allowed on the deploy role']);
+  });
+
+  it('flags grants made from another stack by role name', () => {
+    const template = synth((s) => {
+      new iam.Policy(s, 'Elsewhere', {
+        roles: [iam.Role.fromRoleName(s, 'Imported', roleName)],
+        statements: [new iam.PolicyStatement({ actions: ['iam:CreateRole'], resources: ['*'] })],
+      });
+    });
+    expect(check(template)).toEqual([
+      'ElsewhereAE38D9E0: iam:CreateRole is not an allowed deploy action',
+      'ElsewhereAE38D9E0: wildcard resource *',
+    ]);
+  });
+
+  /** A raw template with the deploy role and these resources, for shapes CDK will not generate. */
+  const withRole = (resources: Record<string, CfnResource> = {}): CfnTemplate => ({
+    Resources: { Role: { Type: 'AWS::IAM::Role', Properties: { RoleName: roleName } }, ...resources },
+  });
+  const policyFor = (roles: unknown[], ...statements: object[]): CfnResource => ({
+    Type: 'AWS::IAM::Policy',
+    Properties: { PolicyName: 'Deploy', Roles: roles, PolicyDocument: { Statement: statements } },
+  });
+  const deleteObject = { Effect: 'Allow', Action: 's3:DeleteObject', Resource: 'arn:aws:s3:::bucket/x' };
+  const DELETE_OBJECT = 's3:DeleteObject is not an allowed deploy action';
+
+  it("checks the role's inline policies", () => {
+    const template = withRole();
+    template.Resources.Role!.Properties!.Policies = [{ PolicyName: 'Extra', PolicyDocument: { Statement: [deleteObject] } }];
+    expect(check(template)).toEqual([`Role/Extra: ${DELETE_OBJECT}`]);
+  });
+
+  it('flags NotAction and NotResource, which grant everything they do not list', () => {
+    const template = withRole({
+      Policy: policyFor(
+        [roleName],
+        { Effect: 'Allow', NotAction: 's3:DeleteObject', Resource: 'arn:aws:s3:::bucket/x' },
+        { Effect: 'Allow', Action: 's3:GetObject', NotResource: 'arn:aws:s3:::other/x' },
+      ),
+    });
+    const tooBroad = 'Policy: NotAction/NotResource grants are too broad';
+    expect(check(template)).toEqual([tooBroad, tooBroad]);
+  });
+
+  it.each<[string, unknown]>([
+    ['an Fn::If', { 'Fn::If': ['IsProd', 's3:GetObject', 's3:DeleteObject'] }],
+    ['a Ref to a parameter', { Ref: 'DeployAction' }],
+    ['a dynamic reference', '{{resolve:ssm:/zachverse/deploy-action}}'],
+  ])('flags an Action given as %s, which it cannot read', (_case, action) => {
+    const statement = { ...deleteObject, Action: ['s3:GetObject', action] };
+    expect(check(withRole({ Policy: policyFor([roleName], statement) }))).toEqual([
+      `Policy: a computed Action ${JSON.stringify(action)} cannot be verified`,
+    ]);
+  });
+
+  it('ignores Deny statements, which only take access away', () => {
+    const deny = { Effect: 'Deny', Action: 's3:*', Resource: '*' };
+    expect(check(withRole({ Policy: policyFor([roleName], deny) }))).toEqual([]);
+  });
+
+  it.each<[string, object]>([
+    ['an Effect given as Fn::If', { ...deleteObject, Effect: { 'Fn::If': ['IsProd', 'Deny', 'Allow'] } }],
+    ['an Effect given as a dynamic reference', { ...deleteObject, Effect: '{{resolve:ssm:/zachverse/effect}}' }],
+    ['a statement wrapped in Fn::If', { 'Fn::If': ['Extra', deleteObject, { Ref: 'AWS::NoValue' }] }],
+  ])('flags %s, which may resolve to Allow', (_case, statement) => {
+    expect(check(withRole({ Policy: policyFor([roleName], statement) }))).toEqual([
+      'Policy: a statement without a literal Effect (Allow or Deny) cannot be verified',
+    ]);
+  });
+
+  it.each<[string, (template: CfnTemplate) => unknown, string]>([
+    ['an inline policy wrapped in Fn::If', (t) => (t.Resources.Role!.Properties!.Policies = [
+      { 'Fn::If': ['Extra', { PolicyName: 'Extra', PolicyDocument: { Statement: [deleteObject] } }, { Ref: 'AWS::NoValue' }] },
+    ]), 'Role/(computed)'],
+    ['a policy document wrapped in Fn::If', (t) => (t.Resources.Policy = {
+      Type: 'AWS::IAM::Policy',
+      Properties: { Roles: [roleName], PolicyDocument: { 'Fn::If': ['Extra', { Statement: [deleteObject] }, {}] } },
+    }), 'Policy'],
+    ['a policy document given as a JSON string', (t) => (t.Resources.Policy = {
+      Type: 'AWS::IAM::ManagedPolicy',
+      Properties: { Roles: [roleName], PolicyDocument: JSON.stringify({ Statement: [deleteObject] }) },
+    }), 'Policy'],
+  ])('flags %s, which it cannot read', (_case, change, where) => {
+    const template = withRole();
+    change(template);
+    expect(check(template)).toEqual([`${where}: a computed or missing PolicyDocument cannot be verified`]);
+  });
+
+  it.each<[string, unknown]>([
+    ['by name', roleName],
+    ['by Ref', { Ref: 'Role' }],
+  ])('checks inline policies defined as AWS::IAM::RolePolicy resources, attached %s', (_case, target) => {
+    const rolePolicy = {
+      Type: 'AWS::IAM::RolePolicy',
+      Properties: { RoleName: target, PolicyName: 'Extra', PolicyDocument: { Statement: [deleteObject] } },
+    };
+    expect(check(withRole({ Extra: rolePolicy }))).toEqual([`Extra: ${DELETE_OBJECT}`]);
+  });
+
+  // Role names are unique regardless of case, so IAM finds the role by any of these.
+  it('finds the deploy role and policies attached to it by name in any letter case', () => {
+    const template = withRole({ Policy: policyFor([roleName.toUpperCase()], deleteObject) });
+    template.Resources.Role!.Properties = {
+      RoleName: 'Zachverse-GitHub-Site-Deploy',
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AdministratorAccess'],
+    };
+    expect(check(template)).toEqual(['Role: managed policies are not allowed on the deploy role', `Policy: ${DELETE_OBJECT}`]);
+  });
+
+  it.each<[string, unknown]>([
+    ['an Fn::Join', { 'Fn::Join': ['-', ['zachverse', 'github', 'site', 'deploy']] }],
+    ['a dynamic reference', '{{resolve:ssm:/zachverse/deploy-role-name}}'],
+  ])('flags a role whose RoleName is %s, which may be the deploy role', (_case, name) => {
+    const template = withRole();
+    template.Resources.Role!.Properties = {
+      RoleName: name,
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AdministratorAccess'],
+      Policies: [{ PolicyName: 'Extra', PolicyDocument: { Statement: [deleteObject] } }],
+    };
+    expect(check(template)).toEqual(['Role: a computed RoleName cannot be verified']);
+  });
+
+  it('ignores roles with other names, and policies attached only to them', () => {
+    const adminArns = ['arn:aws:iam::aws:policy/AdministratorAccess'];
+    const template = withRole({
+      Generated: { Type: 'AWS::IAM::Role' },
+      Named: { Type: 'AWS::IAM::Role', Properties: { RoleName: 'other-role', ManagedPolicyArns: adminArns } },
+      Policy: policyFor(['other-role', { Ref: 'Generated' }], deleteObject),
+    });
+    expect(check(template)).toEqual([]);
+  });
+
+  // Each could name the deploy role during deployment.
+  it.each<[string, unknown]>([
+    ['an Fn::ImportValue', { 'Fn::ImportValue': 'DeployRoleName' }],
+    ['an Fn::Join', { 'Fn::Join': ['-', ['zachverse', 'github', 'site', 'deploy']] }],
+    ['a role ARN', `arn:aws:iam::426499248998:role/${roleName}`],
+    ['a Ref to a parameter', { Ref: 'DeployRoleName' }],
+    ['a Ref to a resource that is not a role', { Ref: 'Bucket' }],
+  ])('flags a policy whose role is given as %s, which it cannot read', (_case, target) => {
+    const document = { Statement: [deleteObject] };
+    const template = withRole({
+      Bucket: { Type: 'AWS::S3::Bucket' },
+      Standalone: policyFor(['other-role', target], deleteObject),
+      Managed: { Type: 'AWS::IAM::ManagedPolicy', Properties: { Roles: [target], PolicyDocument: document } },
+      Inline: { Type: 'AWS::IAM::RolePolicy', Properties: { RoleName: target, PolicyName: 'Extra', PolicyDocument: document } },
+    });
+    const what = `role ${JSON.stringify(target)}`;
+    const unreadable = (id: string) => `${id}: ${what} is not a role name or a role in this stack, so it cannot be verified`;
+    expect(check(template)).toEqual([unreadable('Standalone'), unreadable('Managed'), unreadable('Inline')]);
+  });
+
+  it('checks every template: the role in one, a grant by name in another, in either order', () => {
+    const role = withRole();
+    const grant: CfnTemplate = { Resources: { Policy: policyFor([roleName], deleteObject) } };
+    expect(deployRoleViolations([role, grant], roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([`Policy: ${DELETE_OBJECT}`]);
+    expect(deployRoleViolations([grant, role], roleName, WEBSITE_DEPLOY_ACTIONS)).toEqual([`Policy: ${DELETE_OBJECT}`]);
+  });
+
+  it('checks a policy attached to the deploy role and another role', () => {
+    expect(check(withRole({ Policy: policyFor(['other-role', roleName], deleteObject) }))).toEqual([`Policy: ${DELETE_OBJECT}`]);
+  });
+
+  describe('resources', () => {
+    // The site's grants as CDK writes them: bucketArn, arnForObjects('*'), and distributionArn.
+    const BUCKET_ARN = { 'Fn::GetAtt': ['Bucket', 'Arn'] };
+    const OBJECTS = { 'Fn::Join': ['', [BUCKET_ARN, '/*']] };
+    const DISTRIBUTION_ARN = { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: 'Distribution' }]] };
+    const granting = (...resources: unknown[]) =>
+      withRole({
+        Bucket: { Type: 'AWS::S3::Bucket' },
+        Distribution: { Type: 'AWS::CloudFront::Distribution' },
+        Policy: policyFor([roleName], { Effect: 'Allow', Action: 's3:GetObject', Resource: resources }),
+      });
+
+    it('accepts its own bucket, objects in it, and its distribution, and literal ARNs without wildcards', () => {
+      expect(check(granting(BUCKET_ARN, OBJECTS, DISTRIBUTION_ARN, 'arn:aws:s3:::bucket/index.html'))).toEqual([]);
+    });
+
+    it("flags a literal ARN with IAM's one-character wildcard, ?", () => {
+      expect(check(granting('arn:aws:s3:::bucke?/index.html'))).toEqual(['Policy: wildcard resource arn:aws:s3:::bucke?/index.html']);
+    });
+
+    it.each<[string, unknown]>([
+      ['every S3 resource, joined from literals', { 'Fn::Join': ['', ['arn:aws:s3:::', '*']] }],
+      ['every S3 resource, joined with a separator', { 'Fn::Join': [':', ['arn', 'aws', 's3', '', '', '*']] }],
+      ['objects in another bucket, joined from three literals', { 'Fn::Join': ['', ['arn:aws:s3:::', 'bucket', '/*']] }],
+      ['every bucket whose name starts with its own', { 'Fn::Join': ['', [BUCKET_ARN, '*']] }],
+      ['its bucket followed by a computed suffix', { 'Fn::Join': ['', [BUCKET_ARN, { Ref: 'KeySuffix' }]] }],
+      ['objects in a bucket from another stack', { 'Fn::Join': ['', [{ 'Fn::ImportValue': 'OtherBucketArn' }, '/*']] }],
+      ['an imported ARN', { 'Fn::ImportValue': 'SiteBucketArn' }],
+      ['an Fn::Sub', { 'Fn::Sub': 'arn:aws:s3:::${Bucket}/*' }],
+      ['the Arn attribute of a resource that is not a bucket', { 'Fn::GetAtt': ['Role', 'Arn'] }],
+      ['another attribute of its bucket', { 'Fn::GetAtt': ['Bucket', 'RegionalDomainName'] }],
+      ['distributions in every account', { 'Fn::Join': ['', ['arn:aws:cloudfront::*:distribution/', { Ref: 'Distribution' }]] }],
+      ['every distribution', { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', '*']] }],
+      ['a distribution ARN ending in something other than its distribution',
+        { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: 'Bucket' }]] }],
+      // CloudFormation substitutes a dynamic reference during deployment, wherever it appears in a string.
+      ['an SSM dynamic reference', '{{resolve:ssm:/zachverse/deploy-target:1}}'],
+      ['a Secrets Manager dynamic reference', '{{resolve:secretsmanager:zachverse/deploy:SecretString:bucketArn}}'],
+      ['an ARN around a dynamic reference', 'arn:aws:s3:::{{resolve:ssm:/zachverse/bucket}}'],
+    ])('flags a computed resource that is not its own bucket or distribution: %s', (_case, resource) => {
+      const what = `resource ${JSON.stringify(resource)}`;
+      expect(check(granting(resource))).toEqual([
+        `Policy: ${what} is not this stack's bucket, objects in it, or its distribution, so it cannot be verified`,
+      ]);
+    });
   });
 });

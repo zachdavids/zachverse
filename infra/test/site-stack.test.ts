@@ -1,7 +1,17 @@
-import { Annotations, Match } from 'aws-cdk-lib/assertions';
+import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
+import { App } from 'aws-cdk-lib/core';
 import { CloudAssembly } from 'aws-cdk-lib/cx-api';
 import { afterAll, describe, expect, it } from 'vitest';
-import { PRICING_MODES, productionConfig, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
+import { SiteStack } from '../lib/site-stack';
+import type { CfnTemplate } from './support/synth';
+import {
+  cdkContext,
+  PRICING_MODES,
+  productionConfig,
+  synthesizeSite,
+  TEST_CERTIFICATE_ARN,
+  TEST_WEB_ACL_ARN,
+} from './support/synth';
 
 // CDK deletes its temporary cloud assemblies on process exit, which Vitest workers skip.
 afterAll(() => CloudAssembly.cleanupTemporaryDirectories());
@@ -208,6 +218,34 @@ describe('site stack (pay-as-you-go)', () => {
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBeUndefined();
     template.resourceCountIs('AWS::PricingPlanManager::Subscription', 0);
   });
+
+  it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
+    expect(json.Resources['SiteDeployPolicyEEC9A210']!.Properties).toEqual({
+      PolicyName: 'SiteDeployPolicyEEC9A210',
+      Roles: ['zachverse-github-site-deploy'],
+      PolicyDocument: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [BUCKET, 'Arn'] } },
+          {
+            Effect: 'Allow',
+            Action: ['s3:GetObject', 's3:PutObject'],
+            Resource: { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/*']] },
+          },
+          {
+            Effect: 'Allow',
+            Action: [
+              'cloudfront:CreateInvalidation',
+              'cloudfront:GetDistribution',
+              'cloudfront:GetInvalidation',
+              'cloudfront:ListInvalidations',
+            ],
+            Resource: { 'Fn::Join': ['', ['arn:aws:cloudfront::426499248998:distribution/', { Ref: DISTRIBUTION }]] },
+          },
+        ],
+      },
+    });
+  });
 });
 
 describe('site stack (Free flat-rate plan enabled)', () => {
@@ -241,8 +279,14 @@ const error = (message: unknown) => expect.objectContaining({ message });
 const ANY_ID = 'abcdef01-2345-4789-8bcd-ef0123456789';
 
 describe('site stack configuration errors', () => {
-  const synthesizeWith = (certificateArn: string | undefined) => () =>
-    synthesizeSite(productionConfig({ certificateArn }));
+  // The site stack's template, with cdk.json's context. It builds the stack itself: createStacks leaves it out until
+  // certificateArn is set.
+  const synthesizeWith = (certificateArn: string | undefined) => () => {
+    const config = productionConfig({ certificateArn });
+    const env = { account: config.account, region: config.region };
+    const stack = new SiteStack(new App({ context: cdkContext }), 'ZachverseSite', { env, config });
+    return Template.fromStack(stack).toJSON() as CfnTemplate;
+  };
 
   it.each([
     ['missing', undefined],
@@ -298,7 +342,7 @@ describe('site stack configuration errors', () => {
 
   it('accepts a certificate ID with any lowercase hex digit', () => {
     const certificateArn = TEST_CERTIFICATE_ARN.replace(/[0-9a-f-]{36}$/, ANY_ID);
-    const { json } = synthesizeWith(certificateArn)();
+    const json = synthesizeWith(certificateArn)();
     expect(json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.ViewerCertificate.AcmCertificateArn).toBe(certificateArn);
   });
 

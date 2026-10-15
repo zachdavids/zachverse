@@ -8,6 +8,7 @@ import { Construct } from 'constructs';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { createStacks } from '../lib/app';
 import { production } from '../lib/config';
+import { IdentityStack } from '../lib/identity-stack';
 import { SiteStack } from '../lib/site-stack';
 import { prohibitedResourceViolations } from './support/checks';
 import { productionConfig, synthesizeAll, synthesizeSite, TEST_CERTIFICATE_ARN, TEST_WEB_ACL_ARN } from './support/synth';
@@ -51,14 +52,14 @@ describe('productionConfig', () => {
 describe('synthesizeAll', () => {
   it('synthesizes the production configuration by default', () => {
     const stacks = synthesizeAll();
-    expect(stacks.map((s) => s.stack.stackName)).toEqual(['ZachverseSite']);
-    const config = stacks[0]!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
+    expect(stacks.map((s) => s.stack.stackName)).toEqual(['ZachverseIdentity', 'ZachverseSite']);
+    const config = stacks[1]!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig;
     expect(config.ViewerCertificate.AcmCertificateArn).toBe(productionConfig().certificateArn);
     expect(config.WebACLId).toBe(production.pricingPlan?.webAclArn);
   });
 
   it('synthesizes the configuration it is given', () => {
-    const [site] = synthesizeAll(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }));
+    const [, site] = synthesizeAll(productionConfig({ pricingPlan: { tier: 'FREE', webAclArn: TEST_WEB_ACL_ARN } }));
     expect(site!.json.Resources[DISTRIBUTION]!.Properties!.DistributionConfig.WebACLId).toBe(TEST_WEB_ACL_ARN);
   });
 
@@ -66,25 +67,27 @@ describe('synthesizeAll', () => {
     const cdkJson = readFileSync(path.join(__dirname, '..', 'cdk.json'), 'utf8');
     const flags = Object.entries<unknown>(JSON.parse(cdkJson).context);
     expect(flags.length).toBeGreaterThan(0);
-    const [site] = synthesizeAll();
-    for (const [key, value] of flags) expect(site!.stack.node.tryGetContext(key), key).toEqual(value);
+    for (const { stack } of synthesizeAll()) {
+      for (const [key, value] of flags) expect(stack.node.tryGetContext(key), `${stack.stackName}: ${key}`).toEqual(value);
+    }
   });
 
-  // cdk synth emits these stacks as well, so the guardrails must see them although createStacks returns only the site.
+  // cdk synth emits these stacks as well, so the guardrails must see them although createStacks does not return them.
   it.each<[string, (app: App, site: Stack) => Construct, string]>([
     ['inside the site stack', (_app, site) => site, 'ZachverseSite/Dns'],
     ['inside a Stage', (app) => new Stage(app, 'Staged'), 'Staged/Dns'],
     ['under a plain construct', (app) => new Construct(app, 'Shared'), 'Shared/Dns'],
   ])('includes a stack created %s', (_case, scopeFor, stackPath) => {
     vi.mocked(createStacks).mockImplementationOnce((app, config) => {
+      const identity = new IdentityStack(app, 'ZachverseIdentity', { config });
       const site = new SiteStack(app, 'ZachverseSite', { config });
       const dns = new Stack(scopeFor(app, site), 'Dns');
       new route53.PublicHostedZone(dns, 'Zone', { zoneName: config.domainName });
-      return { site };
+      return { identity, site };
     });
     const stacks = synthesizeAll();
-    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite', stackPath]);
-    expect(Object.values(stacks[1]!.json.Resources).map((r) => r.Type)).toEqual([
+    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseIdentity', 'ZachverseSite', stackPath]);
+    expect(Object.values(stacks[2]!.json.Resources).map((r) => r.Type)).toEqual([
       'AWS::Route53::HostedZone',
       'AWS::CDK::Metadata',
     ]);
@@ -92,13 +95,14 @@ describe('synthesizeAll', () => {
 
   it('leaves a nested stack to its parent template, where the prohibited-resource check flags it', () => {
     vi.mocked(createStacks).mockImplementationOnce((app, config) => {
+      const identity = new IdentityStack(app, 'ZachverseIdentity', { config });
       const site = new SiteStack(app, 'ZachverseSite', { config });
       new NestedStack(site, 'Nested');
-      return { site };
+      return { identity, site };
     });
     const stacks = synthesizeAll();
-    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseSite']);
-    expect(prohibitedResourceViolations(stacks[0]!.json)).toEqual([
+    expect(stacks.map((s) => s.stack.node.path)).toEqual(['ZachverseIdentity', 'ZachverseSite']);
+    expect(prohibitedResourceViolations(stacks[1]!.json)).toEqual([
       expect.stringMatching(
         /^Nested\w+ \(AWS::CloudFormation::Stack\): nested stacks and Service Catalog products launch templates these guardrails do not check$/,
       ),
@@ -108,7 +112,10 @@ describe('synthesizeAll', () => {
 
 describe('synthesizeSite', () => {
   it('fails clearly when the app has no ZachverseSite stack', () => {
-    vi.mocked(createStacks).mockImplementationOnce((app, config) => ({ site: new SiteStack(app, 'RenamedSite', { config }) }));
+    vi.mocked(createStacks).mockImplementationOnce((app, config) => ({
+      identity: new IdentityStack(app, 'ZachverseIdentity', { config }),
+      site: new SiteStack(app, 'RenamedSite', { config }),
+    }));
     expect(() => synthesizeSite()).toThrow('ZachverseSite stack not found');
   });
 

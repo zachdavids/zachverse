@@ -41,6 +41,11 @@ const PROHIBITED: { matches: (type: string) => boolean; reason: string }[] = [
   },
   { matches: (t) => t === 'AWS::CloudFormation::StackSet', reason: 'StackSets are not allowed in this project' },
   {
+    // An identity pool that accepts GitHub's OIDC provider hands out credentials no role trust check sees.
+    matches: (t) => t.startsWith('AWS::Cognito::'),
+    reason: 'website stacks need no Cognito resources, and an identity pool can exchange outside tokens for credentials',
+  },
+  {
     // Service Catalog products launch their own templates, and its other types exist only to serve products.
     matches: (t) =>
       t === 'AWS::CloudFormation::Stack' || t === 'AWS::Serverless::Application' || t.startsWith('AWS::ServiceCatalog::'),
@@ -278,6 +283,238 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
   const actions = asArray<string>(conditions['route53:ChangeResourceRecordSetsActions']);
   if (actions.length === 0 || actions.some((a) => a !== 'UPSERT' && a !== 'CREATE')) {
     out.push(`${where}: change actions must be limited to CREATE/UPSERT`);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// GitHub deploy role: trust and permissions
+// ---------------------------------------------------------------------------
+
+const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
+
+/** Everything routine website publishing needs: no delete, IAM, DNS, or stack actions. */
+export const WEBSITE_DEPLOY_ACTIONS: ReadonlySet<string> = new Set([
+  's3:ListBucket',
+  's3:GetObject',
+  's3:PutObject',
+  'cloudfront:CreateInvalidation',
+  'cloudfront:GetInvalidation',
+  'cloudfront:ListInvalidations',
+  'cloudfront:GetDistribution',
+]);
+
+/** The keys of a Principal the check can read. */
+const PRINCIPAL_TYPES = new Set(['AWS', 'Federated', 'Service', 'CanonicalUser']);
+
+/** A string CloudFormation deploys as written: no intrinsic function, and no {{resolve:...}} dynamic reference. */
+const isLiteral = (value: Json): value is string => typeof value === 'string' && !DYNAMIC_REFERENCE.test(value);
+
+/**
+ * Whether a Federated principal is GitHub's OIDC provider: a literal ARN, or the Ref or Arn attribute (both its ARN)
+ * of an OIDC provider in the template with a literal Url. Undefined for anything else, which could resolve to any
+ * provider during deployment.
+ */
+function isGitHubOidcPrincipal(template: CfnTemplate, federated: Json): boolean | undefined {
+  // The host of a provider ARN or Url, compared whole and in any letter case. An enterprise issuer adds a path.
+  const namesGitHub = (value: Json) => {
+    if (!isLiteral(value)) return undefined;
+    const host = value.startsWith('arn:') ? value.split(':oidc-provider/')[1]?.split('/')[0] : URL.parse(value)?.host;
+    return host?.toLowerCase() === GITHUB_OIDC_HOST;
+  };
+  if (typeof federated === 'string') return namesGitHub(federated);
+  const [getAttId, attribute] = asArray<Json>(federated?.['Fn::GetAtt']);
+  const id = federated?.Ref ?? (attribute === 'Arn' ? getAttId : undefined);
+  const provider = typeof id === 'string' ? template.Resources[id] : undefined;
+  return provider?.Type === 'AWS::IAM::OIDCProvider' ? namesGitHub(provider.Properties?.Url) : undefined;
+}
+
+/**
+ * Every role trusting GitHub's OIDC provider must require the STS audience,
+ * exactly the expected subject, and the expected ref (no wildcards, no StringLike).
+ * Like the DNS check, it fails closed. A wildcard principal or NotPrincipal,
+ * which GitHub's tokens also match, is a violation. So is a trust policy,
+ * statement, or Principal it cannot read, an AWS, Service, or CanonicalUser
+ * value that is not a literal (it may be "*"), a Federated principal it cannot
+ * resolve to an OIDC provider, and GitHub trust with a computed Effect. Values
+ * with {{resolve:...}} dynamic references count as computed.
+ */
+export function githubTrustViolations(template: CfnTemplate, expectedSubject: string, expectedRef: string): string[] {
+  const out: string[] = [];
+  for (const [id, role] of resourcesOf(template, (r) => r.Type === 'AWS::IAM::Role')) {
+    const document = role.Properties?.AssumeRolePolicyDocument;
+    // A document wrapped in Fn::If, or given as a JSON string, has no readable Statement.
+    if (document?.Statement === undefined) {
+      out.push(`${id}: a computed or missing AssumeRolePolicyDocument cannot be verified`);
+      continue;
+    }
+    for (const statement of asArray<Json>(document.Statement)) {
+      if (typeof statement !== 'object' || statement === null) {
+        out.push(`${id}: a trust statement without a readable Principal cannot be verified`);
+        continue;
+      }
+      // Only a literal Deny is skipped: it can only take access away, and a computed Effect may resolve to Allow.
+      if (statement.Effect === 'Deny') continue;
+      if (statement.NotPrincipal !== undefined) {
+        out.push(`${id}: NotPrincipal trusts everyone it does not name, GitHub included`);
+        continue;
+      }
+      // "*" is the same as AWS "*".
+      const principal = statement.Principal === '*' ? { AWS: '*' } : statement.Principal;
+      // A statement wrapped in Fn::If has no Principal, and a Principal wrapped in one has no principal types.
+      if (typeof principal !== 'object' || principal === null || Object.keys(principal).some((t) => !PRINCIPAL_TYPES.has(t))) {
+        out.push(`${id}: a trust statement without a readable Principal cannot be verified`);
+        continue;
+      }
+      if (Object.values<Json>(principal).some((names) => asArray(names).includes('*'))) {
+        out.push(`${id}: a wildcard principal trusts everyone, GitHub included`);
+        continue;
+      }
+      // Federated entries are resolved below; any other computed value may be "*".
+      for (const [type, names] of Object.entries<Json>(principal)) {
+        if (type === 'Federated') continue;
+        for (const name of asArray<Json>(names).filter((n) => !isLiteral(n))) {
+          out.push(`${id}: ${type} principal ${JSON.stringify(name)} cannot be verified (it may be "*")`);
+        }
+      }
+      const federated = asArray<Json>(principal.Federated);
+      for (const entry of federated.filter((e) => isGitHubOidcPrincipal(template, e) === undefined)) {
+        const what = `Federated principal ${JSON.stringify(entry)}`;
+        out.push(
+          `${id}: ${what} is not a literal ARN or an OIDC provider in this stack with a literal Url, so it cannot be verified`,
+        );
+      }
+      if (!federated.some((e) => isGitHubOidcPrincipal(template, e))) continue;
+      if (statement.Effect !== 'Allow') out.push(`${id}: GitHub trust must have a literal Effect, Allow or Deny`);
+      const actions = asArray<string>(statement.Action);
+      if (actions.length !== 1 || actions[0] !== 'sts:AssumeRoleWithWebIdentity') {
+        out.push(`${id}: GitHub trust must allow only sts:AssumeRoleWithWebIdentity`);
+      }
+      const condition = statement.Condition ?? {};
+      const operators = Object.keys(condition);
+      if (operators.length !== 1 || operators[0] !== 'StringEquals') {
+        out.push(`${id}: GitHub trust must use only StringEquals conditions (found ${operators.join(', ') || 'none'})`);
+      }
+      const equals = condition.StringEquals ?? {};
+      if (equals[`${GITHUB_OIDC_HOST}:aud`] !== 'sts.amazonaws.com') out.push(`${id}: audience must be sts.amazonaws.com`);
+      if (equals[`${GITHUB_OIDC_HOST}:sub`] !== expectedSubject) {
+        out.push(`${id}: subject must be exactly ${expectedSubject}`);
+      }
+      if (equals[`${GITHUB_OIDC_HOST}:ref`] !== expectedRef) out.push(`${id}: ref must be exactly ${expectedRef}`);
+    }
+  }
+  return out;
+}
+
+/** Resources that grant a role permissions: their Roles, or a RolePolicy's RoleName, name the role. */
+const ROLE_POLICY_TYPES = new Set(['AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy', 'AWS::IAM::RolePolicy']);
+/** IAM's role name characters; an ARN is not a role name. */
+const ROLE_NAME = /^[\w+=,.@-]+$/;
+/** What CDK writes for distributionArn before the distribution's ID: a literal account, so no wildcard. */
+const DISTRIBUTION_ARN_PREFIX = /^arn:aws:cloudfront::\d{12}:distribution\/$/;
+
+/**
+ * Whether a computed Resource is the template's own bucket, objects in it, or distribution, in the forms CDK
+ * writes for bucketArn, arnForObjects, and distributionArn.
+ */
+function isOwnSiteResource(template: CfnTemplate, value: Json): boolean {
+  const defines = (id: unknown, type: string) => typeof id === 'string' && template.Resources[id]?.Type === type;
+  const isBucketArn = (v: Json) => {
+    const [id, attribute] = asArray<Json>(v?.['Fn::GetAtt']);
+    return attribute === 'Arn' && defines(id, 'AWS::S3::Bucket');
+  };
+  if (isBucketArn(value)) return true;
+  const [separator, parts] = asArray<Json>(value?.['Fn::Join']);
+  if (separator !== '' || parts?.length !== 2) return false;
+  const [head, tail] = parts;
+  // The key pattern must start with a slash, or it would also match other buckets whose names start with this one's.
+  if (isBucketArn(head)) return typeof tail === 'string' && tail.startsWith('/');
+  return typeof head === 'string' && DISTRIBUTION_ARN_PREFIX.test(head) && defines(tail?.Ref, 'AWS::CloudFront::Distribution');
+}
+
+/**
+ * Collects every permission granted to the named role across all templates
+ * (its inline policies, and the AWS::IAM::Policy, ManagedPolicy, and
+ * RolePolicy resources that name it or Ref it) and flags anything beyond the
+ * allowed actions, any resource other than a literal ARN without wildcards or
+ * the stack's own bucket, objects in it, or distribution, and any managed
+ * policy attached by ARN. Like the DNS check, it fails closed: a RoleName,
+ * policy role, document, Effect, Action, or computed resource it cannot read
+ * is a violation, and a {{resolve:...}} dynamic reference counts as computed.
+ * It reads identity-based policies only, not resource policies, such as a
+ * bucket policy that names the role.
+ */
+export function deployRoleViolations(
+  templates: CfnTemplate[],
+  roleName: string,
+  allowedActions: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  // Role names are unique regardless of case, so IAM finds the role by its name in any case.
+  const isRoleName = (name: string) => name.toLowerCase() === roleName.toLowerCase();
+
+  for (const template of templates) {
+    const checkDocument = (where: string, document: Json) => {
+      // A document wrapped in Fn::If, or given as a JSON string, has no readable Statement.
+      if (document?.Statement === undefined) {
+        out.push(`${where}: a computed or missing PolicyDocument cannot be verified`);
+        return;
+      }
+      for (const statement of asArray<Json>(document.Statement)) {
+        // Only a literal Deny is skipped: a computed Effect may resolve to Allow.
+        if (statement.Effect === 'Deny') continue;
+        if (statement.Effect !== 'Allow') {
+          out.push(`${where}: a statement without a literal Effect (Allow or Deny) cannot be verified`);
+          continue;
+        }
+        if (statement.NotAction !== undefined || statement.NotResource !== undefined) {
+          out.push(`${where}: NotAction/NotResource grants are too broad`);
+        }
+        for (const action of asArray<Json>(statement.Action)) {
+          if (!isLiteral(action)) out.push(`${where}: a computed Action ${JSON.stringify(action)} cannot be verified`);
+          else if (!allowedActions.has(action)) out.push(`${where}: ${action} is not an allowed deploy action`);
+        }
+        for (const resource of asArray<Json>(statement.Resource)) {
+          // IAM reads both * and ? in an ARN as wildcards.
+          if (isLiteral(resource)) {
+            if (/[*?]/.test(resource)) out.push(`${where}: wildcard resource ${resource}`);
+          } else if (!isOwnSiteResource(template, resource)) {
+            const what = `resource ${JSON.stringify(resource)}`;
+            out.push(`${where}: ${what} is not this stack's bucket, objects in it, or its distribution, so it cannot be verified`);
+          }
+        }
+      }
+    };
+
+    const roleIds: string[] = [];
+    for (const [id, role] of resourcesOf(template, (r) => r.Type === 'AWS::IAM::Role')) {
+      const props = role.Properties;
+      const name = props?.RoleName;
+      // Without a RoleName, CloudFormation generates a unique one; a computed one may be the deploy role's.
+      if (name !== undefined && !isLiteral(name)) out.push(`${id}: a computed RoleName cannot be verified`);
+      if (!isLiteral(name) || !isRoleName(name)) continue;
+      roleIds.push(id);
+      if (asArray(props?.ManagedPolicyArns).length > 0) out.push(`${id}: managed policies are not allowed on the deploy role`);
+      for (const p of asArray<Json>(props?.Policies)) {
+        // An entry (or the whole list) wrapped in Fn::If has no literal name.
+        checkDocument(`${id}/${typeof p.PolicyName === 'string' ? p.PolicyName : '(computed)'}`, p.PolicyDocument);
+      }
+    }
+
+    /** Whether a policy's role is the deploy role; undefined for anything but a role name or a Ref to a role here. */
+    const isDeployRole = (role: Json): boolean | undefined => {
+      if (typeof role === 'string') return ROLE_NAME.test(role) ? isRoleName(role) : undefined;
+      const isRoleHere = typeof role?.Ref === 'string' && template.Resources[role.Ref]?.Type === 'AWS::IAM::Role';
+      return isRoleHere ? roleIds.includes(role.Ref) : undefined;
+    };
+    for (const [id, policy] of resourcesOf(template, (r) => ROLE_POLICY_TYPES.has(r.Type))) {
+      const props = policy.Properties;
+      const roles = asArray<Json>(policy.Type === 'AWS::IAM::RolePolicy' ? props?.RoleName : props?.Roles);
+      for (const role of roles.filter((r) => isDeployRole(r) === undefined)) {
+        out.push(`${id}: role ${JSON.stringify(role)} is not a role name or a role in this stack, so it cannot be verified`);
+      }
+      if (roles.some((r) => isDeployRole(r))) checkDocument(id, props?.PolicyDocument);
+    }
   }
   return out;
 }
