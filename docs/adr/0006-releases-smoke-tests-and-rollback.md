@@ -1,6 +1,6 @@
 # ADR 0006: Releases, smoke tests, and rollback
 
-- Status: Accepted (milestone 6). The workflows publish only on `main`, so the first release follows the merge.
+- Status: Accepted (milestone 6), merged on 2026-10-15 as `d6503b1`, whose Deploy run published and verified the first release ("First release"). The restore rehearsal passed the same day ("Restore rehearsal").
 - Date: 2026-10-15
 
 ## Decision
@@ -179,9 +179,34 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - the release-record deny, from `398c15b`. Through CloudFront, at both hostnames, an object written under `_releases/` as a probe got 403 `AccessDenied`, and a missing key there 404 `NoSuchKey`;
   - the deploy role's page deletion and its deny, from `a442c2f`. IAM's policy simulator, which applies the organization's SCPs, allows the role to delete a page and denies it deleting anything under `assets/` or `_releases/`, or any object version.
 
+## First release (2026-10-15)
+
+The merge's Deploy run, 38708854432, published `d6503b1` and recorded it as verified, its four jobs passing in about three minutes:
+- **Published** at 08:54 UTC: the two assets uploaded, none replaced, no page removed, and six paths invalidated (`/`, `/404.html`, `/favicon.svg`, `/index.html`, `/robots.txt`, `/sitemap.xml`). The runner had AWS CLI 2.37.13 and Node 24.21.0.
+- **Checked:** the smoke test's 11 checks passed, and so did the browser check, on the built pages in the build job and on the live release through the distribution in the browser job.
+- **Read live afterwards:**
+  - The CloudFront hostname, and the apex through the distribution over IPv4 and IPv6, serve `d6503b1`'s pages.
+  - `www` and HTTP redirect as designed, and a missing page gets the 404 page.
+  - The history gets a 403 through CloudFront. Read with the administrator's credentials, it holds one `publish` entry, verified, by run `38708854432-1`.
+  - The bucket holds the release's five files outside `assets/`, its two assets, its copy under `_releases/d6503b1…/` (seven files and a manifest), and the history.
+- **The probe** written before the merge (ADR 0003, "Deployed state") was deleted afterwards, its only version removed.
+
+#9, which recorded this release, made the second, which the restore rehearsal needs.
+
+## Restore rehearsal (2026-10-15)
+
+| Step | Run | Result |
+| --- | --- | --- |
+| Release B: #9's merge, `663ef61` | Deploy 38709915354 | Published and verified at 09:04 UTC. Both assets were already in place, and no page was removed |
+| Restore A, `d6503b1` | Restore 38710362375 | The test job passed, then the restore job republished A from its copy, passed all 11 smoke checks, recorded A as verified, and held deploys |
+| A Deploy run started by hand without "Publish over a restore" | Deploy 38710602886 | Failed as intended. The publish step refused: "deploys are held, since run 38710362375-1 restored d6503b1… Nothing was changed". The browser job was skipped, and the verify job found nothing to roll back |
+| A Deploy run with "Publish over a restore" checked | Deploy 38710866434 | Published B again over the restore, passed the smoke test and the browser check, recorded B as verified at 09:12 UTC, and so ended the hold |
+
+Read live after each step: CloudFront served A after the restore, still A after the refused run, and B at the end, at its own hostname and at the apex through the distribution, over IPv4 and IPv6. The history ends publish A, publish B, restore A, publish B, each verified. The automatic rollback hasn't run live, since no release has failed its checks; its unit tests cover it.
+
 ## Limits
 
-- **Before the merge:** no release, check against the live distribution, or restore can run, since the environment and the role's trust admit only `main`. The first release, its checks through CloudFront, and the restore rehearsal follow the merge, and `docs/progress.md` records them. The rehearsal needs a second release after the first, which any later commit to `main` makes, since every release's pages name their commit, and it ends by resuming deploys.
+- **Only on `main`:** no release, check against the live distribution, or restore can run from another branch, since the environment and the role's trust admit only `main`. So the first release and the restore rehearsal followed the merge ("First release", "Restore rehearsal"). The rehearsal needed a second release, which any later commit to `main` makes, since every release's pages name their commit.
 - **Infrastructure first:** the release-record deny and the deploy role's page deletion must be live before a release. Otherwise its smoke test fails on the 403 check, and a publish with a page to remove fails partway, after writing its pages. A rollback of the site stack past them would bring those failures back (see "Three kinds of rollback").
 - **What the browser check sees:** what Chromium sees, in two window sizes and after one Tab press, watching each page for 2 seconds after its network goes quiet. It judges nothing about a page's look beyond what it measures: a heading drawn in a transparent colour, clipped, filtered, masked, or covered still passes, and so does a focus indicator that also shows without the focus. Other browsers can differ, and an error later than 2 seconds goes unseen. It checks the home page and the 404 page, which are all the placeholder has.
 - **Outages during the browser job:** an outage of npm's registry, Ubuntu's mirrors, or Playwright's CDN that outlasts the retries (three attempts of each install, 30 seconds apart, after npm's own retries) fails the browser job, and the verify job rolls back a release that passed its smoke test. Re-run all jobs once it is over.
