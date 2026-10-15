@@ -1,9 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { render } from '../src/entry-server.tsx';
+import { prerenderPages, renderDocument } from './prerender-lib.ts';
 import { type SiteFile, siteFiles } from './release-lib.ts';
-import { type Get, type Reply, retrying, smokeTest } from './smoke-lib.ts';
+import { type Get, prerendered, type Reply, retrying, smokeTest } from './smoke-lib.ts';
 
 const CLOUDFRONT = 'd111111abcdef8.cloudfront.net';
 const BUCKET = 'site-bucket';
@@ -213,6 +215,29 @@ describe('smokeTest', () => {
   it('needs the release to have a home page and a 404 page', async () => {
     const dir = site({ '404.html': undefined });
     await expect(smokeTest(dir, TARGET, cloudFront(dir))).rejects.toThrow(`${dir} has no index.html or no 404.html.`);
+  });
+});
+
+describe('prerendered', () => {
+  const template = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const [home] = prerenderPages;
+
+  it('finds nothing wrong with the home page as the build prerenders it, release included', () => {
+    expect(prerendered(Buffer.from(renderDocument(template, home!, render('home'), RELEASE)))).toEqual([]);
+  });
+
+  it('fails the template before prerendering, a client-rendered shell, and a page without its release', () => {
+    expect(prerendered(Buffer.from(template))).toEqual([
+      'the home page has no prerendered markup',
+      'the home page has no a heading',
+      'the home page has no the release it belongs to',
+      'the home page still has a prerender marker',
+    ]);
+    const shell = renderDocument(template, home!, '<!-- rendered in the browser -->', RELEASE).replace('<!-- rendered in the browser -->', '');
+    expect(prerendered(Buffer.from(shell))).toEqual(['the home page has no prerendered markup', 'the home page has no a heading']);
+    expect(prerendered(Buffer.from(renderDocument(template, home!, render('home'))))).toEqual([
+      'the home page has no the release it belongs to',
+    ]);
   });
 });
 

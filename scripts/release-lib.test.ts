@@ -151,9 +151,11 @@ describe('describeFile', () => {
     expect(() => describeFile('_releases/history.json', Buffer.from(''))).toThrow(
       '_releases/history.json would overwrite the release records under _releases/.',
     );
-    expect(() => describeFile('assets/logo.svg', Buffer.from(''))).toThrow(
-      'assets/logo.svg has no content hash in its name, so it cannot be cached as immutable.',
-    );
+    for (const path of ['assets/logo.svg', 'assets/index-AbCd12345.js', 'assets/index-AbCd123.js']) {
+      expect(() => describeFile(path, Buffer.from('')), path).toThrow(
+        `${path} has no content hash in its name, so it cannot be cached as immutable.`,
+      );
+    }
     expect(() => describeFile('notes.md', Buffer.from(''))).toThrow('notes.md has no content type');
     expect(() => describeFile('LICENSE', Buffer.from(''))).toThrow('LICENSE has no content type');
     // An inherited property is no content type.
@@ -257,6 +259,7 @@ describe('publish', () => {
     expect(outcome).toEqual({
       release: A,
       uploaded: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
+      replaced: [],
       kept: [],
       invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
     });
@@ -280,7 +283,7 @@ describe('publish', () => {
     });
   });
 
-  it('keeps assets already in place, replaces one whose checksum or headers differ, and leaves no asset out', async () => {
+  it('keeps assets already in place, and replaces and invalidates one whose checksum or headers differ', async () => {
     const dir = site();
     const files = new Map(siteFiles(dir).map((file) => [file.path, file]));
     const stored = (path: string, change: Partial<StoredObject> = {}) => {
@@ -291,9 +294,15 @@ describe('publish', () => {
       const { log, repository, context } = fakes(
         new Map([stored('assets/index-AbCd1234.js'), stored('assets/index-EfGh5678.css', change)]),
       );
-      const { uploaded, kept } = await publish(dir, A, repository, context);
-      expect({ uploaded, kept }).toEqual({ uploaded: ['assets/index-EfGh5678.css'], kept: ['assets/index-AbCd1234.js'] });
+      const { uploaded, replaced, kept, invalidated } = await publish(dir, A, repository, context);
+      expect({ uploaded, replaced, kept }).toEqual({
+        uploaded: [],
+        replaced: ['assets/index-EfGh5678.css'],
+        kept: ['assets/index-AbCd1234.js'],
+      });
       expect(log.filter((line) => line.startsWith('write assets/'))).toEqual(['write assets/index-EfGh5678.css']);
+      // CloudFront may hold the old object as immutable, so its path is invalidated with the pages'.
+      expect(invalidated).toEqual(['/', '/404.html', '/assets/index-EfGh5678.css', '/favicon.svg', '/index.html', '/robots.txt']);
     }
   });
 
@@ -301,9 +310,13 @@ describe('publish', () => {
     const first = fakes();
     await publish(site(), A, first.repository, first.context);
     const { objects, compared, repository, context } = fakes(first.objects);
-    await publish(site({ 'assets/index-AbCd1234.js': 'unused', 'assets/index-New12345.js': 'new' }), B, repository, context);
+    const outcome = await publish(site({ 'assets/index-New12345.js': 'new' }), B, repository, context);
     expect(compared).toEqual([`${A}...${B}`]);
-    expect(objects.has('assets/index-EfGh5678.css')).toBe(true);
+    expect(outcome).toMatchObject({
+      uploaded: ['assets/index-New12345.js'],
+      replaced: [],
+      kept: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
+    });
     expect(objects.get('assets/index-New12345.js')?.body.toString()).toBe('new');
     expect(historyOf(objects).entries.map(({ release }) => release)).toEqual([A, B]);
   });
@@ -330,11 +343,12 @@ describe('publish', () => {
       'A release is named by its full commit SHA; got "main".',
     );
 
+    // A copy with other files is found before any asset is written.
     const rebuilt = fakes(first.objects, 'identical');
-    await expect(publish(site({ 'robots.txt': 'other' }), A, rebuilt.repository, rebuilt.context)).rejects.toThrow(
-      `The saved copy of ${A} has other files than this build. Nothing was published.`,
-    );
-    expect(rebuilt.log.filter((line) => !line.startsWith('write assets/'))).toEqual([]);
+    await expect(
+      publish(site({ 'robots.txt': 'other', 'assets/index-New12345.js': 'new' }), A, rebuilt.repository, rebuilt.context),
+    ).rejects.toThrow(`The saved copy of ${A} has other files than this build. Nothing was published.`);
+    expect(rebuilt.log).toEqual([]);
   });
 
   it('fails on a history or manifest that is not what it should be, before changing anything', async () => {
@@ -360,10 +374,11 @@ describe('publish', () => {
     }
 
     for (const manifest of [[], { release: B, files: [] }, { release: A, files: [{ path: 'index.html' }] }]) {
-      const { repository, context } = fakes(new Map([[`_releases/${A}/manifest.json`, json(manifest)]]));
+      const { log, repository, context } = fakes(new Map([[`_releases/${A}/manifest.json`, json(manifest)]]));
       await expect(publish(site(), A, repository, context)).rejects.toThrow(
         `_releases/${A}/manifest.json is not the manifest of release ${A}.`,
       );
+      expect(log).toEqual([]);
     }
   });
 });
@@ -385,14 +400,15 @@ describe('restore', () => {
     return objects;
   }
 
-  it('restores the previous verified release from its copy, and writes its files for the smoke test', async () => {
+  it('restores a verified release from its copy, and writes its files for the smoke test', async () => {
     const { objects, log, context } = fakes(await released());
     const out = tempDir();
-    const outcome = await restore('previous', out, { ...context, run: '200-1' });
+    const outcome = await restore(B, out, { ...context, run: '200-1' });
 
     expect(outcome).toEqual({
       release: B,
       uploaded: [],
+      replaced: [],
       kept: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
       invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
     });
@@ -417,6 +433,20 @@ describe('restore', () => {
     });
   });
 
+  it('restores the same release when the run is re-run after failing partway, or after a newer release went out', async () => {
+    const { objects, context } = fakes(await released());
+    // The first attempt wrote its history entry and pages, then failed before the release was verified.
+    await restore(A, tempDir(), { ...context, run: '300-1' });
+    expect((await restore(A, tempDir(), { ...context, run: '300-2' })).release).toBe(A);
+    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+    // A newer release published in between does not change which one the run restores.
+    const later = fakes(objects);
+    await publish(site({ 'robots.txt': 'D' }), 'd'.repeat(40), later.repository, later.context);
+    const { objects: after, context: rerun } = fakes(later.objects);
+    expect((await restore(A, tempDir(), { ...rerun, run: '300-3' })).release).toBe(A);
+    expect(after.get('robots.txt')?.body.toString()).toBe('A');
+  });
+
   it('restores a named verified release, putting back any asset that has gone missing', async () => {
     const before = await released();
     before.delete('assets/index-AbCd1234.js');
@@ -427,30 +457,32 @@ describe('restore', () => {
     expect(objects.get('assets/index-AbCd1234.js')?.body.toString()).toBe('console.log(1);');
   });
 
-  it('after a restore, "previous" means the release before the restored one', async () => {
-    const { objects, context } = fakes(await released());
-    await restore('previous', tempDir(), context);
-    await recordVerified(context);
-    // C is current no longer, and B is: the previous verified release other than B is A.
-    expect((await restore('previous', tempDir(), context)).release).toBe(A);
-    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
-  });
+  it('refuses anything but the full commit SHA of a verified release, and lists the verified ones, newest first', async () => {
+    const { log, context } = fakes(await released());
+    const listing = `Verified releases, newest first: ${B}, ${A}.`;
+    for (const requested of [C, 'previous', 'b'.repeat(39), B.toUpperCase(), '']) {
+      await expect(restore(requested, tempDir(), context), requested).rejects.toThrow(
+        `Restore takes the full commit SHA of a release that passed its smoke test; got ${JSON.stringify(requested)}. ${listing}`,
+      );
+    }
+    expect(log).toEqual([]);
 
-  it('refuses a release that never passed the smoke test, one not named by its commit, and an empty history', async () => {
-    const { context } = fakes(await released());
-    await expect(restore(C, tempDir(), context)).rejects.toThrow(`${C} has never passed the smoke test, so it is not restored.`);
-    await expect(restore('v1', tempDir(), context)).rejects.toThrow('A release is named by its full commit SHA; got "v1".');
-    await expect(restore('previous', tempDir(), fakes().context)).rejects.toThrow(
+    const unverified = fakes();
+    await publish(site(), A, unverified.repository, unverified.context);
+    await expect(restore(A, tempDir(), fakes(unverified.objects).context)).rejects.toThrow(
+      'Verified releases, newest first: none yet.',
+    );
+    await expect(restore(A, tempDir(), fakes().context)).rejects.toThrow(
       'No release has been published yet, so there is none to restore.',
     );
   });
 
-  it('refuses "previous" when no other release has been verified', async () => {
-    const first = fakes();
-    await publish(site(), A, first.repository, first.context);
-    await recordVerified(first.context);
-    await expect(restore('previous', tempDir(), fakes(first.objects).context)).rejects.toThrow(
-      `No verified release is recorded other than the current one, ${A}.`,
+  it('lists at most five verified releases, each once', async () => {
+    const releases = ['1', '2', '3', '4', '5', '6'].map((digit) => digit.repeat(40));
+    const entries = [...releases, releases[0]!].map((release) => entry(release, { verified: 'then' }));
+    const { context } = fakes(new Map([history(entries)]));
+    await expect(restore('previous', tempDir(), context)).rejects.toThrow(
+      `Verified releases, newest first: ${[releases[0], releases[5], releases[4], releases[3], releases[2]].join(', ')}.`,
     );
   });
 

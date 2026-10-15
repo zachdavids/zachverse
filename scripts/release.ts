@@ -1,6 +1,6 @@
 // Entry for the deploy and restore workflows (ADR 0006):
 //   node scripts/release.ts publish <dir>            publishes the build in <dir> as the release of $GITHUB_SHA
-//   node scripts/release.ts restore <release> <dir>  restores a verified release ("previous" or a commit SHA) and
+//   node scripts/release.ts restore <release> <dir>  restores the verified release with that commit SHA, and
 //                                                    writes its files to <dir> for the smoke test
 //   node scripts/release.ts verified                 records this run's release as verified, after its smoke test
 // $BUCKET and $DISTRIBUTION_ID name the site; GitHub sets the run's variables.
@@ -22,11 +22,12 @@ function report(lines: string[]): void {
   if (summary) appendFileSync(summary, `${lines.join('\n')}\n\n`);
 }
 
-function outcomeLines(title: string, { release, uploaded, kept, invalidated }: Outcome): string[] {
+function outcomeLines(title: string, { release, uploaded, replaced, kept, invalidated }: Outcome): string[] {
   return [
     `### ${title} ${release}`,
     '',
     `- Assets uploaded: ${uploaded.length === 0 ? 'none' : uploaded.join(', ')}`,
+    `- Assets replaced, and invalidated: ${replaced.length === 0 ? 'none' : replaced.join(', ')}`,
     `- Assets already in place: ${kept.length === 0 ? 'none' : kept.join(', ')}`,
     `- Paths invalidated: ${invalidated.join(', ')}`,
   ];

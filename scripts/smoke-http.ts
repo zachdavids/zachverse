@@ -21,7 +21,16 @@ export function request(url: string, via?: string, transport: Transport = { http
   return new Promise((resolve, reject) => {
     const req = client.request(
       target,
-      { headers: { 'user-agent': 'zachverse-smoke-test' }, lookup: connectTo, family: 4, timeout: 15_000 },
+      {
+        headers: { 'user-agent': 'zachverse-smoke-test' },
+        lookup: connectTo,
+        family: 4,
+        timeout: 15_000,
+        // A new connection for each request: a pooled one would go wherever its first request went, whatever via says.
+        agent: false,
+        // Explicit, so NODE_TLS_REJECT_UNAUTHORIZED=0 in the environment cannot turn the certificate check off.
+        rejectUnauthorized: true,
+      },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));

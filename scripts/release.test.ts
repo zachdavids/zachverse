@@ -19,6 +19,7 @@ const SHA = 'a'.repeat(40);
 const OUTCOME: Outcome = {
   release: SHA,
   uploaded: ['assets/index-AbCd1234.js'],
+  replaced: [],
   kept: [],
   invalidated: ['/', '/index.html'],
 };
@@ -89,6 +90,7 @@ describe('release script', () => {
       `### Published ${SHA}`,
       '',
       '- Assets uploaded: assets/index-AbCd1234.js',
+      '- Assets replaced, and invalidated: none',
       '- Assets already in place: none',
       '- Paths invalidated: /, /index.html',
     ].join('\n');
@@ -100,17 +102,23 @@ describe('release script', () => {
 
   it('restores a release into a directory and reports it, without a summary file when GitHub sets none', async () => {
     vi.stubEnv('GITHUB_STEP_SUMMARY', '');
-    lib.restore.mockResolvedValue({ ...OUTCOME, uploaded: [], kept: ['assets/index-AbCd1234.js'] });
-    const { exit, log } = await run('restore', 'previous', 'restored');
+    lib.restore.mockResolvedValue({
+      ...OUTCOME,
+      uploaded: [],
+      replaced: ['assets/index-AbCd1234.js'],
+      kept: ['assets/index-EfGh5678.css'],
+    });
+    const { exit, log } = await run('restore', SHA, 'restored');
 
-    expect(lib.restore).toHaveBeenCalledExactlyOnceWith('previous', 'restored', expect.objectContaining({ run: '7-2' }));
+    expect(lib.restore).toHaveBeenCalledExactlyOnceWith(SHA, 'restored', expect.objectContaining({ run: '7-2' }));
     expect(github.githubRepository).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledExactlyOnceWith(
       [
         `### Restored ${SHA}`,
         '',
         '- Assets uploaded: none',
-        '- Assets already in place: assets/index-AbCd1234.js',
+        '- Assets replaced, and invalidated: assets/index-AbCd1234.js',
+        '- Assets already in place: assets/index-EfGh5678.css',
         '- Paths invalidated: /, /index.html',
       ].join('\n'),
     );
@@ -126,7 +134,7 @@ describe('release script', () => {
   });
 
   it('fails with the usage for another command or the wrong number of arguments, before reading anything', async () => {
-    for (const args of [[], ['deploy', 'site'], ['publish'], ['restore', 'previous'], ['verified', 'now'], ['constructor']]) {
+    for (const args of [[], ['deploy', 'site'], ['publish'], ['restore', SHA], ['verified', 'now'], ['constructor']]) {
       const { exit, error } = await run(...args);
       expect(error, args.join(' ')).toHaveBeenCalledExactlyOnceWith(
         '::error::Usage: node scripts/release.ts publish <dir> | restore <release> <dir> | verified',

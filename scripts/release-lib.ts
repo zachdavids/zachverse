@@ -44,8 +44,9 @@ const CONTENT_TYPES = new Map([
 // Path segments CloudFront invalidates as written: invalidation paths need other characters encoded, and "~" never
 // works (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/invalidation-specifying-objects.html).
 const PLAIN_PATH = /^[\w.-]+(?:\/[\w.-]+)*$/;
-// The content hash Vite puts in an asset's name, as check:dist reads it.
-const HASHED_NAME = /-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/;
+// The content hash Vite puts in an asset's name: a hyphen and 8 characters before the extension. A word of 8 letters
+// passes too, so tests/repo-policy.test.ts keeps public/, which Vite copies unhashed, from holding an assets/ directory.
+const HASHED_NAME = /-[A-Za-z0-9_-]{8}\.[a-z0-9]+$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 
 export interface SiteFile {
@@ -104,6 +105,8 @@ export interface Context {
 export interface Outcome {
   release: string;
   uploaded: string[];
+  /** Assets whose names held other bytes or headers; their paths are invalidated too. */
+  replaced: string[];
   kept: string[];
   invalidated: string[];
 }
@@ -244,8 +247,9 @@ async function readManifest(store: Store, release: string): Promise<Manifest | u
 
 /**
  * Refuses a release older than the newest one published, which is how GitHub can run deploys out of order or re-run an
- * old one (ADR 0005). Publishing the same commit again is a retry, allowed only while it is the current release, so a
- * re-run cannot undo a restore; going back is the Restore workflow's job.
+ * old one (ADR 0005). Publishing the same commit again is a retry, allowed only while it is the current release, so
+ * re-running the deploy of a release that a restore replaced does not put it back. A newer commit still publishes over
+ * a restore, whether pushed or re-run; going back is the Restore workflow's job.
  */
 export async function checkOrder(entries: Entry[], release: string, repository: Repository): Promise<void> {
   const current = entries.at(-1);
@@ -265,19 +269,24 @@ export async function checkOrder(entries: Entry[], release: string, repository: 
   );
 }
 
-async function uploadAssets(files: SiteFile[], { store }: Context): Promise<{ uploaded: string[]; kept: string[] }> {
+/**
+ * Uploads each asset the bucket lacks, or holds with other bytes or headers. A replaced one, as after a change to the
+ * header table, may still be cached as immutable, so its path is invalidated with the pages'.
+ */
+async function uploadAssets(files: SiteFile[], { store }: Context) {
   const uploaded: string[] = [];
+  const replaced: string[] = [];
   const kept: string[] = [];
   for (const file of files.filter(({ path }) => isAsset(path))) {
     const head = await store.head(file.path);
     if (head?.sha256 === file.sha256 && head.contentType === file.contentType && head.cacheControl === file.cacheControl) {
       kept.push(file.path);
-    } else {
-      await writeFile(store, file.path, file);
-      uploaded.push(file.path);
+      continue;
     }
+    (head === undefined ? uploaded : replaced).push(file.path);
+    await writeFile(store, file.path, file);
   }
-  return { uploaded, kept };
+  return { uploaded, replaced, kept };
 }
 
 function manifestOf(release: string, files: SiteFile[]): Manifest {
@@ -293,24 +302,26 @@ function manifestOf(release: string, files: SiteFile[]): Manifest {
   };
 }
 
-/** Saves a copy of the release under _releases/<commit>/, so it can be restored however long it has been replaced. */
-async function saveCopy(files: SiteFile[], release: string, { store, log }: Context): Promise<void> {
-  const manifest = manifestOf(release, files);
+/** Whether the release already has a saved copy; one with other files than this build fails, before any write. */
+async function hasCopy(files: SiteFile[], release: string, { store }: Context): Promise<boolean> {
   const saved = await readManifest(store, release);
-  if (saved !== undefined) {
-    if (!isDeepStrictEqual(saved, manifest)) {
-      throw new Error(`The saved copy of ${release} has other files than this build. Nothing was published.`);
-    }
-    log(`The copy of ${release} is already saved.`);
-    return;
+  if (saved === undefined) return false;
+  if (!isDeepStrictEqual(saved, manifestOf(release, files))) {
+    throw new Error(`The saved copy of ${release} has other files than this build. Nothing was published.`);
   }
+  return true;
+}
+
+/** Saves a copy of the release under _releases/<commit>/, so it can be restored however long ago it was replaced. */
+async function saveCopy(files: SiteFile[], release: string, { store }: Context): Promise<void> {
   for (const file of files) await writeFile(store, `${RECORDS}${release}/site/${file.path}`, file);
-  await writeJson(store, `${RECORDS}${release}/manifest.json`, manifest);
+  await writeJson(store, `${RECORDS}${release}/manifest.json`, manifestOf(release, files));
 }
 
 /** Records the release as started, writes its pages, waits for the invalidation, and records it as published. */
 async function publishPages(
   files: SiteFile[],
+  replaced: string[],
   entries: Entry[],
   { action, release }: Pick<Entry, 'action' | 'release'>,
   { store, cdn, run, now }: Context,
@@ -319,7 +330,7 @@ async function publishPages(
   entries.push(entry);
   await writeHistory(store, entries);
   for (const file of pageOrder(files)) await writeFile(store, file.path, file);
-  const paths = invalidationPaths(files);
+  const paths = [...invalidationPaths(files), ...replaced.map((path) => `/${path}`)].sort();
   await cdn.invalidate(paths, `${run}-${action}-${release}`);
   entry.published = now();
   await writeHistory(store, entries);
@@ -332,28 +343,34 @@ export async function publish(dir: string, release: string, repository: Reposito
   const files = siteFiles(dir);
   const entries = await readHistory(context.store);
   await checkOrder(entries, release, repository);
+  const saved = await hasCopy(files, release, context);
   const assets = await uploadAssets(files, context);
-  await saveCopy(files, release, context);
-  const invalidated = await publishPages(files, entries, { action: 'publish', release }, context);
+  if (saved) context.log(`The copy of ${release} is already saved.`);
+  else await saveCopy(files, release, context);
+  const invalidated = await publishPages(files, assets.replaced, entries, { action: 'publish', release }, context);
   return { release, ...assets, invalidated };
 }
 
-/** The verified release "previous" or a commit SHA names. */
+/**
+ * The release to restore: named by its full commit SHA, which is fixed when the run starts, so a re-run, or a run that
+ * waited behind another, restores the same release; and it must have passed its smoke test.
+ */
 function chooseRelease(entries: Entry[], requested: string): string {
-  const current = entries.at(-1);
-  if (current === undefined) throw new Error('No release has been published yet, so there is none to restore.');
-  if (requested === 'previous') {
-    const previous = entries.findLast((entry) => entry.verified !== undefined && entry.release !== current.release);
-    if (previous === undefined) {
-      throw new Error(`No verified release is recorded other than the current one, ${current.release}.`);
-    }
-    return previous.release;
-  }
-  requireCommit(requested);
-  if (!entries.some((entry) => entry.release === requested && entry.verified !== undefined)) {
-    throw new Error(`${requested} has never passed the smoke test, so it is not restored.`);
-  }
-  return requested;
+  if (entries.length === 0) throw new Error('No release has been published yet, so there is none to restore.');
+  const verified = [
+    ...new Set(
+      entries
+        .filter((entry) => entry.verified !== undefined)
+        .map((entry) => entry.release)
+        .reverse(),
+    ),
+  ];
+  if (COMMIT.test(requested) && verified.includes(requested)) return requested;
+  const choices = verified.length === 0 ? 'none yet' : verified.slice(0, 5).join(', ');
+  throw new Error(
+    `Restore takes the full commit SHA of a release that passed its smoke test; got ${JSON.stringify(requested)}. ` +
+      `Verified releases, newest first: ${choices}.`,
+  );
 }
 
 /**
@@ -382,7 +399,7 @@ export async function restore(requested: string, outDir: string, context: Contex
     writeFileSync(target, file.body);
   }
   const assets = await uploadAssets(files, context);
-  const invalidated = await publishPages(files, entries, { action: 'restore', release }, context);
+  const invalidated = await publishPages(files, assets.replaced, entries, { action: 'restore', release }, context);
   return { release, ...assets, invalidated };
 }
 

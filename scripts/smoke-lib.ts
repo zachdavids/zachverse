@@ -53,16 +53,21 @@ function redirected(reply: Reply, location: string): string[] {
     : [`status ${reply.status} to ${JSON.stringify(actual)}, not 301 to ${location}`];
 }
 
-// What check:dist requires of a prerendered home page, so a client-rendered shell fails, plus the release it names.
-function prerendered(body: Buffer): string[] {
+/**
+ * Problems with a home page as prerendered: no looser than what check:dist requires of every build (a title, markup
+ * inside the home page's root element, text that ends a heading, no prerender marker left), so a release that passed
+ * its build cannot fail here, but a client-rendered shell does; and the release it names.
+ */
+export function prerendered(body: Buffer): string[] {
   const html = body.toString('utf8');
   const markers: [string, RegExp][] = [
-    ['a title', /<title>[^<]+<\/title>/],
-    ['prerendered markup', /<div id="root" data-page="home"><main\b/],
-    ['a heading', /<h1>[^<]+<\/h1>/],
+    ['a title', /<title>[^<]*\S[^<]*<\/title>/],
+    ['prerendered markup', /\sdata-page="home"[^>]*>\s*<[a-z]/i],
+    ['a heading', />[^<]*\S[^<]*<\/h1>/],
     ['the release it belongs to', /<meta name="zachverse-release" content="[0-9a-f]{40}" \/>/],
   ];
-  return markers.filter(([, pattern]) => !pattern.test(html)).map(([what]) => `the home page has no ${what}`);
+  const problems = markers.filter(([, pattern]) => !pattern.test(html)).map(([what]) => `the home page has no ${what}`);
+  return html.includes('<!--app-') ? [...problems, 'the home page still has a prerender marker'] : problems;
 }
 
 /** The root-relative URLs a page loads or links to, and the release file each one gets, as the viewer-request function maps paths. */

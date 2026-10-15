@@ -772,6 +772,14 @@ const envOf = (item?: { env?: Environment }) =>
 const kind = (step: Step) =>
   step.uses !== undefined ? actionName(step.uses) : /^node \S/.test(step.run?.trim() ?? '') ? step.run!.trim() : 'run';
 
+// Whether a concurrency setting could put a run in the deploy and restore group, deploy-refs/heads/main. GitHub compares
+// group names without case, and an expression can evaluate to anything, so only a group that starts with a literal
+// other than "deploy" stays out.
+function mayJoinDeployGroup(concurrency: unknown): boolean {
+  const group = typeof concurrency === 'string' ? concurrency : (concurrency as { group?: unknown } | null)?.group;
+  return typeof group !== 'string' || !/^[a-z0-9_.]/i.test(group) || /^deploy/i.test(group);
+}
+
 // A job that runs the release scripts: it checks them out and installs Node, but no packages.
 function expectReleaseTools(job: Job | undefined, where: string) {
   const list = job?.steps ?? [];
@@ -796,7 +804,13 @@ function expectDeployRole(job: Job | undefined, session: string) {
   expect(job?.environment).toBe('production');
   // contents: read for the checkout and the deploy job's comparison of commits; no other scope.
   expect(job?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
+  // Only the settings these checks read: a container would run every step in an image no pin covers, with the role's
+  // credentials; services or a matrix would run more beside or in parallel; a shell could hide a failed step.
+  const allowed = ['name', 'needs', 'runs-on', 'timeout-minutes', 'environment', 'permissions', 'defaults', 'env', 'steps'];
+  expect(Object.keys(job ?? {}).filter((key) => !allowed.includes(key))).toEqual([]);
+  expect(job?.defaults).toEqual({ run: { shell: 'bash' } });
   const list = job?.steps ?? [];
+  expect(list.filter((step) => step.shell !== undefined).map(kind)).toEqual([]);
   const configured = list.filter((step) => actionName(step.uses) === 'aws-actions/configure-aws-credentials');
   expect(configured.map((step) => step.with)).toEqual([
     {
@@ -841,6 +855,38 @@ describe('Deploy workflow', () => {
       expect(each?.concurrency).toEqual({ group: 'deploy-${{ github.ref }}', 'cancel-in-progress': false });
       expect(Object.values(each?.jobs ?? {}).filter((other) => other.concurrency !== undefined)).toEqual([]);
     }
+  });
+
+  it('lets no other workflow, and no job, join that group', () => {
+    // Another run in the group could replace a waiting deploy or restore or, with cancel-in-progress, stop one partway
+    // through publishing (ADR 0006, "Limits").
+    const settings = [
+      ...workflows
+        .filter(({ file }) => !/^(?:deploy|restore)\.ya?ml$/.test(file))
+        .map(({ file, workflow }) => ({ where: file, concurrency: workflow.concurrency })),
+      ...jobs.map(({ where, job }) => ({ where, concurrency: job.concurrency })),
+    ];
+    expect(
+      settings.filter(({ concurrency }) => concurrency !== undefined && mayJoinDeployGroup(concurrency)).map(({ where }) => where),
+    ).toEqual([]);
+    // CI keeps a group of its own.
+    expect(mayJoinDeployGroup(ci?.concurrency)).toBe(false);
+  });
+
+  it('counts a group that names deploy in any case, or starts with an expression, as one that may join it', () => {
+    const groups = [
+      'deploy-${{ github.ref }}',
+      { group: 'Deploy-${{ github.ref }}' },
+      { group: 'DEPLOY' },
+      { group: '${{ github.workflow }}-${{ github.ref }}' },
+      { group: ' deploy' },
+      { group: 5 },
+      null,
+      { group: 'ci-${{ github.ref }}' },
+      'pages',
+      { group: 'deployments-preview' },
+    ];
+    expect(groups.map(mayJoinDeployGroup)).toEqual([true, true, true, true, true, true, true, false, false, true]);
   });
 
   it('stops any ref but main, then builds and checks the site as CI does before uploading it', () => {
@@ -945,10 +991,12 @@ describe('Deploy workflow', () => {
         env && typeof env === 'object' ? Object.keys(env) : [],
       );
       expect(names, file).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
-      expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy)$/i.test(name)), file).toEqual([]);
+      // Nor a NODE_ variable: NODE_OPTIONS can load code into the release scripts, and NODE_TLS_REJECT_UNAUTHORIZED or
+      // NODE_EXTRA_CA_CERTS changes which certificates they and the smoke test trust.
+      expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy|node_\w+)$/i.test(name)), file).toEqual([]);
       // Nor may a script set one, for itself or, through $GITHUB_ENV or $GITHUB_PATH, for later steps, or write the
       // AWS CLI's config, whose endpoint_url the SDKs also read.
-      const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
+      const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy|node_\w+)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
       const setters = (roleJob?.steps ?? []).filter((step) => setting.test(step.run ?? ''));
       expect(setters.map((step) => step.name ?? step.run), file).toEqual([]);
     }
@@ -956,23 +1004,38 @@ describe('Deploy workflow', () => {
 });
 
 describe('Restore workflow', () => {
+  const test = restoreWorkflow?.jobs.test;
   const job = restoreWorkflow?.jobs.restore;
 
-  it('runs only by hand, restoring the release its one input names', () => {
+  it('runs only by hand, restoring the release its one input names, after a test job', () => {
+    // No default: the release is a commit SHA the person running it gives, fixed for the run and its re-runs.
     expect(restoreWorkflow ? triggers(restoreWorkflow) : undefined).toEqual({
-      workflow_dispatch: {
-        inputs: { release: { description: expect.any(String), required: true, default: 'previous', type: 'string' } },
-      },
+      workflow_dispatch: { inputs: { release: { description: expect.any(String), required: true, type: 'string' } } },
     });
-    expect(Object.keys(restoreWorkflow?.jobs ?? {})).toEqual(['restore']);
+    expect(Object.keys(restoreWorkflow?.jobs ?? {})).toEqual(['test', 'restore']);
+    expect([job?.needs].flat()).toEqual(['test']);
     // The input reaches the script through env, and the script checks it.
     expect(envOf(job).RELEASE).toBe('${{ inputs.release }}');
   });
 
-  it("stops any ref but main, and runs the deploy job's checks before it restores, smoke-tests, and records the release", () => {
+  it("stops any ref but main, then tests the commit whose scripts the restore job runs, without the role", () => {
+    const [first] = test?.steps ?? [];
+    expect(first?.run).toMatch(MAIN_ONLY);
+    expectRequiredSteps(restoreWorkflow, 'restore.yml', 'test', [
+      'actions/checkout',
+      'actions/setup-node',
+      'npm ci',
+      'npm run typecheck',
+      'npm run test:coverage',
+    ]);
+    expect(plan(restoreWorkflow, 'test').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+    expect(test?.environment).toBeUndefined();
+    expect(test?.permissions).toBeUndefined();
+  });
+
+  it("runs the deploy job's checks before it restores, smoke-tests, and records the release", () => {
     const list = job?.steps ?? [];
     expect(list.map(kind)).toEqual([
-      'run', // the ref check
       'run', // the variables check
       'actions/checkout',
       'actions/setup-node',
@@ -982,7 +1045,6 @@ describe('Restore workflow', () => {
       'node scripts/smoke.ts restored',
       'node scripts/release.ts verified',
     ]);
-    expect(list[0]?.run).toMatch(MAIN_ONLY);
     // The deploy job's own checks, so the two jobs cannot drift apart.
     const deploySteps = deploy?.jobs.deploy?.steps ?? [];
     for (const name of ["Check the environment's variables", "Check the deploy role's access (read-only)"]) {
@@ -1001,6 +1063,12 @@ describe('Restore workflow', () => {
 });
 
 describe('Release and smoke-test scripts', () => {
+  it("publish nothing unhashed under assets/: public/ has no assets/ directory, whose files Vite copies as they are", () => {
+    // Publishing caches every file under assets/ as immutable for a year, trusting the content hash in its name, and
+    // Vite's own output names carry one (see "lets the Vite config set no client output name without a content hash").
+    expect(readdirSync(new URL('public/', root)).filter((name) => name.toLowerCase() === 'assets')).toEqual([]);
+  });
+
   it('keep the release records under the prefix the bucket policy keeps CloudFront from reading', () => {
     // infra/lib/site-stack.ts denies CloudFront that prefix; records anywhere else would be served as part of the site.
     expect(read('infra/lib/site-stack.ts')).toContain(`export const RELEASE_RECORDS = '${RECORDS}';`);

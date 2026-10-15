@@ -49,7 +49,7 @@ describe('request', () => {
     expect({ status: reply.status, body: reply.body.toString() }).toEqual({ status: 200, body: 'body of /page' });
   });
 
-  it('makes https URLs with the https client, an IPv4 connection, a user agent, and a 15-second timeout', async () => {
+  it('makes https URLs with the https client: IPv4, a user agent, a 15-second timeout, a new connection, and the certificate checked', async () => {
     const { res, client } = fakeClient();
     const unused = { request: vi.fn() };
     const transport = { http: unused, https: client } as unknown as Transport;
@@ -67,6 +67,8 @@ describe('request', () => {
       lookup: expect.any(Function),
       family: 4,
       timeout: 15_000,
+      agent: false,
+      rejectUnauthorized: true,
     });
     expect(unused.request).not.toHaveBeenCalled();
   });
