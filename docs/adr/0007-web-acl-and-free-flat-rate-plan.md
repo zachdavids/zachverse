@@ -1,13 +1,13 @@
 # ADR 0007: Web ACL and the Free flat-rate plan
 
 - Status: Accepted (milestone 7). Not deployed yet: per the plan, it deploys after milestone 6's first release has passed its checks, with the runbook below.
-- Date: 2026-10-15
+- Date: 2026-10-15, revised the same day after review
 
 ## Context
 
 CloudFront's flat-rate pricing plans charge one monthly price, with no overage charges, for a distribution together with its AWS WAF web ACL, a Route 53 hosted zone attached to the plan, and CloudWatch Logs ingestion for its logs. The Free tier costs nothing and comes with an allowance of 1 million requests and 100 GB a month; requests that AWS WAF blocks don't count toward it. A distribution on a plan must keep a web ACL attached, and the Free tier allows at most five WAF rules, AWS managed rule groups included. It has no customer rule groups, Bot Control, CAPTCHA or JavaScript challenges, custom responses, header- or regex-based matching, or WAF request logs. (CloudFront Developer Guide, "CloudFront flat-rate pricing plans", and the PricingPlanManager User Guide, both read 2026-10-15.)
 
-ADR 0002 left it to this milestone to decide how the web ACL is created. Since milestone 4 the site stack could attach an existing web ACL by ARN and subscribe it, and the guardrails have checked every template against the Free tier's limits (ADR 0003, "Template checks").
+ADR 0002 left it to this milestone to decide how the web ACL is created. Since milestones 1–2 the site stack could attach an existing web ACL by ARN and subscribe it, and since milestone 4 the guardrails have checked every synthesized template against the Free tier's limits (ADR 0003, "Template checks").
 
 ## Decision
 
@@ -16,9 +16,9 @@ ADR 0002 left it to this milestone to decide how the web ACL is created. Since m
 - the web ACL `zachverse-site` (`AWS::WAFv2::WebACL`, scope `CLOUDFRONT`, in us-east-1), attached to the distribution;
 - an `AWS::PricingPlanManager::Subscription`, family `CloudFront`, tier `FREE`, over the distribution, the web ACL, and the existing hosted zone `Z03492543O0YEY0RDZZ0J`.
 
-Without `pricingPlan`, there is neither. On pay-as-you-go pricing AWS WAF would bill the web ACL, its rules, and its requests, which the plan covers. Milestone 4's `webAclArn` option, kept only until this decision, is gone.
+Without `pricingPlan`, there is neither. On pay-as-you-go pricing AWS WAF would bill the web ACL, its rules, and its requests, which the plan covers. The `webAclArn` option from milestones 1–2, kept only until this decision, is gone.
 
-Attaching the hosted zone is a pricing association: the plan pays the zone's monthly fee, records, and queries, within the Free tier's allowances (at most 50 records; the zone has 10). It changes no record.
+Attaching the hosted zone is a pricing association: the plan pays the zone's monthly fee, records, and queries, within the Free tier's allowances (at most 50 records; runbook step 3 checks the zone's `ResourceRecordSetCount`, which counts its SOA and NS records too). It changes no record.
 
 **Four rules**, of the five the Free tier allows:
 
@@ -32,12 +32,14 @@ Attaching the hosted zone is a pricing association: the plan pays the zone's mon
 - **Which rules:** the three rule groups are the ones in AWS's example web ACL for a pricing-plan subscription (PricingPlanManager User Guide). The rate limit is the Free tier's IP-based rate limiting, and 5 minutes is the window it counts over.
 - **Order:** the cheaper checks run first: known bad addresses, then floods, then the rule groups that inspect each request.
 - **Default action:** Allow.
-- **Visibility:** CloudWatch metrics and sampled requests are on; WAF keeps them at no charge. Request logs need the Pro tier, so there are none.
+- **Visibility:** CloudWatch metrics and sampled requests are on; WAF keeps them at no charge, the sampled requests for 3 hours. Request logs need the Pro tier, so there are none.
 - **The fifth rule** is left free.
 - **The site's own checks pass these rules:**
   - The Common Rule Set blocks requests without a `User-Agent`; the smoke test sends one (`scripts/smoke-http.ts`, pinned by its tests), and Chromium sends its own.
   - Neither check's requests match the other rules' patterns.
+  - The smoke test sends all its requests from one runner address: seven fixed ones, then each URL at the apex once (the home page, every file, and every other address a page links to), 15 for the placeholder. `check:dist` fails a build that would need more than 500, half the rate limit, since WAF counts approximately (`SMOKE_REQUEST_BUDGET` in `scripts/smoke-lib.ts`, which `tests/repo-policy.test.ts` keeps at most half of `RATE_LIMIT_PER_IP`).
   - A visitor's browser sends far fewer requests than the limit: it keeps the hashed assets for a year (ADR 0006).
+  - The IP reputation group judges the address each request comes from, and for the checks that is a GitHub-hosted runner's, which the project doesn't control. A runner on a listed address fails its run with 403s, and a re-run gets another runner ("If a step fails").
 
 **Paid tiers take a reviewed code change.** `PricingPlanConfig.tier` admits only `FREE`. CloudFormation activates a Free subscription at once, but leaves a paid one pending until someone approves it outside CloudFormation. It also refuses to change the tier of an existing subscription.
 
@@ -47,56 +49,86 @@ Attaching the hosted zone is a pricing association: the plan pays the zone's mon
 2. updates the distribution to use it, waiting until the change is deployed;
 3. creates the subscription.
 
-That is the order AWS documents (web ACL → distribution → subscription). Removal runs in reverse, and nothing else depends on them.
+That is the order AWS documents (web ACL → distribution → subscription). Nothing else references or depends on the web ACL or the subscription (`infra/test/site-stack.test.ts`). Rolling a failed update back doesn't run in reverse, though: CloudFormation restores the distribution first and deletes what the update created afterwards, and CloudFront won't detach the web ACL while a subscription holds the distribution ("If a step fails").
 
-**Retention.** Like every resource in the site stack, both are retained, so removing them from the template, or deleting the stack, leaves them in place, and the subscription keeps the plan on. CloudFront refuses to detach the web ACL while the plan is on. Going back to pay-as-you-go is therefore an administrator's sequence:
+**Retention.** Like every resource in the site stack, both are retained, so removing them from the template, or deleting the stack, leaves them in place, and the subscription keeps the plan on. CloudFront refuses to detach the web ACL while the plan is on, so deploying a template without `pricingPlan`, such as any from before milestone 7, fails at the distribution, and CloudFormation rolls the update back. Going back to pay-as-you-go is therefore an administrator's sequence, with ADR 0004's runbook:
 
-1. Cancel the subscription (`aws pricing-plan-manager cancel-subscription`). A Free plan cancels at once.
-2. Deploy the template without `pricingPlan`. That detaches the web ACL.
-3. Delete the retained web ACL.
+1. **Cancel the subscription.** Take its ARN from the stack output `PricingPlanSubscriptionArn`, which step 3 removes, and its current `eTag` from `aws pricing-plan-manager get-subscription --region us-east-1 --arn <arn>`. Its status must be `ACTIVE`: one in `SYNC_IN_PROGRESS` can't be changed, so wait out the sync and read the `eTag` again. Then run `aws pricing-plan-manager cancel-subscription --region us-east-1 --arn <arn> --if-match <eTag>`.
+2. **Wait for the plan to end.** CloudFront's guide says a Free plan is cancelled at once, but the API reference says an active subscription's cancellation takes effect at the end of the billing period. So wait until `aws pricing-plan-manager list-subscriptions --region us-east-1` no longer lists the subscription. If `get-subscription` shows a `scheduledChange` of type `CANCELLATION` instead, the plan stays on until its `effectiveDate`, and step 3 waits until then.
+3. **Deploy the template without `pricingPlan`.** That detaches the web ACL. If CloudFront still refuses, CloudFormation rolls the update back: go back to step 2.
+4. **Delete the retained web ACL** once that deploy is complete: `aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1` gives its `Id` and `LockToken`, and `aws wafv2 delete-web-acl --scope CLOUDFRONT --region us-east-1 --name zachverse-site --id <Id> --lock-token <LockToken>` deletes it.
+
+From step 1 to step 4, AWS WAF bills the web ACL, its rules, and its requests at pay-as-you-go rates, and Route 53 bills the zone, so each step follows the one before it promptly.
 
 ## Runbook
 
-Run this after milestone 6's first release has passed its checks, as an administrator with ADR 0004's runbook:
+Run this after milestone 6's first release has passed its checks, as an administrator with ADR 0004's runbook. Until #7 merges, deploy the site stack only from its branch or a branch built on it: once the plan is on, a deploy of `main`'s template, which has no `pricingPlan`, fails at the distribution (see "Retention").
 
 1. **Preflight:** follow ADR 0004's steps 1 and 2: the account is `426499248998`, and no `CDK` variable or `~/.cdk.json` is set.
-2. **Export the zone:** save `aws route53 list-resource-record-sets --hosted-zone-id Z03492543O0YEY0RDZZ0J` to compare later.
-3. **Check the account.** `aws pricing-plan-manager list-subscriptions --region us-east-1` lists nothing for this distribution, and the account has fewer than three Free plans. `aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1` has no `zachverse-site`. The zone has at most 50 records.
+2. **Export what the deploy could change,** to compare later:
+   - the zone: `aws route53 list-resource-record-sets --hosted-zone-id Z03492543O0YEY0RDZZ0J`;
+   - the distribution: `aws cloudfront get-distribution-config --id E3R8NEUOW8Z97U`, whose `DistributionConfig` is what matters (its `ETag` changes with every update);
+   - the bucket policy: `aws s3api get-bucket-policy --region us-east-1 --bucket <SiteBucketName>`;
+   - the deploy role's policies: `aws iam list-role-policies` and `aws iam list-attached-role-policies`, each with `--role-name zachverse-github-site-deploy`, and `aws iam get-role-policy --role-name zachverse-github-site-deploy --policy-name SiteDeployPolicyEEC9A210`.
+3. **Check the account and the distribution:**
+   - `aws pricing-plan-manager list-subscriptions --region us-east-1` lists nothing for this distribution, and the account has fewer than three Free plans.
+   - `aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1` has no `zachverse-site`, and step 2's `WebACLId` is empty. A web ACL attached outside CloudFormation, by hand or by a Firewall Manager policy, would be detached by the deploy and left billed, and one that Firewall Manager manages rules out the plan.
+   - No other distribution uses the viewer-request function, which a distribution on a plan can't share. CloudFront can't list distributions by function, so take the function's ARN from step 2's `DefaultCacheBehavior.FunctionAssociations`, and check that it appears nowhere in `aws cloudfront list-distributions --query "DistributionList.Items[?Id!='E3R8NEUOW8Z97U'].[Id, DefaultCacheBehavior.FunctionAssociations.Items[].FunctionARN, CacheBehaviors.Items[].FunctionAssociations.Items[].FunctionARN]"`.
+   - `aws shield get-subscription-state --region us-east-1` is `INACTIVE`: Shield Advanced on the distribution rules out the plan.
+   - The distribution's recent usage is far below the Free tier's allowances: the 30-day sums of `Requests` and of `BytesDownloaded` over the last three months (`aws cloudwatch get-metric-statistics --region us-east-1 --namespace AWS/CloudFront --metric-name Requests --dimensions Name=DistributionId,Value=E3R8NEUOW8Z97U Name=Region,Value=Global --statistics Sum --period 2592000 --start-time <three months ago> --end-time <now>`, and again for `BytesDownloaded`), against 1 million and 100 GB. AWS judges eligibility from usage itself, by a rule it doesn't publish, so this is only a sanity check.
+   - The zone's `ResourceRecordSetCount` (`aws route53 get-hosted-zone --id Z03492543O0YEY0RDZZ0J`) is at most 50.
+   - The account's plan has no API to check; the owner confirmed it on 2026-10-15 ("Verification before the merge").
 4. **Review the diff:** `npm run cdk -- diff` in `infra/`. Expect only:
    - the web ACL and the subscription, added;
    - the distribution's `WebACLId`, added;
-   - two new outputs, `WebAclArn` and `PricingPlanSubscriptionArn`.
+   - two new outputs, `WebAclArn` and `PricingPlanSubscriptionArn`;
+   - milestone 6's `SiteDeployPolicy` change, if it isn't deployed yet.
 5. **Deploy:** `npm run cdk -- deploy ZachverseSite --require-approval never`.
 6. **Check the result:**
    - **Subscription:** `aws pricing-plan-manager get-subscription --region us-east-1 --arn <PricingPlanSubscriptionArn>` shows:
      - status `ACTIVE`;
      - tier `FREE`, with no scheduled change;
      - exactly the three resource ARNs (the distribution, the web ACL, the zone).
-   - **Distribution:** `aws cloudfront get-distribution-config` shows the web ACL's ARN as `WebACLId`, and nothing else changed.
-   - **Web ACL:** `aws wafv2 get-web-acl` shows the rules above.
+   - **Distribution:** `aws cloudfront get-distribution-config` shows the web ACL's ARN as `WebACLId`, and its `DistributionConfig` differs from step 2's in nothing else.
+   - **Web ACL:** `aws wafv2 get-web-acl` shows the rules above, and `ManagedByFirewallManager` is false.
+   - **Bucket policy and deploy role:** as in step 2, apart from milestone 6's change if the diff showed it.
    - **Stack:** `ZachverseSite` is `UPDATE_COMPLETE`, and its deployed template equals the synthesized one.
 7. **Smoke-test the live site through the web ACL:** run the Deploy workflow on `main` by hand. It publishes the current release again, as a retry, then smoke-tests it and checks it in a browser.
-8. **Compare the zone:** export it again; it must not differ from step 2.
-9. **Test an in-place update:** with the plan active, make an ordinary change to the stack, the distribution's comment, then deploy and check it as in steps 4 to 7. This shows that later stack updates still work on the plan.
+8. **Compare the zone:** export it again. Any difference from step 2 must be a separately reviewed change, such as an email record the owner approved.
+9. **Test an in-place update:** with the plan active, make an ordinary reviewed change to the stack: the distribution's comment and the web ACL's description. Export as in step 2, then review the diff, deploy, and check as in steps 4 to 7: only those two may change. This shows that later stack updates, a rule fix among them, still work on the plan.
 
-**If the subscription fails,** CloudFormation rolls the update back. Do not assume it undid everything:
+Milestone 8's DNS cutover waits until steps 6 to 9 have all passed and `docs/progress.md` records them.
 
-- **Find the cause:** read the stack's events, and the subscription's `StatusReason` if one was created.
-- **Check what is left:**
-  - the distribution, and whether its `WebACLId` is empty again;
-  - whether the web ACL is gone (the rollback should delete it, since its create rolled back);
-  - the certificate, the bucket and its policy, and the deploy role's permissions;
-  - the zone, against step 2's export.
-- **Report** any resource left on pay-as-you-go pricing, and what it was charged.
-- **Hold milestone 8's DNS cutover** until every check in step 6 passes.
+## If a step fails
+
+- **The deploy fails (step 5).** CloudFormation normally rolls the update back. Don't assume it undid everything:
+  - **Find the cause:** read the stack's events, and the subscription's `statusReason` if one was created.
+  - **Check what is left,** against step 2's exports:
+    - the distribution, and whether its `WebACLId` is empty again;
+    - whether the web ACL is gone (the rollback should delete it, since its create rolled back);
+    - the subscription: `aws pricing-plan-manager list-subscriptions --region us-east-1` lists none naming the distribution. One left behind makes a retry's subscription fail, so cancel it ("Retention", steps 1 and 2);
+    - the certificate, the bucket and its policy, and the deploy role's permissions;
+    - the zone.
+  - **If the stack is `UPDATE_ROLLBACK_FAILED`** because CloudFront wouldn't detach the web ACL: the subscription was created before the update failed, and the rollback restores the distribution before it deletes what the update created. Cancel the subscription ("Retention", steps 1 and 2), then run `npm run cdk -- rollback ZachverseSite` in `infra/`, and check what is left. Never skip or orphan the distribution (`--force`, `--orphan`, or `--resources-to-skip`): CloudFormation would record it without the web ACL while it keeps one, and that web ACL would stay attached outside the stack, billed at pay-as-you-go rates, under the name a retry needs.
+  - **If the stack is `UPDATE_COMPLETE` but step 6 doesn't show `ACTIVE`:** a sync usually takes 2 to 5 minutes, so check again. If the status is `FAILED`, read its `statusReason` and cancel it ("Retention", steps 1 and 2). Deploying the same template again creates no new subscription, so a retry needs a reviewed change.
+  - **Report** any resource left on pay-as-you-go pricing, and what it was charged.
+- **A check is blocked (step 7):** the smoke test or the browser check gets 403s from the web ACL. The deploy job fails, and the verify job's rollback fails its smoke test in the same way.
+  - **Find the rule within 3 hours,** while WAF keeps sampled requests: run `aws wafv2 get-sampled-requests --scope CLOUDFRONT --region us-east-1 --web-acl-arn <WebAclArn> --rule-metric-name <metric name> --time-window StartTime=<start>,EndTime=<end> --max-items 100` for each rule's metric name. Before the cutover, nearly every request is the checks'. Each rule's `BlockedRequests` metric in CloudWatch (namespace `AWS/WAFV2`) lasts longer.
+  - **The IP reputation group, on a runner's address:** re-run all jobs (ADR 0006, "When a release fails"); a new runner usually has another address.
+  - **Another rule, or a block that persists:** make a reviewed change in `infra/lib/site-stack.ts`, with its test, that sets only the matching rule to Count (`ruleActionOverrides` in that rule group's statement). Deploy it with ADR 0004's runbook, and repeat steps 6 and 7. That rule then protects no visitor, so record why. Never change the web ACL in the console, where the next deploy would undo it, and don't cancel the plan or run Restore for this.
+  - Until it is fixed, every push to `main` fails and rolls back.
+- **The zone has a change no one reviewed (step 8):** stop, and find it. Fix only the records it touched, through a reviewed batch in `infra/dns/`, never a whole-zone restore; email records need the owner's approval.
+- **The in-place update fails (step 9):** read the stack's events, and handle it like a failed deploy.
+- **Hold milestone 8's DNS cutover** until steps 6 to 9 all pass.
 
 ## Verification before the merge (2026-10-15)
 
 - **Tests:**
   - The guardrails check the web ACL against the Free tier's limits in every synthesis, production's included.
-  - `infra/test/site-stack.test.ts` pins the web ACL's properties and rules, the references that order the deployment, the subscription, and the outputs.
+  - `infra/test/site-stack.test.ts` pins the web ACL's properties and rules, the references that order the deployment, that nothing else references or depends on the web ACL or the subscription, the subscription, and the outputs.
   - `infra/test/environment.test.ts` pins the new logical IDs and create-only properties: the web ACL's name and scope, and the subscription's plan family.
-  - Infra tests: 1006 passed, at 100% coverage.
+  - `scripts/smoke-lib.test.ts` and `scripts/check-dist-lib.test.ts` pin the smoke test's one request per URL, its count of them, and the budget `check:dist` holds builds to; `tests/repo-policy.test.ts` keeps the budget at most half the rate limit.
+  - Infra tests: 1007 passed; web tests: 447 passed; both at 100% coverage.
 - **Diff:** `npm run cdk -- diff --method template` against the live stacks showed:
   - the web ACL and the subscription, added;
   - the distribution's `WebACLId`, added;
@@ -105,16 +137,19 @@ Run this after milestone 6's first release has passed its checks, as an administ
   - no differences in `ZachverseIdentity`.
 - **The account, read-only:**
   - No CLOUDFRONT-scope web ACL and no pricing-plan subscription. AWS allows three Free plans per account.
-  - The zone has 10 records.
-  - The site's distribution is the only one, with no web ACL.
+  - The zone has 11 record sets (`ResourceRecordSetCount`, at about 07:40 UTC): 10 before the DMARC record the owner approved, added at 06:24 UTC (Route 53 change `C02252852B8LKRZFNHRAO`).
+  - The site's distribution is the only one, with an empty `WebACLId`.
   - The viewer-request function is the only CloudFront Function, used by no other distribution.
+  - Shield Advanced: `get-subscription-state` is `INACTIVE`.
+  - Usage since the distribution was created on 2026-10-14: 371 requests and about 297 KB (CloudWatch, at about 07:40 UTC).
   - The Free Tier API's `GetAccountPlanState` answered `ResourceNotFoundException` ("Missing data for account"), so it couldn't confirm the account's plan type. Accounts on the AWS Free Tier plan can't subscribe; the owner confirmed on 2026-10-15 that the account is on the Paid plan.
 
 ## Limits
 
 - **Usage allowances:** the Free tier's 1 million requests and 100 GB a month are not hard limits. AWS notifies at 50%, 80%, and 100%, and may slow delivery after sustained excess. Phase 2's 3D assets may need a higher tier.
 - **Rule group updates:** AWS updates its managed rule groups, and the web ACL uses their default versions, so a new rule could start blocking legitimate requests. The smoke test and browser check would see it only at the next release.
-- **Seeing blocks:** without request logs, a block shows only in sampled requests and CloudWatch metrics.
-- **The rate limit:** it counts per IP address, so visitors behind one shared address share it.
+- **Seeing blocks:** without request logs, a block shows only in sampled requests, which WAF keeps for 3 hours, and in CloudWatch metrics.
+- **The checks' addresses:** the IP reputation group can list a GitHub-hosted runner's address, and so fail that run ("If a step fails").
+- **The rate limit:** it counts per IP address, so visitors behind one shared address share it. The smoke test's requests count too: `check:dist` keeps each build under half the limit, and a release with more files than that needs a higher limit or a smoke test that paces itself.
 - **Hosted zone records:** the zone must stay within the Free tier's 50 records while it is attached.
-- **What the guardrails can't check:** they read templates. They can't check an account's eligibility, its usage history (which can rule out a tier), or another distribution's use of the web ACL or function; the runbook checks those.
+- **What the guardrails can't check:** they read templates. They can't see another distribution's use of the viewer-request function, a web ACL attached outside CloudFormation, Shield Advanced, the account's plan, or usage that rules out a tier. Runbook step 3 checks the first three and compares the usage with the allowances; the owner confirmed the account's plan, which no API reports. AWS judges usage by a rule it doesn't publish, and refuses an ineligible subscription at deploy time, which rolls the update back ("If a step fails").

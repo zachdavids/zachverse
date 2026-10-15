@@ -2,11 +2,13 @@ import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { render } from '../src/entry-server.tsx';
 import { checkDist, releaseProblems } from './check-dist-lib.ts';
 import { prerenderPages, renderDocument } from './prerender-lib.ts';
+import { siteFiles } from './release-lib.ts';
+import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
 
 const source = (file: string) => readFileSync(new URL(file, import.meta.url), 'utf8');
 const [home, notFound] = prerenderPages;
@@ -619,6 +621,18 @@ describe('releaseProblems', () => {
     expect(releaseProblems(root)).toEqual([
       // The first file a release refuses; the hash rule is the one check:dist applies to references.
       'dist/ cannot be released: assets/index-AbCd12345.js has no content hash in its name, so it cannot be cached as immutable.',
+    ]);
+  });
+
+  it('reports a build whose smoke test would send more requests than its budget, and passes one at the budget', async () => {
+    const base = distributionRequests(siteFiles(fileURLToPath(new URL('dist/', await project({}, publicDir)))));
+    // Each page adds one request: its own address. Its references are files the smoke test requests anyway.
+    const pages = (count: number) =>
+      Object.fromEntries(Array.from({ length: count }, (_, i) => [`p/${i}/index.html`, build['index.html']!]));
+    expect(releaseProblems(await project(pages(SMOKE_REQUEST_BUDGET - base), publicDir))).toEqual([]);
+    expect(releaseProblems(await project(pages(SMOKE_REQUEST_BUDGET - base + 1), publicDir))).toEqual([
+      `dist/ would take the smoke test ${SMOKE_REQUEST_BUDGET + 1} requests through the distribution, more than its ` +
+        `budget of ${SMOKE_REQUEST_BUDGET}, half the web ACL's rate limit for one address (ADR 0007)`,
     ]);
   });
 

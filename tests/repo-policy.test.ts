@@ -9,6 +9,7 @@ import { resolveConfig } from 'vite';
 import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { ASSETS, RECORDS } from '../scripts/release-lib.ts';
+import { SMOKE_REQUEST_BUDGET } from '../scripts/smoke-lib.ts';
 import { site } from '../src/content.ts';
 import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
 
@@ -1281,6 +1282,13 @@ describe('Release and smoke-test scripts', () => {
     // Publishing caches every file under assets/ as immutable for a year, trusting the content hash in its name, and
     // Vite's own output names carry one (see "lets the Vite config set no client output name without a content hash").
     expect(readdirSync(new URL('public/', root)).filter((name) => name.toLowerCase() === 'assets')).toEqual([]);
+  });
+
+  it("keep the smoke test within half the web ACL's rate limit for one address", () => {
+    // Every request the smoke test sends comes from one runner address, and WAF counts approximately (ADR 0007).
+    const limit = /^export const RATE_LIMIT_PER_IP = (\d+);$/m.exec(read('infra/lib/site-stack.ts'))?.[1];
+    expect(limit).toBeDefined();
+    expect(SMOKE_REQUEST_BUDGET).toBeLessThanOrEqual(Number(limit) / 2);
   });
 
   it('keep the release records under the prefix the bucket policy keeps CloudFront from reading', () => {

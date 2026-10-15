@@ -1,6 +1,6 @@
 # Website DNS change batches
 
-The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CDK. It also carries Google Workspace email records (MX, SPF, DKIM, and later DMARC), which must never change as part of website work.
+The `zachdavids.com` hosted zone (`Z03492543O0YEY0RDZZ0J`) is managed outside CDK. It also carries Google Workspace email records (MX, SPF, DKIM, and DMARC), which must never change as part of website work.
 
 Website DNS changes are committed here as Route 53 change batches (the JSON for `aws route53 change-resource-record-sets --change-batch file://...`). Applying one is an administrative step. No stack may define DNS resources or grant DNS write access. The template guardrails (`infra/lib/guardrails/`) reject both. They run inside every synthesis and fail it, so the CDK CLI's synth, diff, and deploy fail on a DNS resource or a DNS-write grant even with `--build ''` or `--ignore-errors`, and the tests run them in CI. These are template checks, not access controls: CloudFormation deploys stacks through the CDK execution role, which can write DNS, and the templates of an assembly synthesized earlier and passed with `--app` are not checked again, so deploy only reviewed commits (ADR 0003, "Limits", lists what these checks miss).
 

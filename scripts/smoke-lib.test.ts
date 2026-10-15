@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render } from '../src/entry-server.tsx';
 import { prerenderPages, renderDocument } from './prerender-lib.ts';
 import { type SiteFile, siteFiles } from './release-lib.ts';
-import { type Get, prerendered, type Reply, retrying, smokeTest } from './smoke-lib.ts';
+import { distributionRequests, type Get, prerendered, type Reply, retrying, smokeTest } from './smoke-lib.ts';
 
 const CLOUDFRONT = 'd111111abcdef8.cloudfront.net';
 const BUCKET = 'site-bucket';
@@ -108,6 +108,7 @@ describe('smokeTest', () => {
       except(dir, (url) => {
         if (url.href === 'https://example.com/favicon.svg') return reply(200, '<svg/>', { 'content-type': 'text/plain' });
         if (url.href === 'https://example.com/about/index.html') return reply(500);
+        if (url.href === 'https://example.com/about') return reply(404);
         if (url.pathname.endsWith('.css')) {
           return reply(200, 'stale', { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'max-age=60' });
         }
@@ -115,20 +116,15 @@ describe('smokeTest', () => {
       }),
     );
     expect(result.passed).toEqual(CHECKS.filter((_check, index) => index !== 2 && index !== 3));
-    // Every file in path order, then each page's references in page order; the 404 page and the home page both load
-    // the icon, and the home page links to /about, which gets about/index.html.
+    // Every file in path order, then the references no earlier check requested: the icon and the stylesheet were, as
+    // files, so only the home page's link to /about is requested, which gets about/index.html.
     expect(result.failures).toEqual([
       `${CHECKS[2]}: /about/index.html: status 500, not 200`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: cache-control is "max-age=60", not "public, max-age=31536000, immutable"`,
       `${CHECKS[2]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
       `${CHECKS[2]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
-      `${CHECKS[3]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
-      `${CHECKS[3]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
-      `${CHECKS[3]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
-      `${CHECKS[3]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
-      `${CHECKS[3]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
-      `${CHECKS[3]}: /assets/index-EfGh5678.css: cache-control is "max-age=60", not "public, max-age=31536000, immutable"`,
+      `${CHECKS[3]}: /about: status 404, not 200`,
     ]);
   });
 
@@ -149,6 +145,24 @@ describe('smokeTest', () => {
         `${CHECKS[1]}: the home page has no the release it belongs to`,
       ]),
     );
+  });
+
+  it('requests each URL through the distribution once, however many pages refer to it, as distributionRequests counts', async () => {
+    const dir = site({
+      'about/index.html': '<!doctype html><title>About</title><a href="/">Home</a><a href="/about">About</a><link rel="icon" href="/favicon.svg" />',
+      'work/index.html': '<!doctype html><title>Work</title><a href="/about/">About</a><a href="/about">About</a>',
+    });
+    const healthy = cloudFront(dir);
+    const requests: string[] = [];
+    const counting: Get = async (url, via) => {
+      if (via !== undefined || new URL(url).host === CLOUDFRONT) requests.push(url);
+      return healthy(url, via);
+    };
+    expect((await smokeTest(dir, TARGET, counting)).failures).toEqual([]);
+    expect(requests.filter((url, i) => requests.indexOf(url) !== i)).toEqual([]);
+    // The fixed seven, the home page, the seven files, and the two page addresses the pages link to, /about and /about/.
+    expect(requests).toHaveLength(7 + 1 + 7 + 2);
+    expect(distributionRequests(siteFiles(dir))).toBe(requests.length);
   });
 
   it('fails a page that refers to a file the release does not have', async () => {

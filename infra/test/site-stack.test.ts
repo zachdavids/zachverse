@@ -324,11 +324,49 @@ describe('site stack (Free flat-rate plan enabled)', () => {
     });
   });
 
-  it('declares no other dependency, so nothing else waits on the plan', () => {
+  it('gives the web ACL, the distribution, and the subscription no DependsOn, so only their references order them', () => {
     for (const id of [WEB_ACL, DISTRIBUTION, 'PricingPlanSubscription']) expect(json.Resources[id]!.DependsOn).toBeUndefined();
   });
 
+  it('lets nothing else reference or depend on the web ACL or the subscription', () => {
+    // Every direct edge into them, from a resource or an output. The distribution is left out: the bucket policy, the
+    // deploy policy, and the subscription reference it, as they should.
+    const plan = [WEB_ACL, 'PricingPlanSubscription'];
+    const edges: string[] = [];
+    for (const [id, resource] of Object.entries(json.Resources)) {
+      for (const to of [resource.DependsOn ?? []].flat()) if (plan.includes(to)) edges.push(`${id} DependsOn ${to}`);
+      for (const to of referencedIds(resource)) if (plan.includes(to)) edges.push(`${id} -> ${to}`);
+    }
+    for (const [key, output] of Object.entries(json.Outputs ?? {})) {
+      for (const to of referencedIds(output)) if (plan.includes(to)) edges.push(`Outputs.${key} -> ${to}`);
+    }
+    expect(edges.sort()).toEqual([
+      `Outputs.PricingPlanSubscriptionArn -> PricingPlanSubscription`,
+      `Outputs.WebAclArn -> ${WEB_ACL}`,
+      `PricingPlanSubscription -> ${WEB_ACL}`,
+      `${DISTRIBUTION} -> ${WEB_ACL}`,
+    ]);
+  });
+
 });
+
+/** The logical IDs a template value refers to, through Ref, Fn::GetAtt in either form, or a ${Id} in Fn::Sub. */
+function referencedIds(value: unknown, ids = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) for (const item of value) referencedIds(item, ids);
+  else if (value !== null && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      if (key === 'Ref' && typeof item === 'string') ids.add(item);
+      else if (key === 'Fn::GetAtt') ids.add(Array.isArray(item) ? String(item[0]) : String(item).split('.')[0]!);
+      else if (key === 'Fn::Sub') {
+        const [text, variables] = Array.isArray(item) ? item : [item, {}];
+        // ${!Literal} is no reference, and a name the variable map defines is not a logical ID.
+        for (const [, id] of String(text).matchAll(/\$\{([^!}.][^}.]*)/g)) if (!(id! in (variables ?? {}))) ids.add(id!);
+      }
+      referencedIds(item, ids);
+    }
+  }
+  return ids;
+}
 
 // toThrow('text') only checks for a substring, so pass the whole message.
 const error = (message: unknown) => expect.objectContaining({ message });
