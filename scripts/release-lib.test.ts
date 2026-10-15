@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -230,6 +230,17 @@ describe('checkOrder', () => {
     // Over a restore, only when the run asks to resume.
     await checkOrder([entry(A), entry(B, { run: '91-1' }), entry(A, { action: 'restore', run: '92-1' })], C, repository, true);
     expect(compared).toEqual([`${B}...${C}`, `${B}...${C}`]);
+  });
+
+  it('lets the release a run rolled back be published again, however many of its attempts rolled back', async () => {
+    // As after re-running the failed jobs of a run whose first rollback never finished.
+    const twice = [
+      entry(A, { run: '10-1', verified: 'then' }),
+      entry(B, { run: '20-1' }),
+      entry(A, { action: 'rollback', run: '20-1', published: undefined }),
+      entry(A, { action: 'rollback', run: '20-2', verified: 'then' }),
+    ];
+    await checkOrder(twice, B, repositoryAnswering('identical').repository);
   });
 
   it('lets the current release be published again, as a retry', async () => {
@@ -789,6 +800,8 @@ describe('removing pages', () => {
     const first = fakes();
     await publish(site(), A, first.repository, first.context);
     for (const key of ['notes/a b.txt', 'notes/../x.txt']) first.objects.set(key, first.objects.get('robots.txt')!);
+    // An asset gone missing, which the publish would otherwise upload first.
+    first.objects.delete('assets/index-AbCd1234.js');
     const { log, repository, context } = fakes(first.objects);
     await expect(publish(site(), B, repository, context)).rejects.toThrow(
       'Nothing was changed: the bucket holds notes/../x.txt, notes/a b.txt, which no release would write. Check, and remove by hand what does not belong.',
@@ -862,6 +875,46 @@ describe('holding deploys after a restore', () => {
   });
 });
 
+describe('refusing before any write, in a restore and a rollback', () => {
+  const ODD = 'Nothing was changed: the bucket holds notes/a b.txt, which no release would write.';
+  const PENDING = '_releases/pending-invalidation.json is not a list of assets to invalidate. Nothing was changed.';
+
+  // A verified, and B published by run 100-1 but not verified; an asset gone missing, which either would put back first.
+  async function bucket(change: (objects: Map<string, StoredObject>) => void) {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    await publish(site({ 'robots.txt': 'B' }), B, second.repository, second.context);
+    second.objects.delete('assets/index-AbCd1234.js');
+    change(second.objects);
+    return second.objects;
+  }
+  const oddKey = (objects: Map<string, StoredObject>) => objects.set('notes/a b.txt', objects.get('robots.txt')!);
+  const badPending = (objects: Map<string, StoredObject>) => objects.set('_releases/pending-invalidation.json', json({ assets: ['/*'] }));
+
+  for (const [problem, change, message] of [
+    ['an odd key', oddKey, ODD],
+    ['a malformed pending record', badPending, PENDING],
+  ] as const) {
+    it(`restores nothing, and writes no file, when the bucket holds ${problem}`, async () => {
+      const { log, context } = fakes(await bucket(change));
+      const out = tempDir();
+      await expect(restore(A, out, { ...context, run: '300-1' })).rejects.toThrow(message);
+      expect(log).toEqual([]);
+      expect(readdirSync(out)).toEqual([]);
+    });
+
+    it(`rolls back nothing, and writes no file, when the bucket holds ${problem}`, async () => {
+      const { log, context } = fakes(await bucket(change));
+      const out = tempDir();
+      await expect(rollBack(out, context)).rejects.toThrow(message);
+      expect(log).toEqual([]);
+      expect(readdirSync(out)).toEqual([]);
+    });
+  }
+});
+
 describe('recordVerified', () => {
   it('records the release this run published as verified', async () => {
     const { objects, repository, context } = fakes();
@@ -895,6 +948,24 @@ describe('recordVerified', () => {
 describe('readHistory', () => {
   it('reads an empty history from a bucket without one', async () => {
     expect(await readHistory(fakes().store)).toEqual([]);
+  });
+
+  it('keeps a field it does not know inside an entry through every rewrite, as the format rule relies on', async () => {
+    const extra = (objects: Map<string, StoredObject>) => historyOf(objects).entries.map((e) => (e as Entry & { note?: string }).note);
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    // Newer code added a note to the first entry.
+    const noted = historyOf(first.objects);
+    (noted.entries[0] as Entry & { note?: string }).note = 'kept';
+    first.objects.set('_releases/history.json', json(noted));
+    const second = fakes(first.objects);
+    await publish(site({ 'robots.txt': 'B' }), B, second.repository, second.context);
+    await rollBack(tempDir(), second.context);
+    await recordVerified(second.context);
+    const third = fakes(second.objects);
+    await restore(A, tempDir(), { ...third.context, run: '300-1' });
+    expect(extra(third.objects)[0]).toBe('kept');
   });
 
   it('reads a history from before the format marker as format 1', async () => {

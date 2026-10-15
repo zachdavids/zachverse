@@ -150,14 +150,21 @@ describe('focusProblems', () => {
   });
   const none = { outlineStyle: 'none', outlineWidth: '0px' };
 
-  it('accepts focus shown by an outline or a shadow', () => {
-    expect(focusProblems(focus({}))).toEqual([]);
-    expect(focusProblems(focus({ outlineColor: 'rgba(0, 0, 255, 0.5)' }))).toEqual([]);
-    expect(focusProblems(focus({ ...none, tag: 'button', boxShadow: 'rgb(0, 0, 0) 0px 0px 0px 2px' }))).toEqual([]);
-    // One visible colour is enough, and a colour syntax it cannot read gets the benefit of the doubt.
-    const twoShadows = 'rgba(0, 0, 0, 0) 0px 0px 0px 1px, rgb(0, 0, 255) 0px 0px 0px 3px';
-    expect(focusProblems(focus({ ...none, boxShadow: twoShadows }))).toEqual([]);
-    expect(focusProblems(focus({ ...none, boxShadow: 'oklch(0.5 0.1 200) 0px 0px 0px 2px' }))).toEqual([]);
+  it('accepts focus shown by an outline or a shadow layer in a visible colour', () => {
+    for (const change of [
+      {},
+      { outlineColor: 'rgba(0, 0, 255, 0.5)' },
+      // Opaque black: a last component of 0 is blue, not alpha.
+      { outlineColor: 'rgb(0, 0, 0)' },
+      { outlineColor: 'oklch(0.5 0.1 200 / 0.8)' },
+      { ...none, tag: 'button', boxShadow: 'rgb(0, 0, 0) 0px 0px 0px 2px' },
+      { ...none, boxShadow: 'rgba(0, 0, 0, 0) 0px 0px 0px 1px, rgb(0, 0, 255) 0px 0px 0px 3px' },
+      // Tailwind v4's ring: transparent layers beside a visible oklch() one.
+      { ...none, boxShadow: 'rgba(0, 0, 0, 0) 0px 0px 0px 0px, oklch(0.623 0.214 259.815) 0px 0px 0px 2px' },
+      { ...none, boxShadow: 'oklch(0.5 0.1 200) 2px 2px 4px 0px inset' },
+    ]) {
+      expect(focusProblems(focus(change)), JSON.stringify(change)).toEqual([]);
+    }
   });
 
   it('reports focus that lands nowhere, or shows nothing', () => {
@@ -168,7 +175,12 @@ describe('focusProblems', () => {
       { outlineWidth: '0px' },
       { outlineColor: 'rgba(0, 0, 0, 0)' },
       { outlineColor: 'transparent' },
+      { outlineColor: 'oklch(0.5 0.1 200 / 0)' },
+      { outlineColor: 'color(srgb 0 0 0 / 0)' },
       { ...none, boxShadow: 'rgba(0, 0, 0, 0) 0px 0px 0px 2px' },
+      { ...none, boxShadow: 'oklch(0.5 0.1 200 / 0) 0px 0px 0px 2px, rgba(0, 0, 0, 0) 0px 0px 0px 2px' },
+      // A visible colour with no size shows nothing either.
+      { ...none, boxShadow: 'rgb(0, 0, 0) 0px 0px 0px 0px' },
     ]) {
       expect(focusProblems(focus(change)), JSON.stringify(change)).toEqual(['the focused <a> shows no focus indicator']);
     }
