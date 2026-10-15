@@ -4,10 +4,14 @@ import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { request, type Transport } from './smoke-http.ts';
 
-// Answers every request with its Host header and path, and /redirect with a 301.
+// Records each request's Host header and path, and answers /redirect with a 301 and anything else with a page. Its
+// answers are fixed: nothing a request sends comes back in a response.
+const received: { host?: string; url?: string }[] = [];
 const server = http.createServer((req, res) => {
-  res.writeHead(req.url === '/redirect' ? 301 : 200, { location: '/elsewhere', 'x-host': req.headers.host });
-  res.end(`body of ${req.url}`);
+  received.push({ host: req.headers.host, url: req.url });
+  const moved = req.url === '/redirect';
+  res.writeHead(moved ? 301 : 200, { location: '/elsewhere', 'content-type': 'text/plain' });
+  res.end(moved ? 'moved' : 'page');
 });
 let port = 0;
 
@@ -40,13 +44,14 @@ describe('request', () => {
     const reply = await request(`http://smoke.invalid:${port}/redirect`, 'localhost');
     expect(reply.status).toBe(301);
     expect(reply.headers.location).toBe('/elsewhere');
-    expect(reply.headers['x-host']).toBe(`smoke.invalid:${port}`);
-    expect(reply.body.toString()).toBe('body of /redirect');
+    expect(reply.body.toString()).toBe('moved');
+    expect(received.at(-1)).toEqual({ host: `smoke.invalid:${port}`, url: '/redirect' });
   });
 
   it("connects to the URL's own host when no via is given", async () => {
     const reply = await request(`http://127.0.0.1:${port}/page`);
-    expect({ status: reply.status, body: reply.body.toString() }).toEqual({ status: 200, body: 'body of /page' });
+    expect({ status: reply.status, body: reply.body.toString() }).toEqual({ status: 200, body: 'page' });
+    expect(received.at(-1)).toEqual({ host: `127.0.0.1:${port}`, url: '/page' });
   });
 
   it('makes https URLs with the https client: IPv4, a user agent, a 15-second timeout, a new connection, and the certificate checked', async () => {

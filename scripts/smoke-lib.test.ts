@@ -74,10 +74,10 @@ function cloudFront(dir: string): Get {
   };
 }
 
-// cloudFront, except where answer returns a reply for a URL.
-function except(dir: string, answer: (url: string, via?: string) => Reply | undefined): Get {
+// cloudFront, except where answer returns a reply for a URL, which it gets parsed, to match by host and path.
+function except(dir: string, answer: (url: URL) => Reply | undefined): Get {
   const healthy = cloudFront(dir);
-  return async (url, via) => answer(url, via) ?? healthy(url, via);
+  return async (url, via) => answer(new URL(url)) ?? healthy(url, via);
 }
 
 const CHECKS = [
@@ -106,9 +106,9 @@ describe('smokeTest', () => {
       dir,
       TARGET,
       except(dir, (url) => {
-        if (url === 'https://example.com/favicon.svg') return reply(200, '<svg/>', { 'content-type': 'text/plain' });
-        if (url === 'https://example.com/about/index.html') return reply(500);
-        if (url.endsWith('.css')) {
+        if (url.href === 'https://example.com/favicon.svg') return reply(200, '<svg/>', { 'content-type': 'text/plain' });
+        if (url.href === 'https://example.com/about/index.html') return reply(500);
+        if (url.pathname.endsWith('.css')) {
           return reply(200, 'stale', { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'max-age=60' });
         }
         return undefined;
@@ -134,7 +134,11 @@ describe('smokeTest', () => {
 
   it('fails a home page that is not the release, or not prerendered, at either hostname', async () => {
     const dir = site({ 'index.html': '<!doctype html><title></title><div id="root" data-page="home"></div>' });
-    const result = await smokeTest(dir, TARGET, except(dir, (url) => (url.endsWith('/') && !url.includes(PROBE) ? reply(503) : undefined)));
+    const result = await smokeTest(
+      dir,
+      TARGET,
+      except(dir, (url) => (url.pathname.endsWith('/') && !url.pathname.includes(PROBE) ? reply(503) : undefined)),
+    );
     expect(result.failures).toEqual(
       expect.arrayContaining([
         `${CHECKS[0]}: /: status 503, not 200`,
@@ -161,9 +165,9 @@ describe('smokeTest', () => {
       dir,
       TARGET,
       except(dir, (url) => {
-        if (url === 'http://example.com/') return reply(200, HOME);
-        if (url === 'http://www.example.com/') return reply(302, '', { location: 'https://www.example.com/' });
-        if (url.startsWith('https://www.')) return reply(301, '', { location: 'https://example.com/' });
+        if (url.href === 'http://example.com/') return reply(200, HOME);
+        if (url.href === 'http://www.example.com/') return reply(302, '', { location: 'https://www.example.com/' });
+        if (url.protocol === 'https:' && url.host === 'www.example.com') return reply(301, '', { location: 'https://example.com/' });
         return undefined;
       }),
     );
@@ -181,11 +185,12 @@ describe('smokeTest', () => {
       dir,
       TARGET,
       except(dir, (url) => {
-        if (url.includes(`/${PROBE}/`) && !url.includes('www.')) return reply(200, HOME);
-        if (url.includes(`/assets/${PROBE}`)) return reply(200, 'js');
-        if (url.includes('/_releases/')) return reply(404, notFoundPage);
-        if (url.includes('.s3.us-east-1.amazonaws.com/index.html')) return reply(200, HOME);
-        if (url.endsWith('.s3.us-east-1.amazonaws.com/')) return reply(200, '<ListBucketResult/>');
+        const bucket = url.host === `${BUCKET}.s3.us-east-1.amazonaws.com`;
+        if (url.host === 'example.com' && url.pathname === `/${PROBE}/`) return reply(200, HOME);
+        if (url.pathname === `/assets/${PROBE}.js`) return reply(200, 'js');
+        if (url.pathname === '/_releases/history.json') return reply(404, notFoundPage);
+        if (bucket && url.pathname === '/index.html') return reply(200, HOME);
+        if (bucket && url.pathname === '/') return reply(200, '<ListBucketResult/>');
         return undefined;
       }),
     );
