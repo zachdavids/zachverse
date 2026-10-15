@@ -113,6 +113,7 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
 
   it('is enabled, with only the settings checked here', () => {
     expect(distributionConfig().Enabled).toBe(true);
+    expect(distributionConfig().Comment).toBe('zachdavids.com website, Zachverse');
     // A new setting, such as a geo restriction, a price class, or another behavior, needs its own test first.
     expect(Object.keys(distributionConfig()).sort()).toEqual([
       'Aliases',
@@ -284,6 +285,7 @@ describe('site stack (Free flat-rate plan enabled)', () => {
     expect(json.Resources[WEB_ACL]!.Type).toBe('AWS::WAFv2::WebACL');
     expect(json.Resources[WEB_ACL]!.Properties).toEqual({
       Name: 'zachverse-site',
+      Description: 'zachdavids.com website, Free flat-rate plan, ADR 0007',
       Scope: 'CLOUDFRONT',
       DefaultAction: { Allow: {} },
       VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: 'zachverse-site' },

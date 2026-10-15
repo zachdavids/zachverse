@@ -57,7 +57,7 @@ export class SiteStack extends Stack {
     });
 
     this.distribution = new cloudfront.Distribution(this, 'SiteDistribution', {
-      comment: `${config.domainName} website`,
+      comment: `${config.domainName} website, Zachverse`,
       domainNames: [config.domainName, config.wwwDomainName],
       certificate: acm.Certificate.fromCertificateArn(this, 'SiteCertificate', certificateArn),
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
@@ -113,6 +113,8 @@ export class SiteStack extends Stack {
     if (config.pricingPlan) {
       const webAcl = new wafv2.CfnWebACL(this, 'SiteWebAcl', {
         name: 'zachverse-site',
+        // WAF allows letters, digits, spaces, and _+=:#@/,.- in a description.
+        description: `${config.domainName} website, Free flat-rate plan, ADR 0007`,
         scope: 'CLOUDFRONT',
         defaultAction: { allow: {} },
         visibilityConfig: visibility('zachverse-site'),
