@@ -1,8 +1,9 @@
 // Validates Route 53 change batches (the JSON passed to
 // `aws route53 change-resource-record-sets --change-batch`) kept in infra/dns/.
 // Website batches may only touch website routing and ACM validation records,
-// may never delete a validation record, and may give the site certificate's
-// validation records no value but the one committed.
+// may never delete a validation record, may give the site certificate's
+// validation records no value but the one committed, and may never point a
+// website name at the retired DigitalOcean Droplet.
 import { readdirSync, readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { ACM_VALIDATION_NAME } from '../../lib/guardrails/checks';
@@ -29,6 +30,25 @@ const NOT_SIMPLE = 'is not a field of a simple record, the only kind these batch
 const CLOUDFRONT_ALIAS_ZONE = 'Z2FDTNDATAQYW2';
 
 const normalize = (name: string) => name.toLowerCase().replace(/\.$/, '');
+
+/**
+ * The DigitalOcean Droplet's addresses, which served the website until milestone 8 and were retired in milestone 9
+ * (ADR 0009). Once the Droplet is destroyed, DigitalOcean can give them to another customer, who would then receive
+ * the website's traffic, so no batch may point a website name at them again.
+ */
+const RETIRED_ADDRESSES = new Set(['159.203.37.93', '2604:a880:cad:d0::46:6001']);
+
+/** An address in one spelling: IPv6 compressed and in lower case, as the URL parser writes it. */
+function canonicalAddress(value: string): string {
+  const address = value.trim().toLowerCase();
+  if (!address.includes(':')) return address;
+  try {
+    return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  } catch {
+    // Not an IPv6 address at all, so not a retired one.
+    return address;
+  }
+}
 
 /**
  * The site certificate's validation records, as its committed batch creates them: each name with its value, both
@@ -107,6 +127,14 @@ export function dnsBatchViolations(batch: Json): string[] {
       records.every((record) => typeof record?.Value === 'string' && Object.keys(record).length === 1);
     if (alias ? rrs.TTL !== undefined || records !== undefined : typeof rrs.TTL !== 'number' || !valued) {
       out.push(`${where}: a website record is either an alias, with no TTL or values, or a TTL with a list of string values`);
+    }
+    // A DELETE of such a record still passes: it removes a stale pointer at the retired Droplet.
+    if (change?.Action !== 'DELETE' && Array.isArray(records)) {
+      for (const record of records) {
+        if (typeof record?.Value === 'string' && RETIRED_ADDRESSES.has(canonicalAddress(record.Value))) {
+          out.push(`${where}: ${record.Value} is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else`);
+        }
+      }
     }
   });
   return out;
