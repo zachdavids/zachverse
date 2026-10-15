@@ -6,11 +6,13 @@ import type { Browser } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   browserCheck,
+  type Focus,
   focusProblems,
   type Measure,
   type Open,
   open,
   type PageReport,
+  SETTLE_MS,
   pageProblems,
   serve,
 } from './browser-check-lib.ts';
@@ -23,7 +25,8 @@ const goodMeasure = (): Measure => ({
   release: RELEASE,
   scrollWidth: 320,
   clientWidth: 320,
-  heading: { text: 'A Name', left: 16, right: 304, width: 288, height: 40 },
+  viewportHeight: 800,
+  heading: { text: 'A Name', left: 16, right: 304, top: 24, bottom: 64, width: 288, height: 40, visible: true },
   stylesheets: [{ href: `${ORIGIN}/assets/index-AbCd1234.css`, rules: 12 }],
   scripts: [`${ORIGIN}/assets/index-EfGh5678.js`],
 });
@@ -39,7 +42,7 @@ const goodReport = (url = `${ORIGIN}/`, status = 200, change: Partial<PageReport
     { url: `${ORIGIN}/assets/index-EfGh5678.js`, status: 200 },
   ],
   measure: goodMeasure(),
-  focus: { tag: 'a', outlineStyle: 'solid', outlineWidth: '2px', boxShadow: 'none' },
+  focus: { tag: 'a', outlineStyle: 'solid', outlineWidth: '2px', outlineColor: 'rgb(0, 0, 0)', boxShadow: 'none' },
   ...change,
 });
 
@@ -76,6 +79,9 @@ describe('pageProblems', () => {
       consoleErrors: [{ text: 'Failed to load resource: the server responded with a status of 404', url }],
     });
     expect(pageProblems(report, { status: 404, release: RELEASE })).toEqual([]);
+    // Any other console error on the 404 page is a problem, even at its own URL.
+    const broken = goodReport(url, 404, { consoleErrors: [{ text: 'the 404 page is broken', url }] });
+    expect(pageProblems(broken, { status: 404, release: RELEASE })).toEqual(['console error: the 404 page is broken']);
     // On a page that should load, the same response is a problem.
     expect(pageProblems(report, { status: 200, release: RELEASE })).toEqual([
       'status 404, not 200',
@@ -116,6 +122,9 @@ describe('pageProblems', () => {
     expect(page({ heading: { ...heading, height: 0 } })).toEqual(['the page shows no main heading']);
     expect(page({ heading: { ...heading, left: -400 } })).toEqual(['the main heading runs off the screen']);
     expect(page({ heading: { ...heading, right: 321 } })).toEqual(['the main heading runs off the screen']);
+    expect(page({ heading: { ...heading, top: -50 } })).toEqual(['the main heading runs off the screen']);
+    expect(page({ heading: { ...heading, bottom: 801 } })).toEqual(['the main heading runs off the screen']);
+    expect(page({ heading: { ...heading, visible: false } })).toEqual(['the main heading is hidden, or fully transparent']);
   });
 
   it('reports a page that names another release than the one expected, or none', () => {
@@ -131,20 +140,38 @@ describe('pageProblems', () => {
 });
 
 describe('focusProblems', () => {
+  const focus = (change: Partial<Focus>): Focus => ({
+    tag: 'a',
+    outlineStyle: 'solid',
+    outlineWidth: '2px',
+    outlineColor: 'rgb(0, 0, 0)',
+    boxShadow: 'none',
+    ...change,
+  });
+  const none = { outlineStyle: 'none', outlineWidth: '0px' };
+
   it('accepts focus shown by an outline or a shadow', () => {
-    expect(focusProblems({ tag: 'a', outlineStyle: 'solid', outlineWidth: '2px', boxShadow: 'none' })).toEqual([]);
-    expect(focusProblems({ tag: 'button', outlineStyle: 'none', outlineWidth: '0px', boxShadow: 'rgb(0, 0, 0) 0px 0px 0px 2px' })).toEqual([]);
+    expect(focusProblems(focus({}))).toEqual([]);
+    expect(focusProblems(focus({ outlineColor: 'rgba(0, 0, 255, 0.5)' }))).toEqual([]);
+    expect(focusProblems(focus({ ...none, tag: 'button', boxShadow: 'rgb(0, 0, 0) 0px 0px 0px 2px' }))).toEqual([]);
+    // One visible colour is enough, and a colour syntax it cannot read gets the benefit of the doubt.
+    const twoShadows = 'rgba(0, 0, 0, 0) 0px 0px 0px 1px, rgb(0, 0, 255) 0px 0px 0px 3px';
+    expect(focusProblems(focus({ ...none, boxShadow: twoShadows }))).toEqual([]);
+    expect(focusProblems(focus({ ...none, boxShadow: 'oklch(0.5 0.1 200) 0px 0px 0px 2px' }))).toEqual([]);
   });
 
   it('reports focus that lands nowhere, or shows nothing', () => {
     expect(focusProblems(null)).toEqual(['a Tab press focused nothing']);
     expect(focusProblems(undefined)).toEqual(['a Tab press focused nothing']);
-    expect(focusProblems({ tag: 'a', outlineStyle: 'none', outlineWidth: '2px', boxShadow: 'none' })).toEqual([
-      'the focused <a> shows no focus indicator',
-    ]);
-    expect(focusProblems({ tag: 'a', outlineStyle: 'solid', outlineWidth: '0px', boxShadow: 'none' })).toEqual([
-      'the focused <a> shows no focus indicator',
-    ]);
+    for (const change of [
+      { outlineStyle: 'none' },
+      { outlineWidth: '0px' },
+      { outlineColor: 'rgba(0, 0, 0, 0)' },
+      { outlineColor: 'transparent' },
+      { ...none, boxShadow: 'rgba(0, 0, 0, 0) 0px 0px 0px 2px' },
+    ]) {
+      expect(focusProblems(focus(change)), JSON.stringify(change)).toEqual(['the focused <a> shows no focus indicator']);
+    }
   });
 });
 
@@ -248,8 +275,9 @@ describe('open', () => {
       }),
       evaluate: vi.fn(async (fn: () => unknown) => {
         calls.push(`evaluate ${fn.name}`);
-        return fn.name === 'measure' ? goodMeasure() : { tag: 'a', outlineStyle: 'solid', outlineWidth: '2px', boxShadow: 'none' };
+        return fn.name === 'measure' ? goodMeasure() : goodReport().focus;
       }),
+      waitForTimeout: vi.fn(async (ms: number) => calls.push(`wait ${ms}`)),
       keyboard: { press: vi.fn(async (key: string) => calls.push(`press ${key}`)) },
     });
     const context = { newPage: async () => page, close: vi.fn(async () => calls.push('close')) };
@@ -274,11 +302,12 @@ describe('open', () => {
       failedRequests: [`${ORIGIN}/font.woff2 (net::ERR_FAILED)`, `${ORIGIN}/other (undefined)`],
       responses: [{ url: `${ORIGIN}/`, status: 200 }],
       measure: goodMeasure(),
-      focus: { tag: 'a', outlineStyle: 'solid', outlineWidth: '2px', boxShadow: 'none' },
+      focus: goodReport().focus,
     });
     expect(calls).toEqual([
       'context {"viewport":{"width":320,"height":800}}',
       `goto ${ORIGIN}/ {"waitUntil":"networkidle"}`,
+      `wait ${SETTLE_MS}`,
       'evaluate measure',
       'press Tab',
       'evaluate measureFocus',

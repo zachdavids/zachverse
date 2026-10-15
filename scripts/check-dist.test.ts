@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const checkDist = vi.hoisted(() => vi.fn<(rootDir: URL, release?: string) => string[]>());
-vi.mock('./check-dist-lib.ts', () => ({ checkDist }));
+const releaseProblems = vi.hoisted(() => vi.fn<(rootDir: URL) => string[]>(() => []));
+vi.mock('./check-dist-lib.ts', () => ({ checkDist, releaseProblems }));
 
 describe('check-dist script', () => {
   beforeEach(() => {
@@ -34,8 +35,9 @@ describe('check-dist script', () => {
     await run();
 
     expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url), undefined);
+    expect(releaseProblems).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url));
     expect(log).toHaveBeenCalledExactlyOnceWith(
-      'dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets',
+      'dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets, release rules',
     );
     expect(error).not.toHaveBeenCalled();
     expect(exit).not.toHaveBeenCalled();
@@ -51,7 +53,7 @@ describe('check-dist script', () => {
 
     expect(checkDist).toHaveBeenCalledExactlyOnceWith(new URL('../', import.meta.url), release);
     expect(log).toHaveBeenCalledExactlyOnceWith(
-      `dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets, release ${release}`,
+      `dist check passed: prerendered content and head, 404 page, robots.txt, sitemap.xml, referenced files, hashed assets, release rules, release ${release}`,
     );
     expect(exit).not.toHaveBeenCalled();
   });
@@ -67,14 +69,15 @@ describe('check-dist script', () => {
     expect(log).not.toHaveBeenCalled();
   });
 
-  it('prints every failure and exits with status 1', async () => {
+  it('prints every failure, the release rules\' too, and exits with status 1', async () => {
     checkDist.mockReturnValue(['missing dist/404.html', 'dist/robots.txt does not contain "Sitemap"']);
+    releaseProblems.mockReturnValueOnce(['dist/chunks/a.js is built outside assets/, so a release would publish it as a page']);
     const { exit, error, log } = captureOutput();
 
     await expect(run()).rejects.toThrow('process.exit(1)');
 
     expect(error).toHaveBeenCalledExactlyOnceWith(
-      'dist check failed:\n- missing dist/404.html\n- dist/robots.txt does not contain "Sitemap"',
+      'dist check failed:\n- missing dist/404.html\n- dist/robots.txt does not contain "Sitemap"\n- dist/chunks/a.js is built outside assets/, so a release would publish it as a page',
     );
     expect(exit).toHaveBeenCalledExactlyOnceWith(1);
     expect(log).not.toHaveBeenCalled();

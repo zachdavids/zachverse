@@ -10,7 +10,7 @@ const lib = vi.hoisted(() => ({
   recordVerified: vi.fn<(context: Context) => Promise<{ release: string; run: string }>>(),
   rollBack: vi.fn<(outDir: string, context: Context) => Promise<Outcome | undefined>>(),
 }));
-const aws = vi.hoisted(() => ({ s3Store: vi.fn(), cloudfrontCdn: vi.fn() }));
+const aws = vi.hoisted(() => ({ s3Store: vi.fn(), cloudfrontCdn: vi.fn(), awsVersion: vi.fn() }));
 const github = vi.hoisted(() => ({ githubRepository: vi.fn() }));
 vi.mock('./release-lib.ts', () => lib);
 vi.mock('./release-aws.ts', () => aws);
@@ -43,6 +43,7 @@ describe('release script', () => {
     vi.stubEnv('GITHUB_STEP_SUMMARY', join(summaryDir, 'summary.md'));
     aws.s3Store.mockReturnValue('store');
     aws.cloudfrontCdn.mockReturnValue('cdn');
+    aws.awsVersion.mockResolvedValue('aws-cli/2.37.13');
     github.githubRepository.mockReturnValue('repository');
   });
 
@@ -97,6 +98,7 @@ describe('release script', () => {
       '- Assets already in place: none',
       '- Pages removed: about/index.html',
       '- Paths invalidated: /, /index.html',
+      `- Tools: aws-cli/2.37.13; Node ${process.version}`,
     ].join('\n');
     expect(log.mock.calls).toEqual([['a message'], [report]]);
     expect(summary()).toBe(`${report}\n\n`);
@@ -126,6 +128,7 @@ describe('release script', () => {
         '- Assets already in place: assets/index-EfGh5678.css',
         '- Pages removed: none',
         '- Paths invalidated: /, /index.html',
+        `- Tools: aws-cli/2.37.13; Node ${process.version}`,
         '',
         'Deploys are held: pushes to main publish nothing until the Deploy workflow is run on main by hand with "Publish over a restore" checked.',
       ].join('\n'),
@@ -160,18 +163,30 @@ describe('release script', () => {
     expect((await run('rollback', 'rolled-back')).exit).not.toHaveBeenCalled();
   });
 
-  it('publishes over a restore when a run started by hand asks to resume', async () => {
+  it('publishes over a restore when a run started by hand asks to resume, on its first attempt only', async () => {
     vi.stubEnv('RESUME_DEPLOYS', 'true');
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '1');
     lib.publish.mockResolvedValue(OUTCOME);
-    await run('publish', 'site');
+    let { log } = await run('publish', 'site');
     expect(lib.publish.mock.calls[0]?.[4]).toBe(true);
+    expect(log.mock.calls.flat().filter((line) => String(line).startsWith('::notice::'))).toEqual([]);
+
+    // A re-run keeps the run's inputs, but must not publish over a restore made since.
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '2');
+    vi.resetModules();
+    vi.restoreAllMocks();
+    ({ log } = await run('publish', 'site'));
+    expect(lib.publish.mock.calls[1]?.[4]).toBe(false);
+    expect(log).toHaveBeenCalledWith(
+      '::notice::"Publish over a restore" counts only on a run\'s first attempt, and this is attempt 2. To publish over a restore, run the Deploy workflow on main by hand again.',
+    );
   });
 
   it('records the release as verified', async () => {
     lib.recordVerified.mockResolvedValue({ release: SHA, run: '7-2' });
     const { exit } = await run('verified');
     expect(lib.recordVerified).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ run: '7-2' }));
-    expect(summary()).toBe(`### Verified ${SHA}\n\nThe smoke test passed, and run 7-2 recorded the release as verified.\n\n`);
+    expect(summary()).toBe(`### Verified ${SHA}\n\nThe checks passed, and run 7-2 recorded the release as verified.\n\n`);
     expect(exit).not.toHaveBeenCalled();
   });
 

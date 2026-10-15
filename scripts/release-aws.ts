@@ -6,19 +6,52 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Cdn, Store } from './release-lib.ts';
 
-/** Runs the AWS CLI and resolves with its output; rejects with its error message when it fails. */
+/**
+ * Runs the AWS CLI and resolves with its output. When it fails, rejects with a one-line message and, when AWS answered
+ * with an error, its code.
+ */
 export type Aws = (args: string[]) => Promise<string>;
+
+/** AWS's error code and message, from the JSON the CLI prints for a service error with --cli-error-format json. */
+function serviceError(stderr: string): { code: string; message: string } | undefined {
+  try {
+    const reply = JSON.parse(stderr.slice(stderr.indexOf('{'), stderr.lastIndexOf('}') + 1)) as unknown;
+    if (typeof reply === 'object' && reply !== null && typeof (reply as { Code?: unknown }).Code === 'string') {
+      const { Code: code, Message: message } = reply as { Code: string; Message?: unknown };
+      return { code, message: typeof message === 'string' ? message.replace(/\s+/g, ' ') : '' };
+    }
+  } catch {
+    // Not JSON: the CLI prints other failures, such as an unknown option, as text.
+  }
+  return undefined;
+}
 
 export const runAws: Aws = (args) =>
   new Promise((resolve, reject) => {
-    execFile('aws', [...args, '--region', 'us-east-1'], { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`aws ${args.slice(0, 2).join(' ')}: ${stderr.trim() || error.message}`));
-      else resolve(stdout);
+    // AWS's error codes, unlike the CLI's wording of them, do not change with the CLI. The option needs CLI 2.34 or later.
+    const command = [...args, '--region', 'us-east-1', '--cli-error-format', 'json'];
+    execFile('aws', command, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) return resolve(stdout);
+      const where = `aws ${args.slice(0, 2).join(' ')}`;
+      const reply = serviceError(stderr);
+      const text = stderr.trim().split('\n').filter(Boolean).at(-1) ?? error.message;
+      reject(reply ? Object.assign(new Error(`${where}: ${reply.code}: ${reply.message}`), { code: reply.code }) : new Error(`${where}: ${text}`));
     });
   });
 
-// S3 answers 404 for a missing key because the role may list the bucket; without that it would answer 403.
-const isMissing = (error: unknown) => error instanceof Error && /\((?:404|NoSuchKey)\)/.test(error.message);
+/** The AWS CLI's version, for the release report. */
+export function awsVersion(): Promise<string> {
+  return new Promise((resolve) => {
+    execFile('aws', ['--version'], (error, stdout) => resolve(error ? 'unknown' : stdout.trim()));
+  });
+}
+
+// S3 answers 404 for a missing key because the role may list the bucket; without that it would answer 403. head-object
+// gets a bare 404 (a HEAD reply has no body to name an error in), and get-object NoSuchKey.
+const isMissing = (error: unknown) => {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === '404' || code === 'NoSuchKey';
+};
 
 /** Runs action with a new temporary directory, and removes it afterwards. */
 async function inScratch<T>(action: (dir: string) => Promise<T>): Promise<T> {

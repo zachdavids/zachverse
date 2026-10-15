@@ -5,7 +5,7 @@ import { dirname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { render } from '../src/entry-server.tsx';
-import { checkDist } from './check-dist-lib.ts';
+import { checkDist, releaseProblems } from './check-dist-lib.ts';
 import { prerenderPages, renderDocument } from './prerender-lib.ts';
 
 const source = (file: string) => readFileSync(new URL(file, import.meta.url), 'utf8');
@@ -590,5 +590,40 @@ describe('checkDist', () => {
       await symlink(new URL('missing', root), new URL(link, root), 'junction');
     }
     expect(checkDist(root)).toEqual(['dist/index.html references missing /archive/']);
+  });
+});
+
+describe('releaseProblems', () => {
+  // public/ as the repository has it; Vite copies these into dist/ as they are.
+  const publicDir = { 'favicon.svg': build['favicon.svg']!, 'robots.txt': build['robots.txt']!, 'sitemap.xml': build['sitemap.xml']! };
+
+  it('passes a build a release can publish: pages, files from public/, and hashed assets under assets/', async () => {
+    expect(releaseProblems(await project({ 'about/index.html': build['index.html']! }, publicDir))).toEqual([]);
+  });
+
+  it('reports a file the build emits outside assets/ that is not a page, as a lazily loaded chunk could be', async () => {
+    const root = await project({ 'chunks/lazy-AbCd1234.js': 'export {};\n', 'favicon.svg': null }, publicDir);
+    expect(releaseProblems(root)).toEqual([
+      'dist/chunks/lazy-AbCd1234.js is built outside assets/, so a release would publish it as a page',
+    ]);
+    // A file Vite did not copy from public/ is the build's own, even with a name public/ might have.
+    expect(releaseProblems(await project())).toEqual([
+      'dist/favicon.svg is built outside assets/, so a release would publish it as a page',
+      'dist/robots.txt is built outside assets/, so a release would publish it as a page',
+      'dist/sitemap.xml is built outside assets/, so a release would publish it as a page',
+    ]);
+  });
+
+  it('reports a file a release would refuse, as the release scripts word it', async () => {
+    const root = await project({ 'assets/vendor.js': 'x\n', 'assets/index-AbCd12345.js': 'x\n' }, publicDir);
+    expect(releaseProblems(root)).toEqual([
+      // The first file a release refuses; the hash rule is the one check:dist applies to references.
+      'dist/ cannot be released: assets/index-AbCd12345.js has no content hash in its name, so it cannot be cached as immutable.',
+    ]);
+  });
+
+  it('leaves a missing build to checkDist', async () => {
+    const root = await project(Object.fromEntries(Object.keys(build).map((file) => [file, null])));
+    expect(releaseProblems(root)).toEqual([]);
   });
 });
