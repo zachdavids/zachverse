@@ -1,7 +1,7 @@
 # ADR 0009: DigitalOcean retirement
 
 - Status: Accepted (milestone 9). Prepared, not carried out: it normally runs 7 to 14 days after milestone 8's cutover, before the `notAfter` that ADR 0008's step 2 records for the Droplet's certificate.
-- Date: 2026-10-15, revised the same day after review
+- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
 
 ## Context
 
@@ -43,13 +43,13 @@ The plan's milestone 9 retires the Droplet after 7 to 14 days of successful oper
 
 ## Runbook
 
-The owner does the DigitalOcean and Workspace steps. An administrator does the AWS checks, in Git Bash with `--profile default`, after checking that `aws sts get-caller-identity --profile default` returns `426499248998`. The checks only read. This change's merge (step 5), like every push to `main`, publishes a release through the Deploy workflow (ADR 0006).
+The owner does the DigitalOcean and Workspace steps. An administrator does the AWS checks, in Git Bash with `--profile default`. They sign in only for a step's checks, first check that `aws sts get-caller-identity --profile default` returns `426499248998`, and end the session with `aws logout --all` (ADR 0004, "Administrative access"). The checks only read. This change's merge (step 5), like every push to `main`, publishes a release through the Deploy workflow (ADR 0006).
 
 Before the first export, create the folder with `mkdir -p ~/droplet-retirement`, check that `ls -A ~/droplet-retirement` prints nothing, and run `set -o noclobber` in each session, so no export overwrites another. Give `nslookup` names with a final dot, as below. Without one, Windows `nslookup` first tries the machine's DNS suffix, and DigitalOcean's name servers answer for some of those, which can hide a zone that still exists.
 
 1. **Preconditions.** Stop if 1, 2, or 4 fails.
    1. ADR 0008's cutover was applied at least 7 days ago, its verification passed, and no DNS rollback has run since (`docs/progress.md`).
-   2. The site has run on CloudFront since: every Deploy run on `main` since the cutover passed, or its failure was settled (`gh run list --workflow deploy.yml --branch main`). No restore holds deploys: the newest entry in `aws s3 cp s3://<SiteBucketName>/_releases/history.json - --region us-east-1` is a `publish` with `verified` set, as in ADR 0008's precondition 3.
+   2. The site has run on CloudFront since: the owner's external monitor (ADR 0007, "Monitoring") shows no unexplained downtime since the cutover, and every Deploy run on `main` since then passed, or its failure was settled (`gh run list --workflow deploy.yml --branch main`). The monitor is the only one of these that goes through public DNS: the Deploy runs reach the distribution directly. No restore holds deploys: the newest entry in `aws s3 cp s3://<SiteBucketName>/_releases/history.json - --region us-east-1` is a `publish` with `verified` set, as in ADR 0008's precondition 3.
    3. If the `notAfter` that ADR 0008's step 2 recorded has passed, note in `docs/progress.md` that the clean window ended then ("When"). This doesn't stop the retirement.
    4. The owner decides to end the rollback window.
 2. **Nothing else depends on the Droplet.**
@@ -63,7 +63,7 @@ Before the first export, create the folder with `mkdir -p ~/droplet-retirement`,
 3. **Archive (owner, optional).** Copy what's worth keeping from `/var/www` and `/etc/nginx` into private storage, for example `sudo tar czf ~/droplet-archive.tgz /var/www /etc/nginx` on the Droplet, then `scp` it off. Leave out `/etc/letsencrypt`. Export DigitalOcean's zone into the same archive, from its Domains page or with `doctl compute domain records list zachdavids.com`.
 4. **Snapshot (owner, optional).** Take one only if a recovery copy is useful. Record in `docs/progress.md` its size, its monthly cost, and its deletion date, at most 30 days after step 6.
 5. **End the rollback window.**
-   - Run step 2's Route 53 check again.
+   - Run step 2's Route 53 check again, and ADR 0008's "The site, through real DNS" checks, each `curl` once with `-4` and once with `-6`.
    - Update this ADR's Status and `docs/progress.md`'s row 9 to say this change's merge ends the window, with steps 1 to 4's results.
    - Merge this change, and check that its Deploy run on `main` passed.
 
@@ -85,7 +85,7 @@ Before the first export, create the folder with `mkdir -p ~/droplet-retirement`,
    - **Route 53:** step 2's check still prints nothing. If a record at the Droplet's addresses ever turns up after the merge, remove it at once with a committed batch that deletes it. That batch needs no reverse.
    - **Public DNS:** `nslookup -type=A zachdavids.com. ns-1989.awsdns-56.co.uk` and `-type=AAAA`, and the same at `8.8.8.8`, return CloudFront's addresses, and so do the same queries for `www.zachdavids.com.`.
    - **The old server:** `curl -sS -m 10 -o /dev/null --connect-to zachdavids.com:443:159.203.37.93:443 https://zachdavids.com/` fails, and so does the same with `[2604:a880:cad:d0::46:6001]` in place of the IPv4 address. Nothing at the Droplet's addresses serves the site with a valid certificate. This doesn't show the Droplet is destroyed; step 6's check in the control panel does.
-   - **The site:** step 5's Deploy run passed (`gh run list --workflow deploy.yml --branch main --limit 1`).
+   - **The site:** ADR 0008's "The site, through real DNS" checks pass again, and step 5's Deploy run passed (`gh run list --workflow deploy.yml --branch main --limit 1`).
 10. **Record** steps 1 to 9 in `docs/progress.md`, in a pull request right after step 9.
 11. **Later:** delete the snapshot, if one was taken, by its recorded date, and record it. Record when the last automated backup has expired.
 
