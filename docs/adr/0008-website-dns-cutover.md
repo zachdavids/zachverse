@@ -1,8 +1,8 @@
 # ADR 0008: Website DNS cutover
 
 - Status: Accepted (milestone 8). Prepared, not applied: the batches wait for the preconditions below.
-- Date: 2026-10-15, revised the same day after review
-- Retired: milestone 9 deleted these batches when it ended the rollback window (ADR 0009). Git history keeps them.
+- Date: 2026-10-15, revised the same day after review and for milestone 9
+- Retired: milestone 9 deleted these batches, and the tests in `infra/test/dns-batches.test.ts` that replayed them against the 2026-10-15 zone, when it ended the rollback window (ADR 0009). Git history keeps them; this ADR records them as milestone 8 left them.
 
 ## Context
 
@@ -46,6 +46,8 @@ The Droplet serves both names with a Let's Encrypt certificate valid until 2026-
 - each batch fails whole on a zone that differs, including when applied twice;
 - a record added at `www` after step 2 makes the cutover's reverse fail whole ("Limits");
 - the distribution the aliases name is the one ADR 0003 records.
+
+These tests ran until milestone 9 deleted them with the batches (ADR 0009).
 
 Every batch in `infra/dns/` is also checked (`infra/dns/README.md`):
 - each website routing batch has a reverse batch that undoes exactly its website changes and applies in its order, change by change as Route 53 applies it;
@@ -102,6 +104,8 @@ An administrator applies the batches, in the Website account with `--profile def
   - `nslookup -type=MX www.zachdavids.com. ns-1989.awsdns-56.co.uk` finds no MX, as expected ("Decision", `www`).
 
   The cutover changes nothing email depends on, so an email problem with step 2's diff clean is no reason to roll back the website.
+
+**This rollback ended with milestone 9** (ADR 0009). Never apply a reverse batch taken from git history: the Droplet's addresses may now belong to someone else.
 
 **Rollback.** A rollback doesn't wait for a registrar operation (`infra/dns/README.md`). First check that the Droplet can take the site back, and that the reverse batch can apply:
 - **Delegation:** precondition 6's check passes. If it doesn't, the outage is a delegation problem that no batch can fix.

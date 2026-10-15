@@ -201,6 +201,30 @@ describe('batchPairingViolations', () => {
     ]);
   });
 
+  it("lets a batch delete a record at the retired Droplet's address with no reverse that brings it back, and refuses one that does", () => {
+    const stale = { Name: 'zachdavids.com.', Type: 'A', TTL: 300, ResourceRecords: [{ Value: '159.203.37.93' }] };
+    const alias = { Name: 'zachdavids.com.', Type: 'A', AliasTarget: { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: 'd1.cloudfront.net.', EvaluateTargetHealth: false } };
+    // Removing it alone needs no reverse at all.
+    write('remove.json', [{ Action: 'DELETE', ResourceRecordSet: stale }]);
+    // Replacing it with the alias needs a reverse only for the alias.
+    write('repoint.json', [
+      { Action: 'DELETE', ResourceRecordSet: stale },
+      { Action: 'CREATE', ResourceRecordSet: alias },
+    ]);
+    write('repoint.reverse.json', [{ Action: 'DELETE', ResourceRecordSet: alias }]);
+    expect(batchDirectoryViolations(dir)).toEqual([]);
+    expect(batchPairingViolations(dir)).toEqual([]);
+    // A reverse that brings the record back, under any spelling, is refused by both checks.
+    write('repoint.reverse.json', [
+      { Action: 'DELETE', ResourceRecordSet: alias },
+      { Action: 'CREATE', ResourceRecordSet: { ...stale, ResourceRecords: [{ Value: '159.203.37.93.' }] } },
+    ]);
+    expect(batchDirectoryViolations(dir)).toEqual([
+      "repoint.reverse.json: change 1 (CREATE A zachdavids.com): 159.203.37.93. is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else",
+    ]);
+    expect(batchPairingViolations(dir)).toEqual(['repoint.reverse.json: must undo exactly the website changes in repoint.json, and change nothing else']);
+  });
+
   it('refuses UPSERT at a website name, whose earlier state no reverse could know', () => {
     write('a.json', [{ Action: 'UPSERT', ResourceRecordSet: record(300) }]);
     write('a.reverse.json', [{ Action: 'DELETE', ResourceRecordSet: record(300) }]);
@@ -307,22 +331,29 @@ describe('dnsBatchViolations', () => {
     }
   });
 
-  it("refuses a website record at the retired Droplet's addresses, however spelled, but lets a batch delete one", () => {
+  it("refuses a website A or AAAA value at the retired Droplet's addresses, however written, but lets a batch delete one", () => {
     const RETIRED = "is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else";
-    const at = (action: string, type: string, value: string) => ({
+    const at = (action: string, type: string, value: string, name = 'zachdavids.com.') => ({
       Action: action,
-      ResourceRecordSet: { Name: 'zachdavids.com.', Type: type, TTL: 300, ResourceRecords: [{ Value: value }] },
+      ResourceRecordSet: { Name: name, Type: type, TTL: 300, ResourceRecords: [{ Value: value }] },
     });
     for (const [action, type, value] of [
       ['CREATE', 'A', '159.203.37.93'],
       ['UPSERT', 'A', ' 159.203.37.93 '],
+      ['UPSERT', 'A', '159.203.37.93.'],
       ['CREATE', 'AAAA', '2604:a880:cad:d0::46:6001'],
       ['UPSERT', 'AAAA', '2604:A880:CAD:D0:0:0:46:6001'],
+      ['UPSERT', 'AAAA', '::ffff:159.203.37.93'],
+      ['UPSERT', 'AAAA', '::FFFF:9FCB:255D'],
     ] as const) {
       expect(dnsBatchViolations({ Changes: [at(action, type, value)] }), value).toEqual([
         `change 0 (${action} ${type} zachdavids.com): ${value} ${RETIRED}`,
       ]);
     }
+    // At www too, and second among several values.
+    const both = at('UPSERT', 'A', '192.0.2.1', 'www.zachdavids.com.');
+    both.ResourceRecordSet.ResourceRecords.push({ Value: '159.203.37.93' });
+    expect(dnsBatchViolations({ Changes: [both] })).toEqual([`change 0 (UPSERT A www.zachdavids.com): 159.203.37.93 ${RETIRED}`]);
     // Deleting a stale pointer at the Droplet is how it would be removed.
     expect(dnsBatchViolations({ Changes: [at('DELETE', 'A', '159.203.37.93')] })).toEqual([]);
     // Other addresses, and a value that isn't an IPv6 address at all, are not the Droplet's.
@@ -340,7 +371,7 @@ describe('dnsBatchViolations', () => {
   const RECORD_TYPES = ['A', 'AAAA', 'CAA', 'CNAME', 'DS', 'HTTPS', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT'];
   const ROUTING_RECORDS = ['zachdavids.com A', 'zachdavids.com AAAA', 'www.zachdavids.com A', 'www.zachdavids.com AAAA', 'www.zachdavids.com CNAME'];
   const websiteRecords = ['zachdavids.com', 'www.zachdavids.com'].flatMap((name) => RECORD_TYPES.map((type) => `${name} ${type}`));
-  /** A change to the named record; values are not checked at the website names, only alias targets. */
+  /** A change to the named record; at the website names, values are checked only for their shape and the retired addresses. */
   const upsert = (record: string) => {
     const [name, type] = record.split(' ');
     return { Action: 'UPSERT', ResourceRecordSet: { Name: `${name}.`, Type: type, TTL: 300, ResourceRecords: [{ Value: 'example' }] } };
