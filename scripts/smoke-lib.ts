@@ -80,6 +80,8 @@ function references(page: SiteFile): { url: string; path: string }[] {
   });
 }
 
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
 /** The pages of a release: the files it serves as HTML. */
 const pagesOf = (files: SiteFile[]) => files.filter(({ path }) => path.endsWith('.html'));
 
@@ -129,12 +131,16 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
   const { cloudfront, bucket, probe } = target;
   // Through the distribution, whatever DNS says the custom hostnames are.
   const viaCloudFront = (url: string) => get(url, cloudfront);
-  // Each URL at the apex once a run: its reply doesn't depend on the page that refers to it, and the web ACL's rate
-  // limit counts every request (SMOKE_REQUEST_BUDGET).
-  const requested = new Set<string>();
+  // Each URL at the apex is requested once a run, and a later check reuses the reply: it doesn't depend on the page
+  // that refers to the URL, and the web ACL's rate limit counts every request (SMOKE_REQUEST_BUDGET).
+  const replies = new Map<string, Promise<Reply>>();
   const atApex = (url: string) => {
-    requested.add(url);
-    return viaCloudFront(`https://${apex}${url}`);
+    let reply = replies.get(url);
+    if (reply === undefined) {
+      reply = viaCloudFront(`https://${apex}${url}`);
+      replies.set(url, reply);
+    }
+    return reply;
   };
   const isNotFoundPage = (reply: Reply) => sha256(reply.body) === notFound.sha256;
 
@@ -159,11 +165,21 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
       "every page's scripts, styles, icons, and page links load",
       async () => {
         const problems: string[] = [];
+        // Each URL once, however many pages load it; a request that failed outright is reported, and the rest go on.
+        const judged = new Set<string>();
         for (const page of pagesOf(files)) {
           for (const { url, path } of references(page)) {
             const file = byPath.get(path);
-            if (file === undefined) problems.push(`/${page.path} refers to ${url}, which the release does not have`);
-            else if (!requested.has(url)) problems.push(...served(await atApex(url), file, url));
+            if (file === undefined) {
+              problems.push(`/${page.path} refers to ${url}, which the release does not have`);
+            } else if (!judged.has(url)) {
+              judged.add(url);
+              try {
+                problems.push(...served(await atApex(url), file, url));
+              } catch (error) {
+                problems.push(`${url}: ${messageOf(error)}`);
+              }
+            }
           }
         }
         return problems;
@@ -219,7 +235,7 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
     try {
       problems = await check();
     } catch (error) {
-      problems = [error instanceof Error ? error.message : String(error)];
+      problems = [messageOf(error)];
     }
     if (problems.length === 0) passed.push(name);
     else failures.push(...problems.map((problem) => `${name}: ${problem}`));
