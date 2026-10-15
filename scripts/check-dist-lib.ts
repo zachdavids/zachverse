@@ -9,6 +9,7 @@ import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { profile, site } from '../src/content.ts';
 import { escapeHtml } from './prerender-lib.ts';
+import { ASSETS, HASHED_NAME, isAsset, siteFiles } from './release-lib.ts';
 
 // The file CloudFront serves for a path, as infra/functions/viewer-request.js maps it.
 function servedFile(path: string): string {
@@ -57,8 +58,9 @@ function filesIn(dir: URL): Set<string> {
 }
 
 // Returns one message per problem found in rootDir's dist/. rootDir is a
-// directory URL ending in "/".
-export function checkDist(rootDir: URL): string[] {
+// directory URL ending in "/". release is the commit the deploy build sets
+// (RELEASE_COMMIT, ADR 0006), which each page must name; other builds name none.
+export function checkDist(rootDir: URL, release?: string): string[] {
   const dist = new URL('dist/', rootDir);
   const distFiles = filesIn(dist);
   const publicFiles = filesIn(new URL('public/', rootDir));
@@ -112,6 +114,13 @@ export function checkDist(rootDir: URL): string[] {
       `<meta name="description" content="${escapeHtml(site.description)}" />`,
     ]);
     if (html.includes('<!--app-')) failures.push(`dist/${file} still contains a prerender marker`);
+    const releaseTags = html.match(/<meta name="zachverse-release"[^>]*>/g) ?? [];
+    const releaseTag = `<meta name="zachverse-release" content="${release}" />`;
+    if (release === undefined && releaseTags.length > 0) {
+      failures.push(`dist/${file} names a release, but no RELEASE_COMMIT was given`);
+    } else if (release !== undefined && (releaseTags.length !== 1 || releaseTags[0] !== releaseTag)) {
+      failures.push(`dist/${file} does not name release ${release} exactly once`);
+    }
     // The capture group is not optional, so every match has m[1].
     const urls = [...html.matchAll(/\s(?:src|href)="([^"]*)"/g)].map((m) => m[1]!);
     // CloudFront serves /404.html at every missing path, so on /a/b/c a relative
@@ -127,19 +136,44 @@ export function checkDist(rootDir: URL): string[] {
     for (const ref of refs) {
       const key = keyOf(requested(ref));
       if (key === undefined || !distFiles.has(key)) failures.push(`dist/${file} references missing ${ref}`);
-      if (key?.startsWith('assets/')) assets.push({ ref, key });
+      if (key !== undefined && isAsset(key)) assets.push({ ref, key });
     }
     if (!assets.some((a) => a.key.endsWith('.js'))) failures.push(`dist/${file} references no JavaScript bundle`);
     if (!assets.some((a) => a.key.endsWith('.css'))) failures.push(`dist/${file} references no stylesheet`);
     for (const { ref, key } of assets) {
       // Vite copies public/ as is, so a name from there can only look hashed.
       if (publicFiles.has(key)) failures.push(`${ref} is copied unhashed from public/`);
-      else if (!/-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/.test(key)) failures.push(`${ref} has no content hash in its name`);
+      else if (!HASHED_NAME.test(key)) failures.push(`${ref} has no content hash in its name`);
     }
   }
 
   expectIncludes('robots.txt', read('robots.txt'), [`Sitemap: ${site.origin}/sitemap.xml`]);
   expectIncludes('sitemap.xml', read('sitemap.xml'), [`<loc>${site.origin}/</loc>`]);
 
+  return failures;
+}
+
+/**
+ * Problems a release would have with rootDir's dist/ (ADR 0006). A release publishes every file by the rules in
+ * release-lib.ts, so one it would refuse is reported here first. And only what is under assets/ is cached as immutable
+ * and never deleted: any other file the build emits, other than a page and what Vite copies from public/, would go out
+ * as a page and be deleted by the next release that lacks it, which a chunk an open page loads later must not be.
+ */
+export function releaseProblems(rootDir: URL): string[] {
+  const dist = new URL('dist/', rootDir);
+  const distFiles = filesIn(dist);
+  // checkDist reports a missing build.
+  if (distFiles.size === 0) return [];
+  const publicFiles = filesIn(new URL('public/', rootDir));
+  const failures: string[] = [];
+  try {
+    siteFiles(fileURLToPath(dist));
+  } catch (error) {
+    failures.push(`dist/ cannot be released: ${(error as Error).message}`);
+  }
+  for (const file of distFiles) {
+    if (file.endsWith('.html') || publicFiles.has(file) || isAsset(file)) continue;
+    failures.push(`dist/${file} is built outside ${ASSETS}, so a release would publish it as a page`);
+  }
   return failures;
 }

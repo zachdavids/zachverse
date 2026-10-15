@@ -47,20 +47,30 @@ function replaceOnce(source: string, search: string | RegExp, value: string): st
   return source.replace(search, () => value);
 }
 
-export function renderDocument(template: string, page: PrerenderPage, appHtml: string): string {
+// A release is named by its full commit SHA (ADR 0006).
+const RELEASE = /^[0-9a-f]{40}$/;
+
+// release, if given, is the commit the page is built from; the deploy build names it, so the page served shows which
+// release is live.
+export function renderDocument(template: string, page: PrerenderPage, appHtml: string, release?: string): string {
   if (!appHtml.trim()) throw new Error(`Prerendered markup for "${page.id}" is empty`);
   const description = escapeHtml(page.description);
+  const releaseTag = release === undefined ? '' : `\n    <meta name="zachverse-release" content="${release}" />`;
   let html = replaceOnce(template, markers.title, `<title>${page.title}</title>`);
   html = replaceOnce(html, markers.description, `<meta name="description" content="${description}" />`);
-  html = replaceOnce(html, markers.head, page.head);
+  html = replaceOnce(html, markers.head, `${page.head}${releaseTag}`);
   html = replaceOnce(html, markers.page, `data-page="${page.id}"`);
   // Last, so the marker counts never see the markup, such as an SVG <title>.
   return replaceOnce(html, markers.html, appHtml);
 }
 
 // Renders every page into rootDir's dist/ with the SSR bundle in dist-ssr/,
-// then deletes dist-ssr/. rootDir is a directory URL ending in "/".
-export async function prerender(rootDir: URL): Promise<void> {
+// then deletes dist-ssr/. rootDir is a directory URL ending in "/". release,
+// if given, is the commit the pages are built from.
+export async function prerender(rootDir: URL, release?: string): Promise<void> {
+  if (release !== undefined && !RELEASE.test(release)) {
+    throw new Error(`RELEASE_COMMIT must be a full commit SHA; got ${JSON.stringify(release)}`);
+  }
   const distDir = new URL('dist/', rootDir);
   const ssrDir = new URL('dist-ssr/', rootDir);
 
@@ -70,7 +80,7 @@ export async function prerender(rootDir: URL): Promise<void> {
   };
 
   for (const page of prerenderPages) {
-    await writeFile(new URL(page.file, distDir), renderDocument(template, page, render(page.id)));
+    await writeFile(new URL(page.file, distDir), renderDocument(template, page, render(page.id), release));
     console.log(`prerendered ${page.id} -> dist/${page.file}`);
   }
 

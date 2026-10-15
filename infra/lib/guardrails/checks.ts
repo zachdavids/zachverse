@@ -294,11 +294,16 @@ function recordChangeConditionViolations(where: string, statement: Json, allowan
 
 const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com';
 
-/** Everything routine website publishing needs: no delete, IAM, DNS, or stack actions. */
+/**
+ * Everything routine website publishing needs: no IAM, DNS, or stack actions, and no deletion of object versions. A
+ * release deletes the pages it no longer has (ADR 0006); the site stack denies deleting anything under assets/ or
+ * _releases/, which infra/test/site-stack.test.ts pins.
+ */
 export const WEBSITE_DEPLOY_ACTIONS: ReadonlySet<string> = new Set([
   's3:ListBucket',
   's3:GetObject',
   's3:PutObject',
+  's3:DeleteObject',
   'cloudfront:CreateInvalidation',
   'cloudfront:GetInvalidation',
   'cloudfront:ListInvalidations',

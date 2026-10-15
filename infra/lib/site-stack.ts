@@ -9,6 +9,9 @@ import type { Construct } from 'constructs';
 import type { SiteConfig } from './config';
 import { viewerRequestCode } from './viewer-request';
 
+/** The bucket prefix that holds the release records (scripts/release-lib.ts, ADR 0006). */
+export const RELEASE_RECORDS = '_releases/';
+
 export interface SiteStackProps extends StackProps {
   readonly config: SiteConfig;
 }
@@ -90,6 +93,18 @@ export class SiteStack extends Stack {
       'defaultRootObject is index.html (asserted in tests), so "/" never lists the bucket.',
     );
 
+    // The release records (a copy of each release, and the history) live beside the site, under _releases/, and are
+    // not part of it: CloudFront may read every object but these, so a request for one gets S3's 403, which the
+    // distribution leaves visible (ADR 0006).
+    this.bucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.DENY,
+        principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
+        actions: ['s3:GetObject'],
+        resources: [this.bucket.arnForObjects(`${RELEASE_RECORDS}*`)],
+      }),
+    );
+
     if (config.pricingPlan) {
       // References the distribution, so CloudFormation creates it after the distribution.
       new pricingplanmanager.CfnSubscription(this, 'PricingPlanSubscription', {
@@ -106,15 +121,21 @@ export class SiteStack extends Stack {
     // The GitHub deploy role lives in the identity stack (deployed first); its
     // permissions are defined here so they reference only this bucket and
     // distribution and come into existence together with them (ADR 0004).
-    // No delete: routine releases never remove objects, and versioning keeps
-    // overwritten files recoverable.
+    // A release deletes the pages it no longer has (ADR 0006), but never an asset, which an earlier page may still load,
+    // or a release record. With versioning, a delete only hides an object behind a delete marker, and the role cannot
+    // delete versions, so every page stays recoverable for 90 days.
     new iam.Policy(this, 'SiteDeployPolicy', {
       roles: [iam.Role.fromRoleName(this, 'SiteDeployRole', config.github.deployRoleName)],
       statements: [
         new iam.PolicyStatement({ actions: ['s3:ListBucket'], resources: [this.bucket.bucketArn] }),
         new iam.PolicyStatement({
-          actions: ['s3:GetObject', 's3:PutObject'],
+          actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
           resources: [this.bucket.arnForObjects('*')],
+        }),
+        new iam.PolicyStatement({
+          effect: iam.Effect.DENY,
+          actions: ['s3:DeleteObject'],
+          resources: [this.bucket.arnForObjects('assets/*'), this.bucket.arnForObjects(`${RELEASE_RECORDS}*`)],
         }),
         new iam.PolicyStatement({
           actions: [

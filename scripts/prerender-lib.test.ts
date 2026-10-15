@@ -29,6 +29,18 @@ describe('renderDocument', () => {
     expect(html).not.toContain('noindex');
   });
 
+  it('names the release in the head only when given one', () => {
+    const release = '0123456789abcdef0123456789abcdef01234567';
+    const tag = `<meta name="zachverse-release" content="${release}" />`;
+    expect(renderDocument(template, home!, '<main>hi</main>', release)).toContain(
+      `<link rel="canonical" href="https://zachdavids.com/" />\n    ${tag}\n  </head>`,
+    );
+    expect(renderDocument(template, notFound!, '<main>hi</main>', release)).toContain(
+      `<meta name="robots" content="noindex" />\n    ${tag}\n  </head>`,
+    );
+    expect(renderDocument(template, home!, '<main>hi</main>')).not.toContain('zachverse-release');
+  });
+
   it('marks the 404 page noindex and records its page id for hydration', () => {
     const html = renderDocument(template, notFound!, '<main>missing</main>');
     expect(html).toContain('<title>Page not found — Zachverse</title>');
@@ -131,6 +143,25 @@ describe('prerender', () => {
       ['prerendered home -> dist/index.html'],
       ['prerendered not-found -> dist/404.html'],
     ]);
+  });
+
+  it('names the release in every page when given one, and refuses one that is not a full commit SHA', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const release = 'fedcba9876543210fedcba9876543210fedcba98';
+    const rootUrl = await projectRoot({ 'dist/index.html': template, 'dist-ssr/entry-server.js': serverEntry });
+
+    for (const wrong of ['', 'main', release.slice(1), release.toUpperCase(), `${release}\n`]) {
+      await expect(prerender(rootUrl, wrong), JSON.stringify(wrong)).rejects.toThrow(
+        `RELEASE_COMMIT must be a full commit SHA; got ${JSON.stringify(wrong)}`,
+      );
+    }
+    expect(await readDist(rootUrl, 'index.html')).toBe(template);
+
+    await prerender(rootUrl, release);
+    expect(await readDist(rootUrl, 'index.html')).toBe(renderDocument(template, home!, '<main>rendered home</main>', release));
+    expect(await readDist(rootUrl, '404.html')).toBe(
+      renderDocument(template, notFound!, '<main>rendered not-found</main>', release),
+    );
   });
 
   it('fails when the client build has not produced dist/index.html', async () => {

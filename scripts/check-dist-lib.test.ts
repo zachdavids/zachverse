@@ -5,7 +5,7 @@ import { dirname, join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { render } from '../src/entry-server.tsx';
-import { checkDist } from './check-dist-lib.ts';
+import { checkDist, releaseProblems } from './check-dist-lib.ts';
 import { prerenderPages, renderDocument } from './prerender-lib.ts';
 
 const source = (file: string) => readFileSync(new URL(file, import.meta.url), 'utf8');
@@ -72,6 +72,37 @@ interface Problem {
 describe('checkDist', () => {
   it('passes a complete prerendered build of the pages App renders', async () => {
     expect(checkDist(await project())).toEqual([]);
+  });
+
+  it("requires each page to name the deploy build's release exactly once, and other builds' pages to name none", async () => {
+    const release = '0123456789abcdef0123456789abcdef01234567';
+    const named = {
+      'index.html': renderDocument(template, home!, render('home'), release),
+      '404.html': renderDocument(template, notFound!, render('not-found'), release),
+    };
+    expect(checkDist(await project(named), release)).toEqual([]);
+    expect(checkDist(await project(named))).toEqual([
+      'dist/index.html names a release, but no RELEASE_COMMIT was given',
+      'dist/404.html names a release, but no RELEASE_COMMIT was given',
+    ]);
+    expect(checkDist(await project(), release)).toEqual([
+      `dist/index.html does not name release ${release} exactly once`,
+      `dist/404.html does not name release ${release} exactly once`,
+    ]);
+    const other = 'f'.repeat(40);
+    const twice = named['index.html'].replace('</head>', `<meta name="zachverse-release" content="${release}" /></head>`);
+    expect(
+      checkDist(
+        await project({
+          'index.html': twice,
+          '404.html': renderDocument(template, notFound!, render('not-found'), other),
+        }),
+        release,
+      ),
+    ).toEqual([
+      `dist/index.html does not name release ${release} exactly once`,
+      `dist/404.html does not name release ${release} exactly once`,
+    ]);
   });
 
   it('passes a build whose content has characters React escapes', async () => {
@@ -559,5 +590,40 @@ describe('checkDist', () => {
       await symlink(new URL('missing', root), new URL(link, root), 'junction');
     }
     expect(checkDist(root)).toEqual(['dist/index.html references missing /archive/']);
+  });
+});
+
+describe('releaseProblems', () => {
+  // public/ as the repository has it; Vite copies these into dist/ as they are.
+  const publicDir = { 'favicon.svg': build['favicon.svg']!, 'robots.txt': build['robots.txt']!, 'sitemap.xml': build['sitemap.xml']! };
+
+  it('passes a build a release can publish: pages, files from public/, and hashed assets under assets/', async () => {
+    expect(releaseProblems(await project({ 'about/index.html': build['index.html']! }, publicDir))).toEqual([]);
+  });
+
+  it('reports a file the build emits outside assets/ that is not a page, as a lazily loaded chunk could be', async () => {
+    const root = await project({ 'chunks/lazy-AbCd1234.js': 'export {};\n', 'favicon.svg': null }, publicDir);
+    expect(releaseProblems(root)).toEqual([
+      'dist/chunks/lazy-AbCd1234.js is built outside assets/, so a release would publish it as a page',
+    ]);
+    // A file Vite did not copy from public/ is the build's own, even with a name public/ might have.
+    expect(releaseProblems(await project())).toEqual([
+      'dist/favicon.svg is built outside assets/, so a release would publish it as a page',
+      'dist/robots.txt is built outside assets/, so a release would publish it as a page',
+      'dist/sitemap.xml is built outside assets/, so a release would publish it as a page',
+    ]);
+  });
+
+  it('reports a file a release would refuse, as the release scripts word it', async () => {
+    const root = await project({ 'assets/vendor.js': 'x\n', 'assets/index-AbCd12345.js': 'x\n' }, publicDir);
+    expect(releaseProblems(root)).toEqual([
+      // The first file a release refuses; the hash rule is the one check:dist applies to references.
+      'dist/ cannot be released: assets/index-AbCd12345.js has no content hash in its name, so it cannot be cached as immutable.',
+    ]);
+  });
+
+  it('leaves a missing build to checkDist', async () => {
+    const root = await project(Object.fromEntries(Object.keys(build).map((file) => [file, null])));
+    expect(releaseProblems(root)).toEqual([]);
   });
 });

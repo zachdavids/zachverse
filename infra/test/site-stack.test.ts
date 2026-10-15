@@ -75,8 +75,9 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
     expect(JSON.stringify(allows[0].Condition.StringEquals['AWS:SourceArn'])).toContain(`"Ref":"${DISTRIBUTION}"`);
   });
 
-  it('denies every request that does not use TLS, to the bucket and its objects', () => {
-    // Exact: a narrower action, principal, or resource would let some plain-HTTP requests through.
+  it('denies every request that does not use TLS, and CloudFront every release record', () => {
+    // Exact: a narrower action, principal, or resource would let some plain-HTTP requests through, or let CloudFront
+    // serve a release record; a broader one could deny CloudFront the site itself.
     const bucketArn = { 'Fn::GetAtt': [BUCKET, 'Arn'] };
     expect(bucketPolicyStatements().filter((s) => s.Effect === 'Deny')).toEqual([
       {
@@ -85,6 +86,12 @@ describe.each(Object.entries(PRICING_MODES))('site stack design (%s)', (_mode, s
         Action: 's3:*',
         Resource: [bucketArn, { 'Fn::Join': ['', [bucketArn, '/*']] }],
         Condition: { Bool: { 'aws:SecureTransport': 'false' } },
+      },
+      {
+        Effect: 'Deny',
+        Principal: { Service: 'cloudfront.amazonaws.com' },
+        Action: 's3:GetObject',
+        Resource: { 'Fn::Join': ['', [bucketArn, '/_releases/*']] },
       },
     ]);
   });
@@ -220,7 +227,7 @@ describe('site stack (pay-as-you-go)', () => {
     expect(productionConfig()).toEqual(PRICING_MODES['pay-as-you-go']);
   });
 
-  it('grants the GitHub deploy role read/write (no delete) on this bucket and invalidation/read on this distribution', () => {
+  it('grants the GitHub deploy role read, write, and page deletion on this bucket, and invalidation/read on this distribution', () => {
     expect(json.Resources['SiteDeployPolicyEEC9A210']!.Properties).toEqual({
       PolicyName: 'SiteDeployPolicyEEC9A210',
       Roles: ['zachverse-github-site-deploy'],
@@ -230,8 +237,17 @@ describe('site stack (pay-as-you-go)', () => {
           { Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': [BUCKET, 'Arn'] } },
           {
             Effect: 'Allow',
-            Action: ['s3:GetObject', 's3:PutObject'],
+            Action: ['s3:DeleteObject', 's3:GetObject', 's3:PutObject'],
             Resource: { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/*']] },
+          },
+          // Never an asset, which an earlier page may still load, or a release record (ADR 0006).
+          {
+            Effect: 'Deny',
+            Action: 's3:DeleteObject',
+            Resource: [
+              { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/_releases/*']] },
+              { 'Fn::Join': ['', [{ 'Fn::GetAtt': [BUCKET, 'Arn'] }, '/assets/*']] },
+            ],
           },
           {
             Effect: 'Allow',
