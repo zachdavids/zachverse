@@ -1,0 +1,142 @@
+name: Deploy
+
+# Pushes to main, and runs started by hand, which only main may start (ADR 0005). Until milestone 6 the deploy job
+# publishes nothing: it checks the built site and the deploy role's access.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token; only the deploy job may request an OIDC token.
+permissions:
+  contents: read
+
+# This workflow's runs for main go one at a time, and none cancels one in progress; a newer run replaces any run still
+# waiting. GitHub takes runs in the order they reach the group, which need not be push order (ADR 0005, "Order").
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (typecheck, test, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Deploy only from main
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Only main deploys; this run is for $GITHUB_REF."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No dependency cache, even if package.json names a package manager: the site is built from a clean install.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (100% coverage required)
+        run: npm run test:coverage
+      - name: Build and prerender
+        run: npm run build
+      - name: Check prerendered output
+        run: npm run check:dist
+      # The deploy job checks the files it downloads against this digest of every file's name and contents.
+      - name: Record the site's digest
+        id: digest
+        shell: bash
+        working-directory: dist
+        run: |
+          digest=$(find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d ' ' -f 1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: dist/
+          if-no-files-found: error
+          # Files under .well-known/ are part of the site.
+          include-hidden-files: true
+          # A re-run of this job can add a second site artifact without error, and the download takes the one with the
+          # highest ID, which may be the earlier attempt's. This deletes that one first, as a best effort; the deploy
+          # job's digest check fails on files that differ from this build's.
+          overwrite: true
+
+  deploy:
+    name: Deploy (access check only until milestone 6)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      id-token: write # the OIDC token for the deploy role; every other scope is none
+    defaults:
+      run:
+        shell: bash
+    # The production environment's variables (ADR 0005), under names the AWS CLI does not read.
+    env:
+      ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ROLE_ARN: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+      BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Check the environment's variables
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ $ACCOUNT_ID =~ ^[0-9]{12}$ ]] || fail 'AWS_ACCOUNT_ID must be a 12-digit account ID.'
+          [[ $ROLE_ARN =~ ^arn:aws:iam::$ACCOUNT_ID:role/[A-Za-z0-9+=,.@_/-]+$ ]] ||
+            fail 'AWS_SITE_DEPLOY_ROLE_ARN must be the ARN of a role in AWS_ACCOUNT_ID.'
+          [[ $BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || fail 'SITE_BUCKET must be an S3 bucket name.'
+          [[ $DISTRIBUTION_ID =~ ^[A-Z0-9]{8,32}$ ]] || fail 'CLOUDFRONT_DISTRIBUTION_ID must be a distribution ID.'
+      # Fails if the download's digest differs from the one recorded at upload.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: site
+      - name: Check the site against the build's digest
+        working-directory: site
+        run: |
+          digest=$(find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum | cut -d ' ' -f 1)
+          if [ "$digest" != "$DIGEST" ]; then
+            echo "::error::The downloaded site's digest $digest differs from the build's $DIGEST."
+            exit 1
+          fi
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-session-name: zachverse-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: 900
+          # Keeps variables such as USE_EXISTING_CREDENTIALS or ROLE_CHAINING from filling inputs left out here. The
+          # action still reads HTTP_PROXY, and its AWS SDK reads AWS_ENDPOINT_URL_STS and ~/.aws/config, as the AWS
+          # CLI does in later steps, so no step in this job may set them (ADR 0005, "Limits").
+          translate-env-variables: false
+      - name: Check the deploy role's access (read-only)
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          caller=$(aws sts get-caller-identity --query Arn --output text)
+          [[ $caller == "arn:aws:sts::$ACCOUNT_ID:assumed-role/${ROLE_ARN##*/}/"* ]] ||
+            fail "Expected a session of $ROLE_ARN, got $caller."
+          aws s3api list-objects-v2 --bucket "$BUCKET" --max-keys 1 > /dev/null
+          origins=$(aws cloudfront get-distribution --id "$DISTRIBUTION_ID" \
+            --query 'Distribution.DistributionConfig.Origins.Items[].DomainName' --output text)
+          [[ $origins == "$BUCKET.s3.us-east-1.amazonaws.com" ]] ||
+            fail "Distribution $DISTRIBUTION_ID should have one origin, bucket $BUCKET; it has: $origins."
+          aws cloudfront list-invalidations --distribution-id "$DISTRIBUTION_ID" --max-items 1 > /dev/null
+          {
+            echo '### Access checked; nothing published'
+            echo
+            echo "Publishing starts in milestone 6. Commit \`$GITHUB_SHA\`, site digest \`$DIGEST\`."
+            echo
+            echo "- Role session: \`$caller\`"
+            echo "- Bucket \`$BUCKET\`: listed"
+            echo "- Distribution \`$DISTRIBUTION_ID\`: read, with the bucket as its only origin; invalidations listed"
+          } >> "$GITHUB_STEP_SUMMARY"

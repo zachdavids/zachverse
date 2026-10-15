@@ -23,6 +23,8 @@ type Mapping = Record<string, unknown> | null;
 // GitHub also takes an env written as one ${{ }} expression.
 type Environment = Mapping | string;
 type Step = Conditions & {
+  id?: string;
+  name?: string;
   uses?: string;
   run?: string;
   shell?: string;
@@ -42,12 +44,15 @@ type Job = Conditions & {
   steps?: Step[];
   permissions?: string | Record<string, string>;
   defaults?: Defaults;
+  concurrency?: unknown;
+  outputs?: Record<string, string>;
 };
 type Workflow = {
   on?: string | string[] | Record<string, Filter | null>;
   permissions?: unknown;
   defaults?: Defaults;
   env?: Environment;
+  concurrency?: unknown;
   jobs: Record<string, Job>;
 };
 // The parts of a Vitest config these checks read.
@@ -71,6 +76,18 @@ const jobs = workflows.flatMap(({ file, workflow }) =>
 );
 const steps = jobs.flatMap((context) => (context.job.steps ?? []).map((step) => ({ ...context, step })));
 const ci = workflows.find(({ file }) => /^ci\.ya?ml$/.test(file))?.workflow;
+const deploy = workflows.find(({ file }) => /^deploy\.ya?ml$/.test(file))?.workflow;
+
+// The checks CI's web job runs, which the deploy workflow also runs before it uploads the site.
+const WEB_STEPS = [
+  'actions/checkout',
+  'actions/setup-node',
+  'npm ci',
+  'npm run typecheck',
+  'npm run test:coverage',
+  'npm run build',
+  'npm run check:dist',
+];
 
 // GitHub resolves action names case-insensitively.
 const actionName = (uses = '') => uses.split('@')[0]!.toLowerCase();
@@ -151,11 +168,18 @@ function expressions(text: string) {
   return found;
 }
 
-// A CI job's steps as action names or "<dir>: <command>" (no prefix at the repo root) plus any shell
+// The code a step runs, which GitHub writes expressions into before it runs: its run: script, or the script input of
+// actions/github-script, which runs as JavaScript. Other actions that run an input as code are not recognized.
+function script(step: Step) {
+  const input = actionName(step.uses) === 'actions/github-script' ? step.with?.script : undefined;
+  return step.run ?? (typeof input === 'string' ? input : undefined);
+}
+
+// A job's steps as action names or "<dir>: <command>" (no prefix at the repo root) plus any shell
 // override, marked optional when they may be skipped or may fail without failing the job.
-function plan(jobId: string) {
-  const job = ci?.jobs[jobId];
-  const defaults = { ...ci?.defaults?.run, ...job?.defaults?.run };
+function plan(workflow: Workflow | undefined, jobId: string) {
+  const job = workflow?.jobs[jobId];
+  const defaults = { ...workflow?.defaults?.run, ...job?.defaults?.run };
   const optional = (item: Conditions) => item.if !== undefined || (item['continue-on-error'] ?? false) !== false;
   return (job?.steps ?? []).map((step) => {
     const dir = posix.normalize(step['working-directory'] ?? defaults['working-directory'] ?? '.').replace(/\/$/, '');
@@ -168,11 +192,11 @@ function plan(jobId: string) {
 }
 
 // Other steps may be added, but these must stay separate, required, and in this order.
-function expectRequiredSteps(jobId: string, required: string[]) {
-  expect(ci?.jobs[jobId], `ci.yml job ${jobId}`).toBeDefined();
+function expectRequiredSteps(workflow: Workflow | undefined, file: string, jobId: string, required: string[]) {
+  expect(workflow?.jobs[jobId], `${file} job ${jobId}`).toBeDefined();
   // A job is skipped when one it needs is skipped or fails, and GitHub reports a skipped job as passing.
-  expect(ci?.jobs[jobId]?.needs, `ci.yml job ${jobId} needs`).toBeUndefined();
-  const all = plan(jobId);
+  expect(workflow?.jobs[jobId]?.needs, `${file} job ${jobId} needs`).toBeUndefined();
+  const all = plan(workflow, jobId);
   expect(
     all.filter((step) => required.includes(step.replace(/ \(optional\)$/, ''))),
     all.join(' | '),
@@ -427,12 +451,62 @@ describe('GitHub Actions workflows', () => {
     ]);
   });
 
-  it('check out without persisting the token', () => {
+  it('pass values to scripts through env, never as expressions inside a script', () => {
+    // GitHub pastes an expression's value into the script before the shell or github-script reads it, so the value
+    // could run as code.
+    const pasted = steps.filter(({ step }) => script(step)?.includes('${{'));
+    expect(pasted.map(({ where, step }) => `${where}: ${step.name ?? step.uses ?? step.run}`)).toEqual([]);
+  });
+
+  it("counts an expression in a run: script or github-script's script, but not one passed through env", () => {
+    const githubScript = 'Actions/GitHub-Script@0123456789abcdef0123456789abcdef01234567';
+    const message = '${{ github.event.head_commit.message }}';
+    const list: Step[] = [
+      { run: `echo "${message}"` },
+      { uses: githubScript, with: { script: `core.info("${message}")` } },
+      { run: 'echo "$MESSAGE"', env: { MESSAGE: message } },
+      { uses: githubScript, env: { MESSAGE: message }, with: { script: 'core.info(process.env.MESSAGE)' } },
+      // Other inputs are not code.
+      { uses: 'actions/upload-artifact@0123456789abcdef0123456789abcdef01234567', with: { name: message } },
+    ];
+    expect(list.map((step) => script(step)?.includes('${{') ?? false)).toEqual([true, true, false, false, false]);
+  });
+
+  it('use only plain steps, each finished before the next starts', () => {
+    // These checks read a job's steps as one list in which each step finishes before the next starts. A background:
+    // step lets later steps start first, a cancel: step can stop one before it finishes, and parallel: nests steps
+    // these checks never read. GitHub may add more, so any key not listed here fails until these checks model it.
+    const modeled = [
+      'id',
+      'name',
+      'if',
+      'continue-on-error',
+      'timeout-minutes',
+      'uses',
+      'with',
+      'run',
+      'shell',
+      'working-directory',
+      'env',
+    ];
+    const unmodeled = steps.flatMap(({ where, step }) => {
+      // Each step either uses an action or runs a script.
+      const kinds = ['uses', 'run'].filter((key) => key in step);
+      return [
+        ...Object.keys(step)
+          .filter((key) => !modeled.includes(key))
+          .map((key) => `${where}: ${key}`),
+        ...(kinds.length === 1 ? [] : [`${where}: ${kinds.join(' and ') || 'neither uses nor run'}`]),
+      ];
+    });
+    expect(unmodeled).toEqual([]);
+  });
+
+  it("check out the run's own commit without persisting the token", () => {
     const checkouts = steps.filter(({ step }) => actionName(step.uses) === 'actions/checkout');
     expect(checkouts).not.toHaveLength(0);
-    for (const { where, step } of checkouts) {
-      expect(String(step.with?.['persist-credentials']), where).toBe('false');
-    }
+    // A ref or repository input would check out code other than the commit the run's checks report on.
+    for (const { where, step } of checkouts) expect(step.with, where).toEqual({ 'persist-credentials': false });
   });
 
   it('install Node from .nvmrc', () => {
@@ -466,19 +540,11 @@ describe('CI workflow', () => {
   });
 
   it('runs web install, typecheck, coverage, build, and dist checks as separate required steps in order', () => {
-    expectRequiredSteps('web', [
-      'actions/checkout',
-      'actions/setup-node',
-      'npm ci',
-      'npm run typecheck',
-      'npm run test:coverage',
-      'npm run build',
-      'npm run check:dist',
-    ]);
+    expectRequiredSteps(ci, 'ci.yml', 'web', WEB_STEPS);
   });
 
   it('runs infra install, typecheck, and coverage in infra as separate required steps in order', () => {
-    expectRequiredSteps('infra', [
+    expectRequiredSteps(ci, 'ci.yml', 'infra', [
       'actions/checkout',
       'actions/setup-node',
       'infra: npm ci',
@@ -690,6 +756,137 @@ describe('CI workflow', () => {
     // The scan must reach both packages' sources: an empty list would pass, as when git takes pathspecs literally.
     expect(sources).toEqual(expect.arrayContaining(['src/content.ts', 'infra/functions/viewer-request.js']));
     expect(sources.filter((file) => optOut.test(read(file)))).toEqual([]);
+  });
+});
+
+describe('Deploy workflow', () => {
+  const build = deploy?.jobs.build;
+  const job = deploy?.jobs.deploy;
+  // The positions of a job's steps that use an action.
+  const positions = (list: Step[], action: string) =>
+    list.flatMap((step, index) => (actionName(step.uses) === action ? [index] : []));
+
+  it('runs on pushes to main and by hand, as a build job and then a deploy job', () => {
+    expect(deploy ? triggers(deploy) : undefined).toEqual({ push: { branches: ['main'] }, workflow_dispatch: null });
+    expect(Object.keys(deploy?.jobs ?? {})).toEqual(['build', 'deploy']);
+    expect([job?.needs].flat()).toEqual(['build']);
+  });
+
+  it('is the only workflow with a job that may assume the deploy role', () => {
+    // The role's trust names the environment and main, not a workflow, and the rules for every workflow let any
+    // production deploy request an OIDC token, so one in another workflow would skip this workflow's checks and order.
+    expect(jobs.filter(({ workflow, job }) => deploysToProduction(workflow, job)).map(({ where }) => where)).toEqual([
+      'deploy.yml deploy',
+    ]);
+  });
+
+  it('runs one deploy at a time for main, never cancelling one in progress', () => {
+    // A group on the deploy job alone would order deploys by when each build finished, so an earlier push could often
+    // deploy last. At the workflow level only the order in which runs reach the group counts, which GitHub does not
+    // promise is push order (ADR 0005).
+    expect(deploy?.concurrency).toEqual({ group: 'deploy-${{ github.ref }}', 'cancel-in-progress': false });
+    expect(Object.values(deploy?.jobs ?? {}).filter((each) => each.concurrency !== undefined)).toEqual([]);
+  });
+
+  it('stops any ref but main, then builds and checks the site as CI does before uploading it', () => {
+    // The production environment and the role's trust also refuse other refs; this stops them before the build.
+    const [first] = build?.steps ?? [];
+    expect(first?.run).toMatch(/^if \[ "\$GITHUB_REF" != refs\/heads\/main \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
+    expectRequiredSteps(deploy, 'deploy.yml', 'build', [...WEB_STEPS, 'actions/upload-artifact']);
+    expect(plan(deploy, 'build').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+    // No environment, so no AWS access or variables, and no dependency cache.
+    expect(build?.environment).toBeUndefined();
+    const [setup] = positions(build?.steps ?? [], 'actions/setup-node').map((index) => build!.steps![index]);
+    expect(setup?.with).toEqual({ 'node-version-file': '.nvmrc', 'package-manager-cache': false });
+  });
+
+  it('uploads every file of the checked build right after the check, hidden ones included, with a digest of them all', () => {
+    const list = build?.steps ?? [];
+    const [upload] = positions(list, 'actions/upload-artifact');
+    expect(list[upload!]?.with).toEqual({
+      name: 'site',
+      path: 'dist/',
+      'if-no-files-found': 'error',
+      'include-hidden-files': true,
+      overwrite: true,
+    });
+    const record = list.findIndex((step) => step.id === 'digest');
+    const checked = list.findIndex((step) => step.run?.trim() === 'npm run check:dist');
+    expect(checked, 'npm run check:dist').toBeGreaterThanOrEqual(0);
+    // Only the digest runs between the check and the upload: a step there could change dist/ after the check, and the
+    // digest, taken after that step, would cover the change.
+    expect([record, upload], plan(deploy, 'build').join(' | ')).toEqual([checked + 1, checked + 2]);
+    expect(list[record]?.['working-directory']).toBe('dist');
+    expect(build?.outputs).toEqual({ digest: '${{ steps.digest.outputs.digest }}' });
+  });
+
+  it("deploys only the uploaded files, checked against the build job's digest before AWS credentials exist", () => {
+    const list = job?.steps ?? [];
+    // Every step of this job can request its OIDC token, so it runs only these, in this order.
+    expect(list.map((step) => (step.uses === undefined ? 'run' : actionName(step.uses)))).toEqual([
+      'run', // the variables check
+      'actions/download-artifact',
+      'run', // the digest check
+      'aws-actions/configure-aws-credentials',
+      'run', // the access check
+    ]);
+    const [download] = positions(list, 'actions/download-artifact');
+    const [configure] = positions(list, 'aws-actions/configure-aws-credentials');
+    // download-artifact also fails when the archive's digest differs from the one recorded at upload.
+    expect(list[download!]?.with).toEqual({ name: 'site', path: 'site' });
+    const check = list.findIndex((step) => step['working-directory'] === 'site');
+    expect(download! < check && check < configure!, `${download} < ${check} < ${configure}`).toBe(true);
+    // The same command computes the digest in both jobs.
+    const command = (step?: Step) => step?.run?.trim().split('\n')[0];
+    expect(command(list[check])).toBe(command(build?.steps?.find((step) => step.id === 'digest')));
+    expect(command(list[check])).toMatch(/^digest=\$\(find \. -type f /);
+    expect(list[check]?.run).toMatch(/\nif \[ "\$digest" != "\$DIGEST" \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
+    expect((job?.env as Record<string, unknown> | undefined)?.DIGEST).toBe('${{ needs.build.outputs.digest }}');
+    expect(plan(deploy, 'deploy').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+  });
+
+  it('assumes only the deploy role, through OIDC, in the production environment', () => {
+    expect(job?.environment).toBe('production');
+    // The job reads no repository content, so its token has no scope beyond the OIDC token.
+    expect(job?.permissions).toEqual({ 'id-token': 'write' });
+    const list = job?.steps ?? [];
+    expect(positions(list, 'aws-actions/configure-aws-credentials').map((index) => list[index]?.with)).toEqual([
+      {
+        'role-to-assume': '${{ vars.AWS_SITE_DEPLOY_ROLE_ARN }}',
+        'aws-region': 'us-east-1',
+        'allowed-account-ids': '${{ vars.AWS_ACCOUNT_ID }}',
+        'role-session-name': 'zachverse-deploy-${{ github.run_id }}-${{ github.run_attempt }}',
+        'role-duration-seconds': 900,
+        'translate-env-variables': false,
+      },
+    ]);
+  });
+
+  it('reads only the four production variables, and lets no step set a variable the AWS tools read', () => {
+    const read = strings(deploy)
+      .flatMap(expressions)
+      // GitHub reads context names in any case; a read such as vars['NAME'] or toJSON(vars) counts as "vars".
+      .flatMap((expression) =>
+        [...expression.matchAll(/\bvars\b(?:\s*\.\s*(\w+))?/gi)].map((match) => match[1] ?? match[0]),
+      );
+    expect([...new Set(read)].sort()).toEqual([
+      'AWS_ACCOUNT_ID',
+      'AWS_SITE_DEPLOY_ROLE_ARN',
+      'CLOUDFRONT_DISTRIBUTION_ID',
+      'SITE_BUCKET',
+    ]);
+    // The AWS CLI and SDKs read variables such as AWS_ACCOUNT_ID or AWS_ENDPOINT_URL_STS beside the role's
+    // credentials, and the credentials action reads HTTP_PROXY, so scripts get the values under other names.
+    const names = [deploy?.env, job?.env, ...(job?.steps ?? []).map((step) => step.env)].flatMap((env) =>
+      env && typeof env === 'object' ? Object.keys(env) : [],
+    );
+    expect(names).toEqual(expect.arrayContaining(['ACCOUNT_ID', 'ROLE_ARN', 'BUCKET', 'DISTRIBUTION_ID']));
+    expect(names.filter((name) => /^(?:aws_\w+|(?:https?|no|all)_proxy)$/i.test(name))).toEqual([]);
+    // Nor may a script set one, for itself or, through $GITHUB_ENV or $GITHUB_PATH, for later steps, or write the AWS
+    // CLI's config, whose endpoint_url the SDKs also read.
+    const setting = /\b(?:aws_\w+|(?:https?|no|all)_proxy)(?:=|<<)|\bGITHUB_(?:ENV|PATH)\b|\baws\s+configure\b/i;
+    const setters = (job?.steps ?? []).filter((step) => setting.test(step.run ?? ''));
+    expect(setters.map((step) => step.name ?? step.run)).toEqual([]);
   });
 });
 

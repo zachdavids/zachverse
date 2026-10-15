@@ -1,7 +1,7 @@
 # ADR 0004: GitHub deploy identity and CDK bootstrap
 
 - Status: Accepted and deployed 2026-10-12 (UTC)
-- Date: 2026-10-11, revised 2026-10-12 after the deploy, 2026-10-13 after review and for the site stack's first deployment, and 2026-10-14 after it
+- Date: 2026-10-11, revised 2026-10-12 after the deploy, 2026-10-13 after review and for the site stack's first deployment, and 2026-10-14 after it and for the deploy workflow
 
 ## Decision
 
@@ -89,4 +89,4 @@ Limits:
 - A provider ARN built with `Fn::Join` or `Fn::Sub` is flagged rather than read; trust a literal ARN or the provider's `Ref`.
 - Failing closed also flags computed principals that cannot be `*`, such as an account root principal built from `AWS::Partition`. `cdk.json` enables `@aws-cdk/core:enablePartitionLiterals`, so CDK writes such principals in these stacks as literal ARNs.
 - Neither check models privilege escalation, such as another role changing the deploy role's policies, or a role whose trust names the deploy role, which the deploy role could then assume without any grant of its own.
-- An actual GitHub job assuming the role is only verifiable once the deploy workflow exists (milestone 5).
+- Only a GitHub job can show the trust working. The trust names the `production` environment and `main`, not a workflow; `tests/repo-policy.test.ts` lets only the deploy workflow's deploy job run there with an OIDC token (ADR 0005). Its first run follows milestone 5's merge.
