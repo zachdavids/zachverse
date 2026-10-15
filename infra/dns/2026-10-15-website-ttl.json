@@ -1,5 +1,5 @@
 {
-  "Comment": "Milestone 8, step 1 of 2: lower the Droplet website records' TTL from 1800 to 300 seconds, values unchanged, so the cutover reaches resolvers quickly. Each record is deleted as reviewed and created again, so the batch fails whole if the zone has changed. Reverse: 2026-10-15-website-ttl.reverse.json.",
+  "Comment": "Milestone 8, step 1 of 2: lower the Droplet website records' TTL from 1800 to 300 seconds, values unchanged. Reverse: 2026-10-15-website-ttl.reverse.json.",
   "Changes": [
     {
       "Action": "DELETE",

@@ -1,5 +1,5 @@
 {
-  "Comment": "Milestone 8, reverse of step 2: point the website names back at the Droplet, as step 1 left them (TTL 300), in one atomic batch. Website routing records only; never restore a whole-zone export. After it, 2026-10-15-website-ttl.reverse.json puts the TTL back to 1800 if the cutover is abandoned.",
+  "Comment": "Milestone 8, reverse of step 2: point the website names back at the Droplet, at TTL 300. If the cutover is abandoned, then 2026-10-15-website-ttl.reverse.json.",
   "Changes": [
     {
       "Action": "DELETE",

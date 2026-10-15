@@ -1,5 +1,5 @@
 {
-  "Comment": "Milestone 8, reverse of step 1: put the Droplet website records' TTL back to 1800 seconds, values unchanged. Only if the cutover is abandoned before step 2; after step 2, use 2026-10-15-website-cutover.reverse.json first.",
+  "Comment": "Milestone 8, reverse of step 1: put the Droplet website records' TTL back to 1800 seconds. After step 2, apply 2026-10-15-website-cutover.reverse.json first.",
   "Changes": [
     {
       "Action": "DELETE",

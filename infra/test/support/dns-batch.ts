@@ -31,10 +31,23 @@ const SITE_CERTIFICATE_VALIDATION = new Map<string, string>(
     .Changes.map(({ ResourceRecordSet: rrs }: Json) => [normalize(rrs.Name), normalize(rrs.ResourceRecords[0].Value)]),
 );
 
+/**
+ * Route 53's documented limit on a batch's Comment (ChangeBatch in its API reference), which neither the CLI nor the
+ * SDKs check. The Comment must also be printable ASCII: the CLI reads a file:// batch in the system's encoding, so any
+ * other character could reach Route 53 as more than one.
+ */
+const COMMENT = /^[\x20-\x7e]{0,256}$/;
+
 export function dnsBatchViolations(batch: Json): string[] {
   const out: string[] = [];
+  for (const key of Object.keys(batch ?? {})) {
+    if (key !== 'Comment' && key !== 'Changes') out.push(`batch has ${key}, which is neither Comment nor Changes`);
+  }
+  if (batch?.Comment !== undefined && !(typeof batch.Comment === 'string' && COMMENT.test(batch.Comment))) {
+    out.push('batch Comment must be printable ASCII, at most 256 characters, or Route 53 refuses the batch');
+  }
   const changes: Json[] = batch?.Changes ?? [];
-  if (!Array.isArray(changes) || changes.length === 0) return ['batch has no Changes'];
+  if (!Array.isArray(changes) || changes.length === 0) return [...out, 'batch has no Changes'];
 
   changes.forEach((change, i) => {
     const rrs = change?.ResourceRecordSet ?? {};
@@ -128,17 +141,20 @@ export function applyBatch(zone: Zone, batch: Json): Zone {
 export const zoneOf = (records: Json[]): Zone => new Map(records.map((rrs) => [recordKey(rrs), rrs]));
 
 /**
- * Checks every file under `dir` except its README as a change batch, whatever its
- * name or folder: the AWS CLI applies any file it is given, so none may skip review.
- * That includes dot-names, which globs skip by default, and links, read through.
+ * Every file under `dir` except its README, whatever its name or folder: the AWS CLI applies any file it is given, so
+ * each is a batch, and none may skip review. That includes dot-names, which globs skip by default, and links.
  */
-export function batchDirectoryViolations(dir: string): string[] {
-  const files = readdirSync(dir, { recursive: true, withFileTypes: true })
+function batchFiles(dir: string): string[] {
+  return readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter((entry) => !entry.isDirectory())
     .map((entry) => path.relative(dir, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'))
     .filter((file) => file !== 'README.md')
     .sort();
-  return files.flatMap((file) => {
+}
+
+/** Checks every batch under `dir` (batchFiles) with dnsBatchViolations, reading links through. */
+export function batchDirectoryViolations(dir: string): string[] {
+  return batchFiles(dir).flatMap((file) => {
     let batch: Json;
     try {
       batch = JSON.parse(readFileSync(path.join(dir, file), 'utf8'));
@@ -147,4 +163,51 @@ export function batchDirectoryViolations(dir: string): string[] {
     }
     return dnsBatchViolations(batch).map((v) => `${file}: ${v}`);
   });
+}
+
+const isWebsiteChange = (change: Json) => WEBSITE_RECORDS.has(normalize(String(change?.ResourceRecordSet?.Name ?? '')));
+// A change, and the change that undoes it, as Route 53 compares record sets.
+const asNamed = (change: Json) => `${change?.Action} ${comparable(change?.ResourceRecordSet ?? {})}`;
+const asUndone = (change: Json) => `${change.Action === 'CREATE' ? 'DELETE' : 'CREATE'} ${comparable(change.ResourceRecordSet)}`;
+
+/**
+ * Pairs every batch under `dir` that changes a website routing record with its reverse batch, by name: X.json with
+ * X.reverse.json, so every batch is a top-level .json file named in lower case. A reverse batch must undo exactly its
+ * forward batch's website changes, each CREATE deleted and each DELETE created again, and change nothing else. Only
+ * exact DELETE and CREATE make that possible, so neither uses UPSERT at a website name. A batch that changes only
+ * validation records needs no reverse. Unreadable files are left to batchDirectoryViolations.
+ */
+export function batchPairingViolations(dir: string): string[] {
+  const out: string[] = [];
+  const batches = new Map<string, Json[]>();
+  for (const file of batchFiles(dir)) {
+    if (!/^[a-z0-9][a-z0-9.-]*\.json$/.test(file)) {
+      out.push(`${file}: a batch must be a top-level .json file named in lower case, to pair with its reverse by name`);
+      continue;
+    }
+    try {
+      const changes = JSON.parse(readFileSync(path.join(dir, file), 'utf8'))?.Changes;
+      batches.set(file, Array.isArray(changes) ? changes : []);
+    } catch {
+      // batchDirectoryViolations reports it.
+    }
+  }
+  for (const [file, changes] of batches) {
+    const website = changes.filter(isWebsiteChange);
+    for (const change of website) {
+      if (change?.Action === 'UPSERT') out.push(`${file}: ${asNamed(change)}: a website routing change must be an exact DELETE or a CREATE, never UPSERT`);
+    }
+    if (file.endsWith('.reverse.json')) {
+      const forwardFile = file.replace(/\.reverse\.json$/, '.json');
+      const forward = batches.get(forwardFile);
+      if (forward === undefined) {
+        out.push(`${file}: a reverse batch needs its forward batch, ${forwardFile}`);
+      } else if (JSON.stringify(forward.filter(isWebsiteChange).map(asUndone).sort()) !== JSON.stringify(changes.map(asNamed).sort())) {
+        out.push(`${file}: must undo exactly the website changes in ${forwardFile}, and change nothing else`);
+      }
+    } else if (website.length > 0 && !batches.has(file.replace(/\.json$/, '.reverse.json'))) {
+      out.push(`${file}: a website routing batch needs a reverse batch, ${file.replace(/\.json$/, '.reverse.json')}`);
+    }
+  }
+  return out;
 }
