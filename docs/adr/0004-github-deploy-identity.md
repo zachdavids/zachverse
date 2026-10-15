@@ -43,14 +43,14 @@ The role may delete a page that a release no longer has (milestone 6, ADR 0006),
 - The identity source stays AWS Builder ID.
 - No recovery path may depend on mail delivered through the `zachdavids.com` zone. The zone is in the Website account, so the account or DNS trouble that calls for recovery could also stop that mail (ADR 0002, "Account and billing").
 
-## Deployed state (verified 2026-10-12, updated 2026-10-14)
+## Deployed state (verified 2026-10-12, updated 2026-10-14 and 2026-10-15)
 
 | Item | Live value |
 | --- | --- |
 | `CDKToolkit` (us-east-1) | `CREATE_COMPLETE`, termination protection on, bootstrap version 32. Contains the staging bucket `cdk-hnb659fds-assets-426499248998-us-east-1`, the container repository, five `cdk-hnb659fds-*` roles, and the version parameter |
 | `ZachverseIdentity` | `UPDATE_COMPLETE`, termination protection on, drift `IN_SYNC`. Drift covers only the properties the template sets, so not the deploy role's policies, which the next row records |
 | GitHub provider | the only OIDC provider in the account; client ID `sts.amazonaws.com` |
-| Deploy role | trust policy exactly as above. Since the site stack's deployment on 2026-10-14, one inline policy, `SiteDeployPolicyEEC9A210`, with exactly the statements above; no managed policies |
+| Deploy role | trust policy exactly as above. Since the site stack's deployment on 2026-10-14, one inline policy, `SiteDeployPolicyEEC9A210`, with exactly the statements above, page deletion and its deny included since 2026-10-15; no managed policies |
 | Access Analyzer `ValidatePolicy` (trust policy) | no warnings. One suggestion, `CONFIRM_AUDIENCE_CLAIM_TYPE`, which warns against qualifiers on `aud`; none are used |
 | us-east-2 | no stacks |
 | Hosted zone | the 8 original records, unchanged. On 2026-10-13 the site certificate's two validation CNAMEs were added (ADR 0002) |
@@ -73,7 +73,7 @@ The site stack's first deployment (milestone 4) follows steps 1 and 2, then step
 7. Wait until `aws acm describe-certificate --region us-east-1 --certificate-arn <certificateArn> --query Certificate.Status`, with the ARN from `infra/lib/config.ts`, returns `ISSUED`. CloudFront rejects a certificate still pending validation, and a failed first create leaves a termination-protected stack to retry as ADR 0003 describes ("Termination protection"). ACM issued the certificate at 17:52 UTC on 2026-10-13.
 8. `npm run cdk -- diff --method template`, review, then `npm run cdk -- deploy ZachverseSite --require-approval never`. For a stack that does not exist yet, the default diff creates and deletes a temporary one to compute a change set; `--method template` only reads. Deploying `ZachverseSite` also deploys `ZachverseIdentity`, which it depends on, unless `--exclusively` is passed. The identity template is unchanged, so expect no change there unless the CDK or Node.js version differs from the one that deployed it, which changes only its `AWS::CDK::Metadata` resource (`cdk diff` leaves that resource out). Done on 2026-10-14 from `b569384`: the diff showed no change to `ZachverseIdentity`, even with `--strict`, and only additions to `ZachverseSite`, and the deploy created the site stack in under four minutes. ADR 0003 records its deployed state.
 
-Later changes to the site stack follow steps 1 and 2, then `npm run cdk -- diff`, review, and `npm run cdk -- deploy ZachverseSite --require-approval never`, from a pushed commit whose CI passed. Milestone 6's change, the bucket policy's deny of the release records (ADR 0006), went out this way on 2026-10-15 from `398c15b`, before its pull request merged, since the first release's smoke test needs it: the diff showed that one statement and no change to `ZachverseIdentity`. Milestone 7's web ACL and Free flat-rate plan follow these steps too, with ADR 0007's checks before and after.
+Later changes to the site stack follow steps 1 and 2, then `npm run cdk -- diff`, review, and `npm run cdk -- deploy ZachverseSite --require-approval never`, from a pushed commit whose CI passed. Milestone 6's change, the bucket policy's deny of the release records (ADR 0006), went out this way on 2026-10-15 from `398c15b`, before its pull request merged, since the first release's smoke test needs it: the diff showed that one statement and no change to `ZachverseIdentity`. So did its other change, the deploy role's page deletion and its deny, later that day from `a442c2f`: the diff showed only `SiteDeployPolicy`, again with no change to `ZachverseIdentity`, and IAM's policy simulator, which applies the organization's SCPs, allows the role to delete a page and denies it deleting anything under `assets/` or `_releases/`, or any object version. Milestone 7's web ACL and Free flat-rate plan follow these steps too, with ADR 0007's checks before and after.
 
 ## Checks and limits
 
