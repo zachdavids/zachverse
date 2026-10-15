@@ -1,8 +1,7 @@
+/** CloudFront flat-rate plan. The site stack also creates the web ACL the plan requires (ADR 0007). */
 export interface PricingPlanConfig {
   /** Only the no-cost tier is modelled; a paid tier must be a deliberate code change. */
   readonly tier: 'FREE';
-  /** CLOUDFRONT-scope web ACL (us-east-1); how it is created is decided in milestone 7. */
-  readonly webAclArn: string;
 }
 
 export interface GitHubDeployConfig {
@@ -44,7 +43,7 @@ export interface SiteConfig {
    * without a valid one.
    */
   readonly certificateArn: string;
-  /** CloudFront flat-rate plan. Omit for pay-as-you-go (the initial deployment). */
+  /** CloudFront flat-rate plan, and its web ACL. Omit for pay-as-you-go. */
   readonly pricingPlan?: PricingPlanConfig;
   /** GitHub Actions identity allowed to publish the website. */
   readonly github: GitHubDeployConfig;
@@ -58,7 +57,8 @@ export const production: SiteConfig = {
   wwwDomainName: 'www.zachdavids.com',
   // Requested on 2026-10-13; infra/dns/2026-10-13-acm-validation.json holds its validation records.
   certificateArn: 'arn:aws:acm:us-east-1:426499248998:certificate/f285dc12-6f64-4d9b-8309-043d5e90f354',
-  pricingPlan: undefined,
+  // Milestone 7 (ADR 0007).
+  pricingPlan: { tier: 'FREE' },
   github: {
     ownerName: 'zachdavids',
     ownerId: 43345768,

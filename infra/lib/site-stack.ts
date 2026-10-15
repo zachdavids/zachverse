@@ -4,6 +4,7 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as pricingplanmanager from 'aws-cdk-lib/aws-pricingplanmanager';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Annotations, Arn, ArnFormat, CfnOutput, Duration, RemovalPolicies, Stack, type StackProps, Tags } from 'aws-cdk-lib/core';
 import type { Construct } from 'constructs';
 import type { SiteConfig } from './config';
@@ -17,8 +18,9 @@ export interface SiteStackProps extends StackProps {
 }
 
 /**
- * Private S3 bucket behind a CloudFront distribution (OAC). Owns no DNS
- * records, hosted zones, or certificates; see docs/adr/0002 and 0003.
+ * Private S3 bucket behind a CloudFront distribution (OAC), and, with the Free flat-rate plan, the distribution's web
+ * ACL and the plan's subscription (docs/adr/0007). Owns no DNS records, hosted zones, or certificates; see
+ * docs/adr/0002 and 0003.
  */
 export class SiteStack extends Stack {
   readonly bucket: s3.Bucket;
@@ -28,7 +30,6 @@ export class SiteStack extends Stack {
     super(scope, id, props);
     const { config } = props;
     const certificateArn = requireCertificateArn(config);
-    if (config.pricingPlan) checkWebAclArn(config.pricingPlan.webAclArn, config.account);
 
     this.bucket = new s3.Bucket(this, 'SiteBucket', {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -56,7 +57,7 @@ export class SiteStack extends Stack {
     });
 
     this.distribution = new cloudfront.Distribution(this, 'SiteDistribution', {
-      comment: `${config.domainName} website`,
+      comment: `${config.domainName} website, Zachverse`,
       domainNames: [config.domainName, config.wwwDomainName],
       certificate: acm.Certificate.fromCertificateArn(this, 'SiteCertificate', certificateArn),
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
@@ -86,7 +87,6 @@ export class SiteStack extends Stack {
       errorResponses: [
         { httpStatus: 404, responseHttpStatus: 404, responsePagePath: '/404.html', ttl: Duration.seconds(60) },
       ],
-      webAclId: config.pricingPlan?.webAclArn,
     });
     Annotations.of(this.distribution).acknowledgeWarning(
       '@aws-cdk/aws-cloudfront-origins:listBucketSecurityRisk',
@@ -105,17 +105,34 @@ export class SiteStack extends Stack {
       }),
     );
 
+    // The Free flat-rate plan requires a web ACL on the distribution, and covers its cost; on pay-as-you-go the web ACL
+    // would be billed, so it exists only with the plan (ADR 0007). Each resource references the one before it, so
+    // CloudFormation creates the web ACL, then attaches it to the distribution, then subscribes them. Rolling the update
+    // back is not the reverse: CloudFormation restores the distribution first, which CloudFront refuses while a
+    // subscription holds it (ADR 0007, "If a step fails").
     if (config.pricingPlan) {
-      // References the distribution, so CloudFormation creates it after the distribution.
-      new pricingplanmanager.CfnSubscription(this, 'PricingPlanSubscription', {
+      const webAcl = new wafv2.CfnWebACL(this, 'SiteWebAcl', {
+        name: 'zachverse-site',
+        // WAF allows letters, digits, spaces, and _+=:#@/,.- in a description.
+        description: `${config.domainName} website, Free flat-rate plan, ADR 0007`,
+        scope: 'CLOUDFRONT',
+        defaultAction: { allow: {} },
+        visibilityConfig: visibility('zachverse-site'),
+        rules: SITE_WEB_ACL_RULES,
+      });
+      this.distribution.attachWebAclId(webAcl.attrArn);
+      const subscription = new pricingplanmanager.CfnSubscription(this, 'PricingPlanSubscription', {
         planFamily: 'CloudFront',
         planTier: config.pricingPlan.tier,
         resourceArns: [
           this.distribution.distributionArn,
-          config.pricingPlan.webAclArn,
+          webAcl.attrArn,
+          // The existing zone, attached so the plan covers its cost: a pricing association, which changes no record.
           `arn:${this.partition}:route53:::hostedzone/${config.hostedZoneId}`,
         ],
       });
+      new CfnOutput(this, 'WebAclArn', { value: webAcl.attrArn });
+      new CfnOutput(this, 'PricingPlanSubscriptionArn', { value: subscription.attrArn });
     }
 
     // The GitHub deploy role lives in the identity stack (deployed first); its
@@ -160,10 +177,52 @@ export class SiteStack extends Stack {
   }
 }
 
+/**
+ * Requests one viewer IP address may send in 5 minutes, the window the Free plan's rate limiting counts over, before
+ * the web ACL blocks it. A visitor's browser sends far fewer: it keeps the hashed assets for a year (ADR 0006). The
+ * smoke test sends all its requests from one runner address, so check:dist holds each build to half this limit
+ * (SMOKE_REQUEST_BUDGET in scripts/smoke-lib.ts).
+ */
+export const RATE_LIMIT_PER_IP = 1000;
+
+/** CloudWatch metrics and sampled requests, which AWS WAF keeps at no charge. */
+const visibility = (metricName: string): wafv2.CfnWebACL.VisibilityConfigProperty => ({
+  sampledRequestsEnabled: true,
+  cloudWatchMetricsEnabled: true,
+  metricName,
+});
+
+/** An AWS managed rule group, whose rules keep their own actions. */
+function managedRuleGroup(name: string, priority: number): wafv2.CfnWebACL.RuleProperty {
+  return {
+    name: `AWS-${name}`,
+    priority,
+    statement: { managedRuleGroupStatement: { vendorName: 'AWS', name } },
+    overrideAction: { none: {} },
+    visibilityConfig: visibility(`AWS-${name}`),
+  };
+}
+
+/**
+ * Four of the five rules the Free plan allows (ADR 0007): a per-IP rate limit, and the three AWS managed rule groups
+ * of AWS's example web ACL for a pricing plan. The cheaper rules run first: known bad addresses, then floods, then the
+ * rule groups that inspect each request.
+ */
+const SITE_WEB_ACL_RULES: wafv2.CfnWebACL.RuleProperty[] = [
+  managedRuleGroup('AWSManagedRulesAmazonIpReputationList', 0),
+  {
+    name: 'RateLimitPerIp',
+    priority: 1,
+    statement: { rateBasedStatement: { limit: RATE_LIMIT_PER_IP, evaluationWindowSec: 300, aggregateKeyType: 'IP' } },
+    action: { block: {} },
+    visibilityConfig: visibility('RateLimitPerIp'),
+  },
+  managedRuleGroup('AWSManagedRulesKnownBadInputsRuleSet', 2),
+  managedRuleGroup('AWSManagedRulesCommonRuleSet', 3),
+];
+
 // ACM certificate IDs are UUIDs.
 const CERTIFICATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-// webacl/<name>/<ID>: the name is 1-128 letters, digits, hyphens, or underscores, and the ID is a UUID.
-const WEB_ACL_RESOURCE_NAME = /^webacl\/[\w-]{1,128}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function requireCertificateArn(config: SiteConfig): string {
   const arn = config.certificateArn;
@@ -191,27 +250,4 @@ function requireCertificateArn(config: SiteConfig): string {
     throw new Error(`certificateArn must have the form arn:aws:acm:us-east-1:<account>:certificate/<ID>: ${arn}`);
   }
   return arn;
-}
-
-/** The web ACL is created outside this stack, so a bad paste would otherwise fail only at deploy time. */
-function checkWebAclArn(arn: string, account: string): void {
-  if (!arn) {
-    throw new Error('pricingPlan.webAclArn is empty. Set it to the ARN of the CLOUDFRONT-scope web ACL (docs/adr/0002).');
-  }
-  const parsed = Arn.split(arn, ArnFormat.SLASH_RESOURCE_NAME);
-  // CLOUDFRONT-scope web ACLs have the scope "global" and always live in us-east-1.
-  if (
-    parsed.partition !== 'aws' ||
-    parsed.service !== 'wafv2' ||
-    parsed.resource !== 'global' ||
-    parsed.region !== 'us-east-1' ||
-    parsed.account !== account
-  ) {
-    throw new Error(`pricingPlan.webAclArn must be a CLOUDFRONT-scope web ACL in us-east-1 owned by ${account}: ${arn}`);
-  }
-  if (!WEB_ACL_RESOURCE_NAME.test(parsed.resourceName ?? '') || parsed.arnFormat !== ArnFormat.SLASH_RESOURCE_NAME) {
-    throw new Error(
-      `pricingPlan.webAclArn must have the form arn:aws:wafv2:us-east-1:<account>:global/webacl/<name>/<ID>: ${arn}`,
-    );
-  }
 }

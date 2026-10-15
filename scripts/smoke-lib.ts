@@ -80,6 +80,31 @@ function references(page: SiteFile): { url: string; path: string }[] {
   });
 }
 
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The pages of a release: the files it serves as HTML. */
+const pagesOf = (files: SiteFile[]) => files.filter(({ path }) => path.endsWith('.html'));
+
+/**
+ * The most requests the smoke test may send through the distribution in one run. Every request it sends comes from one
+ * runner address, which the web ACL's rate limit counts, and WAF counts approximately, so this is half that limit
+ * (infra/lib/site-stack.ts, RATE_LIMIT_PER_IP; tests/repo-policy.test.ts keeps the two in step). check:dist holds every
+ * build to it.
+ */
+export const SMOKE_REQUEST_BUDGET = 500;
+
+/**
+ * How many requests smokeTest sends through the distribution for a release: seven fixed ones, then each URL at the apex
+ * once: the home page, every file, and every other URL a page refers to that the release has. Its two requests to the
+ * bucket's own endpoint don't pass through the distribution.
+ */
+export function distributionRequests(files: SiteFile[]): number {
+  const paths = new Set(files.map((file) => file.path));
+  const urls = new Set(['/', ...files.map((file) => `/${file.path}`)]);
+  for (const page of pagesOf(files)) for (const { url, path } of references(page)) if (paths.has(path)) urls.add(url);
+  return 7 + urls.size;
+}
+
 /** get, retried twice after a request that fails outright, such as a reset connection or a timeout, but not after a reply. */
 export function retrying(get: Get, sleep: (ms: number) => Promise<unknown>): Get {
   return async (url, via) => {
@@ -106,6 +131,17 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
   const { cloudfront, bucket, probe } = target;
   // Through the distribution, whatever DNS says the custom hostnames are.
   const viaCloudFront = (url: string) => get(url, cloudfront);
+  // Each URL at the apex is requested once a run, and a later check reuses the reply: it doesn't depend on the page
+  // that refers to the URL, and the web ACL's rate limit counts every request (SMOKE_REQUEST_BUDGET).
+  const replies = new Map<string, Promise<Reply>>();
+  const atApex = (url: string) => {
+    let reply = replies.get(url);
+    if (reply === undefined) {
+      reply = viaCloudFront(`https://${apex}${url}`);
+      replies.set(url, reply);
+    }
+    return reply;
+  };
   const isNotFoundPage = (reply: Reply) => sha256(reply.body) === notFound.sha256;
 
   const checks: [string, () => Promise<string[]>][] = [
@@ -113,7 +149,7 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
     [
       `https://${apex}/ serves the prerendered home page`,
       async () => {
-        const reply = await viaCloudFront(`https://${apex}/`);
+        const reply = await atApex('/');
         return [...served(reply, home, '/'), ...prerendered(reply.body)];
       },
     ],
@@ -121,7 +157,7 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
       `https://${apex} serves every file of the release, with its content type and caching`,
       async () => {
         const problems: string[] = [];
-        for (const file of files) problems.push(...served(await viaCloudFront(`https://${apex}/${file.path}`), file));
+        for (const file of files) problems.push(...served(await atApex(`/${file.path}`), file));
         return problems;
       },
     ],
@@ -129,11 +165,21 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
       "every page's scripts, styles, icons, and page links load",
       async () => {
         const problems: string[] = [];
-        for (const page of files.filter(({ path }) => path.endsWith('.html'))) {
+        // Each URL once, however many pages load it; a request that failed outright is reported, and the rest go on.
+        const judged = new Set<string>();
+        for (const page of pagesOf(files)) {
           for (const { url, path } of references(page)) {
             const file = byPath.get(path);
-            if (file === undefined) problems.push(`/${page.path} refers to ${url}, which the release does not have`);
-            else problems.push(...served(await viaCloudFront(`https://${apex}${url}`), file, url));
+            if (file === undefined) {
+              problems.push(`/${page.path} refers to ${url}, which the release does not have`);
+            } else if (!judged.has(url)) {
+              judged.add(url);
+              try {
+                problems.push(...served(await atApex(url), file, url));
+              } catch (error) {
+                problems.push(`${url}: ${messageOf(error)}`);
+              }
+            }
           }
         }
         return problems;
@@ -189,7 +235,7 @@ export async function smokeTest(dir: string, target: Target, get: Get): Promise<
     try {
       problems = await check();
     } catch (error) {
-      problems = [error instanceof Error ? error.message : String(error)];
+      problems = [messageOf(error)];
     }
     if (problems.length === 0) passed.push(name);
     else failures.push(...problems.map((problem) => `${name}: ${problem}`));

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render } from '../src/entry-server.tsx';
 import { prerenderPages, renderDocument } from './prerender-lib.ts';
 import { type SiteFile, siteFiles } from './release-lib.ts';
-import { type Get, prerendered, type Reply, retrying, smokeTest } from './smoke-lib.ts';
+import { distributionRequests, type Get, prerendered, type Reply, retrying, smokeTest } from './smoke-lib.ts';
 
 const CLOUDFRONT = 'd111111abcdef8.cloudfront.net';
 const BUCKET = 'site-bucket';
@@ -115,16 +115,15 @@ describe('smokeTest', () => {
       }),
     );
     expect(result.passed).toEqual(CHECKS.filter((_check, index) => index !== 2 && index !== 3));
-    // Every file in path order, then each page's references in page order; the 404 page and the home page both load
-    // the icon, and the home page links to /about, which gets about/index.html.
+    // Every file in path order, then each URL the pages load, once, in page order: the 404 page's icon, then the home
+    // page's stylesheet, its icon already judged. Their replies are the ones the earlier check got, not new requests;
+    // /about gets about/index.html, which serves.
     expect(result.failures).toEqual([
       `${CHECKS[2]}: /about/index.html: status 500, not 200`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: cache-control is "max-age=60", not "public, max-age=31536000, immutable"`,
       `${CHECKS[2]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
       `${CHECKS[2]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
-      `${CHECKS[3]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
-      `${CHECKS[3]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
       `${CHECKS[3]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
       `${CHECKS[3]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
       `${CHECKS[3]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
@@ -149,6 +148,38 @@ describe('smokeTest', () => {
         `${CHECKS[1]}: the home page has no the release it belongs to`,
       ]),
     );
+  });
+
+  it('requests each URL through the distribution once, however many pages refer to it, as distributionRequests counts', async () => {
+    const dir = site({
+      'about/index.html': '<!doctype html><title>About</title><a href="/">Home</a><a href="/about">About</a><link rel="icon" href="/favicon.svg" />',
+      'work/index.html': '<!doctype html><title>Work</title><a href="/about/">About</a><a href="/about">About</a>',
+    });
+    const healthy = cloudFront(dir);
+    const requests: string[] = [];
+    const counting: Get = async (url, via) => {
+      if (via !== undefined || new URL(url).host === CLOUDFRONT) requests.push(url);
+      return healthy(url, via);
+    };
+    expect((await smokeTest(dir, TARGET, counting)).failures).toEqual([]);
+    expect(requests.filter((url, i) => requests.indexOf(url) !== i)).toEqual([]);
+    // The fixed seven, the home page, the seven files, and the two page addresses the pages link to, /about and /about/.
+    expect(requests).toHaveLength(7 + 1 + 7 + 2);
+    expect(distributionRequests(siteFiles(dir))).toBe(requests.length);
+  });
+
+  it('reports a file whose request failed outright under both checks, and goes on with the other references', async () => {
+    const dir = site({ '404.html': '<!doctype html><title>x</title><link rel="icon" href="/favicon.svg" /><a href="/about">About</a>' });
+    const result = await smokeTest(
+      dir,
+      TARGET,
+      except(dir, (url) => {
+        if (url.pathname === '/favicon.svg') throw new Error('read ECONNRESET');
+        return undefined;
+      }),
+    );
+    // The file check stops at the icon; the references check reports it once and still checks /about.
+    expect(result.failures).toEqual([`${CHECKS[2]}: read ECONNRESET`, `${CHECKS[3]}: /favicon.svg: read ECONNRESET`]);
   });
 
   it('fails a page that refers to a file the release does not have', async () => {

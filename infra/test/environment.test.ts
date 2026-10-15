@@ -89,11 +89,12 @@ describe('logical ID stability', () => {
     expect(logicalIds(site!.json.Resources)).toEqual(SITE_RESOURCES);
   });
 
-  it('enabling the Free plan only adds the subscription; nothing is replaced', () => {
+  it('enabling the Free plan adds only the web ACL and the subscription; nothing is replaced', () => {
     const [identity, site] = synthesizeAll(PRICING_MODES['Free flat-rate plan']);
     expect(logicalIds(identity!.json.Resources)).toEqual(IDENTITY_RESOURCES);
     expect(logicalIds(site!.json.Resources)).toEqual({
       ...SITE_RESOURCES,
+      SiteWebAcl: 'AWS::WAFv2::WebACL',
       PricingPlanSubscription: 'AWS::PricingPlanManager::Subscription',
     });
   });
@@ -102,7 +103,10 @@ describe('logical ID stability', () => {
     const [identity, site] = synthesizeAll(config);
     const siteExpected: Record<string, Record<string, unknown>> = {
       ...SITE_CREATE_ONLY_PROPERTIES,
-      ...(config.pricingPlan && { PricingPlanSubscription: { PlanFamily: 'CloudFront' } }),
+      ...(config.pricingPlan && {
+        SiteWebAcl: { Name: 'zachverse-site', Scope: 'CLOUDFRONT' },
+        PricingPlanSubscription: { PlanFamily: 'CloudFront' },
+      }),
     };
     expect(propertiesNamed(identity!.json.Resources, IDENTITY_CREATE_ONLY_PROPERTIES)).toEqual(IDENTITY_CREATE_ONLY_PROPERTIES);
     expect(propertiesNamed(site!.json.Resources, siteExpected)).toEqual(siteExpected);

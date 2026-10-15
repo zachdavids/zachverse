@@ -22,6 +22,7 @@ export function request(url: string, via?: string, transport: Transport = { http
     const req = client.request(
       target,
       {
+        // Required: the web ACL's Common Rule Set blocks a request without a User-Agent (ADR 0007).
         headers: { 'user-agent': 'zachverse-smoke-test' },
         lookup: connectTo,
         family: 4,
