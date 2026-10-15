@@ -1,6 +1,6 @@
 # ADR 0007: Web ACL and the Free flat-rate plan
 
-- Status: Accepted (milestone 7). Not deployed yet: per the plan, it deploys after milestone 6's first release has passed its checks, with the runbook below.
+- Status: Accepted (milestone 7), and deployed on 2026-10-15 with the runbook below, after milestone 6's first release had passed its checks. Its steps 6 to 9 passed ("Deployed").
 - Date: 2026-10-15, revised the same day after review
 
 ## Context
@@ -122,6 +122,28 @@ Milestone 8's DNS cutover waits until steps 6 to 9 have all passed and `docs/pro
   - any other record, the email records above all: as a separate change the owner approves, kept outside `infra/dns/`, whose tests refuse such records, as the DMARC record was (Route 53 change `C02252852B8LKRZFNHRAO`). Record its change ID in `docs/progress.md`.
 - **The in-place update fails (step 9):** read the stack's events, and handle it like a failed deploy.
 - **Hold milestone 8's DNS cutover** until steps 6 to 9 all pass.
+
+## Deployed (2026-10-15)
+
+An administrator ran the runbook from #7's branch, with the owner's approval:
+- **Steps 1 to 4:** the preflight passed, and step 2's exports were saved outside the repository.
+  - **Step 3's checks:** no subscription and no Free plan in the account, no CLOUDFRONT web ACL, an empty `WebACLId`, no other distribution, Shield Advanced `INACTIVE`, 11 record sets, and about 540 requests and 5 MB since the distribution was created.
+  - **Step 4's diff:** exactly the web ACL, the subscription, the distribution's `WebACLId`, and the two outputs; `ZachverseIdentity` had no differences.
+- **Step 5:** deployed from `90d4b47` in 112 seconds; `UPDATE_COMPLETE` at 09:23:58 UTC.
+  - Web ACL: `arn:aws:wafv2:us-east-1:426499248998:global/webacl/zachverse-site/9d3295cb-f213-4a20-a607-d90ba73ab876`.
+  - Subscription: `arn:aws:pricingplanmanager::426499248998:subscription:sub_3Kj1lGHIAlYiKp1L1LRQCDf7DWN`.
+- **Step 6:**
+  - The subscription is `ACTIVE`, `FREE`, family `CloudFront`, with no scheduled change and exactly the three resource ARNs.
+  - The distribution's config differs from step 2's only in `WebACLId`.
+  - The web ACL has the four rules above, allows by default, uses 927 WCU, and isn't managed by Firewall Manager.
+  - The bucket policy and the deploy role's policies are byte for byte as in step 2.
+  - The deployed template equals the synthesized one.
+- **Step 7:** Deploy run 38712952516, started by hand on `main`, published release `5f333d8` again through the web ACL. Every smoke check and both browser checks passed, and the release was recorded as verified.
+- **Step 8:** the zone export equals step 2's.
+- **Step 9:** `47d8f90` set the distribution's comment to "zachdavids.com website, Zachverse" and gave the web ACL a description. It was deployed after fresh exports, in 86 seconds, with `UPDATE_COMPLETE` at 09:33:10 UTC.
+  - The diff and the result showed exactly those two changes.
+  - The subscription stayed `ACTIVE`, and the zone, bucket policy, and role were unchanged.
+  - Deploy run 38714014628 then passed every check through the web ACL again.
 
 ## Verification before the merge (2026-10-15)
 
