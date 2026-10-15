@@ -175,7 +175,9 @@ Each changes only its own layer: restoring a release changes no stack and no DNS
   - The second, of the pipeline, the scripts, and the design, after the browser check, page removal, and holds were added, raised 18 distinct findings, each checked by two skeptics. All but a few were confirmed, none of high severity, and all are addressed here.
   - A third, of the second's fixes, confirmed 14 low-severity findings (two rollbacks in one run blocking a retry, `npm ci` not retried, mixed colour syntaxes in the focus check, gaps in the policy tests, and overstated docs), all addressed here; mutations show the new tests catch each regression it described.
   - CodeQL flagged two patterns in the smoke test's own tests (a local server echoing the request path, and a host matched by substring), both fixed.
-- **Deployed before the merge:** the release-record deny, with ADR 0004's runbook on 2026-10-15 from `398c15b`. Through CloudFront, at both hostnames, an object written under `_releases/` as a probe got 403 `AccessDenied`, and a missing key there 404 `NoSuchKey` (ADR 0003, "Deployed state").
+- **Deployed before the merge,** both with ADR 0004's runbook on 2026-10-15 (ADR 0003, "Deployed state"):
+  - the release-record deny, from `398c15b`. Through CloudFront, at both hostnames, an object written under `_releases/` as a probe got 403 `AccessDenied`, and a missing key there 404 `NoSuchKey`;
+  - the deploy role's page deletion and its deny, from `a442c2f`. IAM's policy simulator, which applies the organization's SCPs, allows the role to delete a page and denies it deleting anything under `assets/` or `_releases/`, or any object version.
 
 ## Limits
 
