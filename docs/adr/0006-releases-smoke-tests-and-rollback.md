@@ -1,7 +1,7 @@
 # ADR 0006: Releases, smoke tests, and rollback
 
 - Status: Accepted (milestone 6), merged on 2026-10-15 as `d6503b1`, whose Deploy run published and verified the first release ("First release"). The restore rehearsal passed the same day ("Restore rehearsal").
-- Date: 2026-10-15
+- Date: 2026-10-15, revised the same day after the Phase 1 review
 
 ## Decision
 
@@ -129,6 +129,10 @@ A history entry belongs to the workflow run, in any attempt: the run ID decides,
   - If a Restore was tried in the meantime, its entry holds deploys. Run the Deploy workflow by hand with "Publish over a restore" checked.
 - **A check got 403s from the web ACL** (since milestone 7). Re-run all jobs, which gets a runner with another address. If the block persists, see ADR 0007, "If a step fails": a fix pushed to `main` is blocked the same way.
 - **The history is refused as newer than the code.** Run release code that knows its format. Do not put back an older version of the history: that would drop its newest entries.
+- **The deploy role may have been misused,** for example by a malicious change that reached `main`. Code that runs with the role sets every object's bytes and headers, the release records included, and a restore checks a copy only against its own manifest.
+  - First an administrator cuts the role off: deleting its inline policy, `SiteDeployPolicy` (ADR 0004), stops live sessions at once. Then disable the Deploy and Restore workflows. Don't run Restore: it and the verify job's rollback trust the records.
+  - The administrator then puts back the history, the pending record, the manifests, the copies, and `assets/` as their S3 versions stood before the first misused run, found by matching version times against the role's `AssumeRoleWithWebIdentity` events in CloudTrail's event history. This is the one exception to the rule above against putting back an older history. Noncurrent versions expire after 90 days, so this works only within that time.
+  - Publish next a build whose asset names change: a replaced asset stays in visitors' caches for a year under its name.
 
 ## Three kinds of rollback
 
@@ -202,7 +206,7 @@ The merge's Deploy run, 38708854432, published `d6503b1` and recorded it as veri
 | A Deploy run started by hand without "Publish over a restore" | Deploy 38710602886 | Failed as intended. The publish step refused: "deploys are held, since run 38710362375-1 restored d6503b1… Nothing was changed". The browser job was skipped, and the verify job found nothing to roll back |
 | A Deploy run with "Publish over a restore" checked | Deploy 38710866434 | Published B again over the restore, passed the smoke test and the browser check, recorded B as verified at 09:12 UTC, and so ended the hold |
 
-Read live after each step: CloudFront served A after the restore, still A after the refused run, and B at the end, at its own hostname and at the apex through the distribution, over IPv4 and IPv6. The history ends publish A, publish B, restore A, publish B, each verified. The automatic rollback hasn't run live, since no release has failed its checks; its unit tests cover it.
+Read live after each step: CloudFront served A after the restore, still A after the refused run, and B at the end, at its own hostname and at the apex through the distribution, over IPv4 and IPv6. The history ends publish A, publish B, restore A, publish B, each verified. No release has failed its checks, so the automatic rollback has never republished anything live; its unit tests cover that path, and `tests/repo-policy.test.ts` pins its conditions. Its parts have run live, though: Deploy 38710602886's verify job took the rollback step's "nothing to roll back" branch, and Restore 38710362375 ran the same republish, smoke test, and record that a rollback runs.
 
 ## Limits
 
@@ -222,5 +226,7 @@ Read live after each step: CloudFront served A after the restore, still A after 
 - **The AWS CLI:** the release scripts ask it for JSON errors (`--cli-error-format json`), which needs AWS CLI 2.34 or later. GitHub's Ubuntu runners have 2.37, and each release's summary records the CLI's and Node's versions.
 - **One edge location:** the smoke test and the live browser check each run from one GitHub runner over IPv4. A completed invalidation applies to every edge, but the checks do not show it.
 - **Deployment records:** a restore job, like a deploy or verify job, makes GitHub record a deployment to `production` of the workflow's own commit. The release it restored is in the run's summary and the history, not in that record.
-- **The role's scripts:** the release scripts run with the deploy role's credentials, from the job's own checkout of the commit, like every other step of those jobs (ADR 0005, "Limits"). The deploy workflow's build job and the Restore workflow's test job test them at that commit first.
+- **The role's scripts:** the release scripts run with the deploy role's credentials, from the job's own checkout of the commit, like every other step of those jobs (ADR 0005, "Limits"). The deploy workflow's build job and the Restore workflow's test job test them at that commit first. They load nothing under `src/`: the smoke test takes the site's address from `scripts/site-origin.ts`, which `tests/repo-policy.test.ts` keeps equal to `src/content.ts`'s, so the site's content never runs beside the role.
 - **Invalidation volume:** each release of the placeholder invalidates six paths, plus any it removes or any pending asset, and a restore or rollback the same. CloudFront's first 1,000 invalidation paths each month are free.
+- **Release time:** the release scripts make one AWS CLI call per object, one after another, at about a second each on GitHub's runners: a publish about two per file plus one per new asset, and a rollback or restore about two per file. With an invalidation that takes the CLI waiter's full 10 minutes, the deploy, verify, and restore jobs' 20-minute limits bind at about 200 files, below `check:dist`'s ceiling of about 490, which comes from the smoke test's request budget. A verify job that times out partway through a rollback leaves the site partly rolled back, and a re-run costs as long again. Phase 2 adds concurrency or a file ceiling before the site grows that far (`docs/phase-2-inputs.md`).
+- **Storage:** each new release stores a full copy of the site under `_releases/<commit>/site/`, unchanged assets included, about 225 KB for the placeholder. Nothing removes copies or assets: the role may not, and the bucket's lifecycle rule expires only noncurrent versions. S3 Standard storage beyond the Free flat-rate plan's 5 GB credit, which covers the whole account, is billed. Each publish, restore, and rollback also lists the whole bucket into a 16 MiB buffer, room for tens of thousands of releases at today's size. Pruning is an administrator's step that no runbook describes yet (`docs/phase-2-inputs.md`).

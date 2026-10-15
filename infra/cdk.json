@@ -1,6 +1,5 @@
 {
   "app": "node --import tsx bin/zachverse.ts",
-  "build": "npm run typecheck 1>&2 && npm test 1>&2",
   "versionReporting": true,
   "plugin": [],
   "context": {
