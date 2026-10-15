@@ -15,6 +15,7 @@ import {
   recordVerified,
   type Repository,
   restore,
+  rollBack,
   REVALIDATE,
   sha256,
   siteFiles,
@@ -505,6 +506,110 @@ describe('restore', () => {
       await expect(restore(B, tempDir(), context)).rejects.toThrow(message);
       expect(log).toEqual([]);
     }
+  });
+});
+
+describe('rollBack', () => {
+  // A bucket where A was published and verified, and run 100-1 then published B, which is not verified.
+  async function failedB() {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    await publish(site({ 'robots.txt': 'B' }), B, second.repository, second.context);
+    return second.objects;
+  }
+
+  it("rolls back to the last verified release after this run's release failed its smoke test", async () => {
+    const { objects, log, context } = fakes(await failedB());
+    const out = tempDir();
+    const outcome = await rollBack(out, context);
+
+    expect(outcome).toEqual({
+      release: A,
+      uploaded: [],
+      replaced: [],
+      kept: ['assets/index-AbCd1234.js', 'assets/index-EfGh5678.css'],
+      invalidated: ['/', '/404.html', '/favicon.svg', '/index.html', '/robots.txt'],
+    });
+    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+    expect(readFileSync(join(out, 'robots.txt'), 'utf8')).toBe('A');
+    expect(log).toEqual([
+      'write _releases/history.json',
+      'write favicon.svg',
+      'write robots.txt',
+      'write 404.html',
+      'write index.html',
+      `invalidate / /404.html /favicon.svg /index.html /robots.txt (100-1-rollback-${A})`,
+      'write _releases/history.json',
+    ]);
+    expect(historyOf(objects).entries.map(({ action, release, run }) => `${action} ${release[0]} ${run}`)).toEqual([
+      'publish a 100-1',
+      'publish b 100-1',
+      'rollback a 100-1',
+    ]);
+    // The rolled-back release passes its own smoke test before the workflow records it as verified.
+    expect((await recordVerified(context)).action).toBe('rollback');
+  });
+
+  it('rolls back after a publish that stopped partway, before its invalidation finished', async () => {
+    const first = fakes();
+    await publish(site({ 'robots.txt': 'A' }), A, first.repository, first.context);
+    await recordVerified(first.context);
+    const second = fakes(first.objects);
+    const failing = { ...second.context, cdn: { invalidate: async () => Promise.reject(new Error('waiter timed out')) } };
+    await expect(publish(site({ 'robots.txt': 'B' }), B, second.repository, failing)).rejects.toThrow('waiter timed out');
+    expect(second.objects.get('robots.txt')?.body.toString()).toBe('B');
+
+    const { objects, context } = fakes(second.objects);
+    expect((await rollBack(tempDir(), context))?.release).toBe(A);
+    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+  });
+
+  it("changes nothing when this run left no unverified release in place", async () => {
+    const verified = fakes();
+    await publish(site(), A, verified.repository, verified.context);
+    await recordVerified(verified.context);
+    for (const [objects, run] of [
+      [new Map<string, StoredObject>(), '100-1'], // nothing published
+      [await failedB(), '101-1'], // another run's release, as when this run's publish was refused
+      [verified.objects, '100-1'], // this run's release, verified
+    ] as const) {
+      const { log, messages, context } = fakes(objects);
+      expect(await rollBack(tempDir(), { ...context, run })).toBeUndefined();
+      expect(log).toEqual([]);
+      expect(messages).toEqual(['This run left no unverified release in place, so there is nothing to roll back.']);
+    }
+  });
+
+  it('changes nothing when no earlier release passed its smoke test', async () => {
+    const first = fakes();
+    await publish(site(), A, first.repository, first.context);
+    const { log, messages, context } = fakes(first.objects);
+    expect(await rollBack(tempDir(), context)).toBeUndefined();
+    expect(log).toEqual([]);
+    expect(messages).toEqual([`No release before ${A} passed its smoke test, so there is none to roll back to.`]);
+  });
+
+  it('rolls back past an earlier failed release to the last verified one', async () => {
+    const afterB = fakes(await failedB());
+    await rollBack(tempDir(), afterB.context);
+    await recordVerified(afterB.context);
+    const third = fakes(afterB.objects);
+    await publish(site({ 'robots.txt': 'C' }), C, third.repository, { ...third.context, run: '102-1' });
+    const { objects, context } = fakes(third.objects);
+    expect((await rollBack(tempDir(), { ...context, run: '102-1' }))?.release).toBe(A);
+    expect(objects.get('robots.txt')?.body.toString()).toBe('A');
+  });
+
+  it('lets the release it rolled back from be published again, as a retry, unless someone has restored since', async () => {
+    const afterB = fakes(await failedB(), 'identical');
+    await rollBack(tempDir(), afterB.context);
+    await recordVerified(afterB.context);
+    const entries = historyOf(afterB.objects).entries;
+    await checkOrder(entries, B, afterB.repository);
+    const restored = [...entries, entry(A, { action: 'restore', run: '103-1', verified: 'then' })];
+    await expect(checkOrder(restored, B, afterB.repository)).rejects.toThrow(`Not publishing ${B}`);
   });
 });
 

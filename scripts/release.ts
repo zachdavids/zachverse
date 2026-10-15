@@ -3,11 +3,14 @@
 //   node scripts/release.ts restore <release> <dir>  restores the verified release with that commit SHA, and
 //                                                    writes its files to <dir> for the smoke test
 //   node scripts/release.ts verified                 records this run's release as verified, after its smoke test
+//   node scripts/release.ts rollback <dir>           after this run's release failed, restores the last verified one
+//                                                    before it, writes its files to <dir>, and sets the step's
+//                                                    output release to its commit (empty if nothing was rolled back)
 // $BUCKET and $DISTRIBUTION_ID name the site; GitHub sets the run's variables.
 import { appendFileSync } from 'node:fs';
 import { cloudfrontCdn, s3Store } from './release-aws.ts';
 import { githubRepository } from './release-github.ts';
-import { type Outcome, publish, recordVerified, restore } from './release-lib.ts';
+import { type Outcome, publish, recordVerified, restore, rollBack } from './release-lib.ts';
 
 function required(name: string): string {
   const value = process.env[name];
@@ -34,11 +37,12 @@ function outcomeLines(title: string, { release, uploaded, replaced, kept, invali
 }
 
 async function main(command: string | undefined, args: string[]): Promise<void> {
-  const usage = 'Usage: node scripts/release.ts publish <dir> | restore <release> <dir> | verified';
+  const usage = 'Usage: node scripts/release.ts publish <dir> | restore <release> <dir> | verified | rollback <dir>';
   const arity = new Map([
     ['publish', 1],
     ['restore', 2],
     ['verified', 0],
+    ['rollback', 1],
   ]);
   if (arity.get(command ?? '') !== args.length) throw new Error(usage);
   const context = {
@@ -53,6 +57,13 @@ async function main(command: string | undefined, args: string[]): Promise<void> 
     report(outcomeLines('Published', await publish(args[0]!, required('GITHUB_SHA'), repository, context)));
   } else if (command === 'restore') {
     report(outcomeLines('Restored', await restore(args[0]!, args[1]!, context)));
+  } else if (command === 'rollback') {
+    const outcome = await rollBack(args[0]!, context);
+    // The workflow smoke-tests and records the rolled-back release only when this names one.
+    const output = process.env.GITHUB_OUTPUT;
+    if (output) appendFileSync(output, `release=${outcome?.release ?? ''}\n`);
+    if (outcome === undefined) console.log('::warning::Nothing was rolled back; the log above says why.');
+    else report(outcomeLines('Rolled back to', outcome));
   } else {
     const { release, run } = await recordVerified(context);
     report([`### Verified ${release}`, '', `The smoke test passed, and run ${run} recorded the release as verified.`]);

@@ -65,7 +65,8 @@ interface Manifest {
 }
 
 export interface Entry {
-  action: 'publish' | 'restore';
+  /** A rollback is a restore the deploy job made itself, after the release it published failed its smoke test. */
+  action: 'publish' | 'restore' | 'rollback';
   /** The commit whose build is the release. */
   release: string;
   /** The workflow run, as "<run ID>-<attempt>". */
@@ -205,7 +206,7 @@ const isOptionalText = (value: unknown) => value === undefined || isText(value);
 function isEntry(value: unknown): value is Entry {
   return (
     isRecord(value) &&
-    (value.action === 'publish' || value.action === 'restore') &&
+    (value.action === 'publish' || value.action === 'restore' || value.action === 'rollback') &&
     typeof value.release === 'string' &&
     COMMIT.test(value.release) &&
     isText(value.run) &&
@@ -247,9 +248,10 @@ async function readManifest(store: Store, release: string): Promise<Manifest | u
 
 /**
  * Refuses a release older than the newest one published, which is how GitHub can run deploys out of order or re-run an
- * old one (ADR 0005). Publishing the same commit again is a retry, allowed only while it is the current release, so
- * re-running the deploy of a release that a restore replaced does not put it back. A newer commit still publishes over
- * a restore, whether pushed or re-run; going back is the Restore workflow's job.
+ * old one (ADR 0005). Publishing the same commit again is a retry, allowed while it is the current release, or when the
+ * current release is an automatic rollback from it, after its smoke test failed. Re-running the deploy of a release
+ * that someone restored over does not put it back. A newer commit still publishes over a restore, whether pushed or
+ * re-run; going back is the Restore workflow's job.
  */
 export async function checkOrder(entries: Entry[], release: string, repository: Repository): Promise<void> {
   const current = entries.at(-1);
@@ -257,7 +259,8 @@ export async function checkOrder(entries: Entry[], release: string, repository: 
   if (current === undefined || newest === undefined) return;
   const relation = await repository.compare(newest.release, release);
   if (relation === 'ahead') return;
-  if (relation === 'identical' && current.release === release) return;
+  const rolledBackFrom = current.action === 'rollback' ? entries.at(-2) : undefined;
+  if (relation === 'identical' && (current.release === release || rolledBackFrom?.release === release)) return;
   const reason =
     relation === 'identical'
       ? `run ${newest.run} published it, and run ${current.run} has since restored ${current.release}`
@@ -378,9 +381,39 @@ function chooseRelease(entries: Entry[], requested: string): string {
  * files to outDir for the smoke test.
  */
 export async function restore(requested: string, outDir: string, context: Context): Promise<Outcome> {
+  const entries = await readHistory(context.store);
+  return republish(chooseRelease(entries, requested), 'restore', entries, outDir, context);
+}
+
+/**
+ * After the release this run started fails to publish or fails its smoke test, publishes the last release before it
+ * that passed its smoke test again, as restore does, and writes its files to outDir for the smoke test. Returns
+ * undefined, changing nothing, when this run started no release that is still current and unverified (it was refused,
+ * or failed before writing a page), or when no earlier release passed its smoke test.
+ */
+export async function rollBack(outDir: string, context: Context): Promise<Outcome | undefined> {
+  const entries = await readHistory(context.store);
+  const current = entries.at(-1);
+  if (current?.run !== context.run || current.verified !== undefined) {
+    context.log('This run left no unverified release in place, so there is nothing to roll back.');
+    return undefined;
+  }
+  const target = entries.slice(0, -1).findLast((entry) => entry.verified !== undefined);
+  if (target === undefined) {
+    context.log(`No release before ${current.release} passed its smoke test, so there is none to roll back to.`);
+    return undefined;
+  }
+  return republish(target.release, 'rollback', entries, outDir, context);
+}
+
+async function republish(
+  release: string,
+  action: 'restore' | 'rollback',
+  entries: Entry[],
+  outDir: string,
+  context: Context,
+): Promise<Outcome> {
   const { store } = context;
-  const entries = await readHistory(store);
-  const release = chooseRelease(entries, requested);
   const manifest = await readManifest(store, release);
   if (manifest === undefined) throw new Error(`${release} has no saved copy under ${RECORDS}${release}/.`);
   const files: SiteFile[] = [];
@@ -399,7 +432,7 @@ export async function restore(requested: string, outDir: string, context: Contex
     writeFileSync(target, file.body);
   }
   const assets = await uploadAssets(files, context);
-  const invalidated = await publishPages(files, assets.replaced, entries, { action: 'restore', release }, context);
+  const invalidated = await publishPages(files, assets.replaced, entries, { action, release }, context);
   return { release, ...assets, invalidated };
 }
 

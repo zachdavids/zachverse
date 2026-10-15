@@ -795,12 +795,14 @@ function expectSmokeTestThroughDistribution(job: Job | undefined) {
   const access = list.find((step) => step.name === "Check the deploy role's access (read-only)");
   expect(access?.id).toBe('access');
   expect(access?.run).toContain('echo "domain=$domain" >> "$GITHUB_OUTPUT"');
-  const smoke = list.find((step) => step.run?.trim().startsWith('node scripts/smoke.ts '));
-  expect(smoke?.env).toEqual({ CLOUDFRONT_DOMAIN: '${{ steps.access.outputs.domain }}' });
+  const smokes = list.filter((step) => step.run?.trim().startsWith('node scripts/smoke.ts '));
+  expect(smokes).not.toHaveLength(0);
+  for (const smoke of smokes) expect(smoke.env).toEqual({ CLOUDFRONT_DOMAIN: '${{ steps.access.outputs.domain }}' });
 }
 
-// A job in the production environment that assumes the deploy role through OIDC, and nothing else.
-function expectDeployRole(job: Job | undefined, session: string) {
+// A job in the production environment that assumes the deploy role through OIDC, and nothing else, for a session long
+// enough for the job's steps.
+function expectDeployRole(job: Job | undefined, session: string, seconds: number) {
   expect(job?.environment).toBe('production');
   // contents: read for the checkout and the deploy job's comparison of commits; no other scope.
   expect(job?.permissions).toEqual({ contents: 'read', 'id-token': 'write' });
@@ -818,7 +820,7 @@ function expectDeployRole(job: Job | undefined, session: string) {
       'aws-region': 'us-east-1',
       'allowed-account-ids': '${{ vars.AWS_ACCOUNT_ID }}',
       'role-session-name': `${session}\${{ github.run_id }}-\${{ github.run_attempt }}`,
-      'role-duration-seconds': 1800,
+      'role-duration-seconds': seconds,
       'translate-env-variables': false,
     },
   ]);
@@ -941,6 +943,9 @@ describe('Deploy workflow', () => {
       'node scripts/release.ts publish site',
       'node scripts/smoke.ts site',
       'node scripts/release.ts verified',
+      'node scripts/release.ts rollback rolled-back',
+      'node scripts/smoke.ts rolled-back',
+      'node scripts/release.ts verified',
     ]);
     const [download] = positions(list, 'actions/download-artifact');
     const [configure] = positions(list, 'aws-actions/configure-aws-credentials');
@@ -954,7 +959,16 @@ describe('Deploy workflow', () => {
     expect(command(list[check])).toMatch(/^digest=\$\(find \. -type f /);
     expect(list[check]?.run).toMatch(/\nif \[ "\$digest" != "\$DIGEST" \]; then\n {2}echo "::error::.*"\n {2}exit 1\nfi\n$/);
     expect(envOf(job).DIGEST).toBe('${{ needs.build.outputs.digest }}');
-    expect(plan(deploy, 'deploy').filter((step) => step.endsWith(' (optional)'))).toEqual([]);
+    // Every step runs unconditionally except the automatic rollback (ADR 0006): it runs only when publishing or the
+    // smoke test failed, and records the rolled-back release as verified only when that release's own smoke test passed.
+    expect(list.filter((step) => step.if !== undefined || step['continue-on-error'] !== undefined).map((step) => [step.id, step.if])).toEqual([
+      ['rollback', "failure() && (steps.publish.outcome == 'failure' || steps.smoke.outcome == 'failure')"],
+      ['rollback_smoke', "failure() && steps.rollback.outputs.release != ''"],
+      [undefined, "failure() && steps.rollback_smoke.outcome == 'success'"],
+    ]);
+    expect(list.slice(-6).map((step) => step.id)).toEqual(['publish', 'smoke', undefined, 'rollback', 'rollback_smoke', undefined]);
+    expect(job?.['continue-on-error']).toBeUndefined();
+    expect(job?.if).toBeUndefined();
     expectReleaseTools(job, 'deploy.yml deploy');
     // The order check compares commits through GitHub's API with the job's read-only token; the smoke test connects
     // through the distribution whose hostname the access check read.
@@ -964,7 +978,8 @@ describe('Deploy workflow', () => {
   });
 
   it('assumes only the deploy role, through OIDC, in the production environment', () => {
-    expectDeployRole(job, 'zachverse-deploy-');
+    // An hour, the role's maximum: publishing and a rollback can each wait 10 minutes for an invalidation.
+    expectDeployRole(job, 'zachverse-deploy-', 3600);
   });
 
   it('reads only the four production variables, and lets no step set a variable the AWS tools read', () => {
@@ -1058,7 +1073,7 @@ describe('Restore workflow', () => {
   });
 
   it('assumes only the deploy role, through OIDC, in the production environment', () => {
-    expectDeployRole(job, 'zachverse-restore-');
+    expectDeployRole(job, 'zachverse-restore-', 1800);
   });
 });
 

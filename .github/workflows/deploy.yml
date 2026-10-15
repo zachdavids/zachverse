@@ -78,8 +78,8 @@ jobs:
     name: Deploy (publish, smoke-test, and record the release)
     needs: build
     runs-on: ubuntu-24.04
-    # Publishing waits up to 10 minutes for CloudFront's invalidation.
-    timeout-minutes: 20
+    # Publishing waits up to 10 minutes for CloudFront's invalidation, and a rollback as long again.
+    timeout-minutes: 30
     environment: production
     permissions:
       contents: read # the checkout, and the order check's comparison of commits through GitHub's API
@@ -131,8 +131,8 @@ jobs:
           aws-region: us-east-1
           allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
           role-session-name: zachverse-deploy-${{ github.run_id }}-${{ github.run_attempt }}
-          # Long enough for the invalidation, the smoke test, and the record after it.
-          role-duration-seconds: 1800
+          # Long enough to publish, smoke-test, and roll back, each with its invalidation: the role's 1-hour maximum.
+          role-duration-seconds: 3600
           # Keeps variables such as USE_EXISTING_CREDENTIALS or ROLE_CHAINING from filling inputs left out here. The
           # action still reads HTTP_PROXY, and its AWS SDK reads AWS_ENDPOINT_URL_STS and ~/.aws/config, as the AWS
           # CLI does in later steps, so no step in this job may set them (ADR 0005, "Limits").
@@ -163,12 +163,30 @@ jobs:
       # Refuses a release older than the newest one published; then uploads the assets, a copy of the release, and the
       # pages, and waits for the invalidation (ADR 0006).
       - name: Publish the release
+        id: publish
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/release.ts publish site
       - name: Smoke-test the release through CloudFront
+        id: smoke
         env:
           CLOUDFRONT_DOMAIN: ${{ steps.access.outputs.domain }}
         run: node scripts/smoke.ts site
       - name: Record the release as verified
+        run: node scripts/release.ts verified
+      # Automatic rollback (ADR 0006): if publishing failed partway or the smoke test failed, the last verified release
+      # goes back out, is smoke-tested, and is recorded as verified again. The run still fails. Nothing is rolled back
+      # when this run changed nothing, and the rolled-back release is recorded only if its own smoke test passes.
+      - name: Roll back to the last verified release
+        id: rollback
+        if: failure() && (steps.publish.outcome == 'failure' || steps.smoke.outcome == 'failure')
+        run: node scripts/release.ts rollback rolled-back
+      - name: Smoke-test the rolled-back release through CloudFront
+        id: rollback_smoke
+        if: failure() && steps.rollback.outputs.release != ''
+        env:
+          CLOUDFRONT_DOMAIN: ${{ steps.access.outputs.domain }}
+        run: node scripts/smoke.ts rolled-back
+      - name: Record the rolled-back release as verified
+        if: failure() && steps.rollback_smoke.outcome == 'success'
         run: node scripts/release.ts verified

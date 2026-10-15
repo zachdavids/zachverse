@@ -8,6 +8,7 @@ const lib = vi.hoisted(() => ({
   publish: vi.fn<(dir: string, release: string, repository: unknown, context: Context) => Promise<Outcome>>(),
   restore: vi.fn<(requested: string, outDir: string, context: Context) => Promise<Outcome>>(),
   recordVerified: vi.fn<(context: Context) => Promise<{ release: string; run: string }>>(),
+  rollBack: vi.fn<(outDir: string, context: Context) => Promise<Outcome | undefined>>(),
 }));
 const aws = vi.hoisted(() => ({ s3Store: vi.fn(), cloudfrontCdn: vi.fn() }));
 const github = vi.hoisted(() => ({ githubRepository: vi.fn() }));
@@ -125,6 +126,33 @@ describe('release script', () => {
     expect(exit).not.toHaveBeenCalled();
   });
 
+  it("rolls back, names the release it rolled back to in the step's output, and reports it", async () => {
+    vi.stubEnv('GITHUB_OUTPUT', join(summaryDir, 'output'));
+    lib.rollBack.mockResolvedValue(OUTCOME);
+    const { exit, log } = await run('rollback', 'rolled-back');
+
+    expect(lib.rollBack).toHaveBeenCalledExactlyOnceWith('rolled-back', expect.objectContaining({ run: '7-2' }));
+    expect(readFileSync(join(summaryDir, 'output'), 'utf8')).toBe(`release=${SHA}\n`);
+    expect(String(log.mock.calls[0]?.[0])).toMatch(new RegExp(`^### Rolled back to ${SHA}\n`));
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it('leaves the output empty, and warns, when there was nothing to roll back', async () => {
+    vi.stubEnv('GITHUB_OUTPUT', join(summaryDir, 'output'));
+    lib.rollBack.mockResolvedValue(undefined);
+    const { exit, log } = await run('rollback', 'rolled-back');
+
+    expect(readFileSync(join(summaryDir, 'output'), 'utf8')).toBe('release=\n');
+    expect(log).toHaveBeenCalledExactlyOnceWith('::warning::Nothing was rolled back; the log above says why.');
+    expect(exit).not.toHaveBeenCalled();
+
+    // Outside GitHub there is no output file to write.
+    vi.stubEnv('GITHUB_OUTPUT', '');
+    vi.resetModules();
+    vi.restoreAllMocks();
+    expect((await run('rollback', 'rolled-back')).exit).not.toHaveBeenCalled();
+  });
+
   it('records the release as verified', async () => {
     lib.recordVerified.mockResolvedValue({ release: SHA, run: '7-2' });
     const { exit } = await run('verified');
@@ -134,10 +162,10 @@ describe('release script', () => {
   });
 
   it('fails with the usage for another command or the wrong number of arguments, before reading anything', async () => {
-    for (const args of [[], ['deploy', 'site'], ['publish'], ['restore', SHA], ['verified', 'now'], ['constructor']]) {
+    for (const args of [[], ['deploy', 'site'], ['publish'], ['restore', SHA], ['verified', 'now'], ['rollback'], ['constructor']]) {
       const { exit, error } = await run(...args);
       expect(error, args.join(' ')).toHaveBeenCalledExactlyOnceWith(
-        '::error::Usage: node scripts/release.ts publish <dir> | restore <release> <dir> | verified',
+        '::error::Usage: node scripts/release.ts publish <dir> | restore <release> <dir> | verified | rollback <dir>',
       );
       expect(exit).toHaveBeenCalledExactlyOnceWith(1);
       vi.restoreAllMocks();
