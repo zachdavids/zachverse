@@ -16,6 +16,15 @@ const WEBSITE_RECORDS = new Map([
   ['zachdavids.com', ['A', 'AAAA']],
   ['www.zachdavids.com', ['A', 'AAAA', 'CNAME']],
 ]);
+/**
+ * The fields of a simple record set, the only kind these batches may write: anything else, such as a routing policy's
+ * SetIdentifier or Weight, or a HealthCheckId, would make a record set this model can't compare or key, and a reverse
+ * batch that looked exact would not be.
+ */
+const SIMPLE_FIELDS = new Set(['Name', 'Type', 'TTL', 'ResourceRecords', 'AliasTarget']);
+const ALIAS_FIELDS = new Set(['HostedZoneId', 'DNSName', 'EvaluateTargetHealth']);
+const NOT_SIMPLE = 'is not a field of a simple record, the only kind these batches write';
+
 /** Alias hosted zone ID that CloudFront distributions always use. */
 const CLOUDFRONT_ALIAS_ZONE = 'Z2FDTNDATAQYW2';
 
@@ -55,6 +64,8 @@ export function dnsBatchViolations(batch: Json): string[] {
     const where = `change ${i} (${change?.Action} ${rrs.Type} ${name})`;
     if (!['CREATE', 'UPSERT', 'DELETE'].includes(change?.Action)) out.push(`${where}: unknown action`);
 
+    for (const field of Object.keys(rrs)) if (!SIMPLE_FIELDS.has(field)) out.push(`${where}: ${field} ${NOT_SIMPLE}`);
+
     if (ACM_VALIDATION_NAME.test(name)) {
       if (change?.Action === 'DELETE') out.push(`${where}: ${KEEP_VALIDATION}`);
       if (rrs.Type !== 'CNAME') out.push(`${where}: ACM validation records must be CNAME`);
@@ -86,6 +97,17 @@ export function dnsBatchViolations(batch: Json): string[] {
     if (alias && (alias.HostedZoneId !== CLOUDFRONT_ALIAS_ZONE || !/\.cloudfront\.net\.?$/.test(alias.DNSName ?? ''))) {
       out.push(`${where}: aliases must target a CloudFront distribution`);
     }
+    if (alias) {
+      for (const field of Object.keys(alias)) if (!ALIAS_FIELDS.has(field)) out.push(`${where}: AliasTarget.${field} ${NOT_SIMPLE}`);
+    }
+    const records = rrs.ResourceRecords;
+    const valued =
+      Array.isArray(records) &&
+      records.length > 0 &&
+      records.every((record) => typeof record?.Value === 'string' && Object.keys(record).length === 1);
+    if (alias ? rrs.TTL !== undefined || records !== undefined : typeof rrs.TTL !== 'number' || !valued) {
+      out.push(`${where}: a website record is either an alias, with no TTL or values, or a TTL with a list of string values`);
+    }
   });
   return out;
 }
@@ -95,21 +117,28 @@ export type Zone = ReadonlyMap<string, Json>;
 
 const recordKey = (rrs: Json) => `${normalize(String(rrs.Name))} ${rrs.Type}`;
 
-/** A record set as Route 53 compares one a DELETE names: values in any order, names and targets in any case. */
+/**
+ * A simple record set as Route 53 compares one a DELETE names: values in any order, names and targets in any case. A
+ * malformed value, which dnsBatchViolations reports, compares as written, so it never equals a well-formed one.
+ */
 function comparable(rrs: Json): string {
-  const values = (rrs.ResourceRecords ?? []).map((record: Json) => String(record.Value).toLowerCase().replace(/\.$/, ''));
+  const value = (record: Json) =>
+    typeof record?.Value === 'string' ? record.Value.toLowerCase().replace(/\.$/, '') : JSON.stringify(record);
+  const records = rrs.ResourceRecords;
+  const values = records === undefined ? [] : Array.isArray(records) ? records.map(value).sort() : [JSON.stringify(records)];
   const alias = rrs.AliasTarget && {
     zone: rrs.AliasTarget.HostedZoneId,
     name: normalize(String(rrs.AliasTarget.DNSName)),
     health: rrs.AliasTarget.EvaluateTargetHealth,
   };
-  return JSON.stringify({ key: recordKey(rrs), ttl: rrs.TTL, values: values.sort(), alias });
+  return JSON.stringify({ key: recordKey(rrs), ttl: rrs.TTL, values, alias });
 }
 
 /**
- * The zone after Route 53 applies `batch` to it, which it does all or nothing: a CREATE of a record set that exists
- * fails, a DELETE must name a record set exactly (its TTL and values, or its alias target), an UPSERT replaces one, and a
- * name with a CNAME may hold nothing else. Throws, naming the change, where Route 53 would refuse the batch.
+ * The zone after Route 53 applies `batch` to it, which it does all or nothing, change by change in the batch's order: a
+ * CREATE of a record set that exists fails, a DELETE must name a record set exactly (its TTL and values, or its alias
+ * target), an UPSERT replaces one, and after each change a name with a CNAME may hold nothing else. Simple records only,
+ * as dnsBatchViolations requires. Throws, naming the change, where Route 53 would refuse the batch.
  */
 export function applyBatch(zone: Zone, batch: Json): Zone {
   const next = new Map(zone);
@@ -127,13 +156,10 @@ export function applyBatch(zone: Zone, batch: Json): Zone {
     } else {
       next.set(key, rrs);
     }
+    const name = key.slice(0, key.lastIndexOf(' '));
+    const atName = [...next.keys()].filter((other) => other.startsWith(`${name} `));
+    if (atName.length > 1 && atName.includes(`${name} CNAME`)) throw new Error(`${where}: ${name} would hold a CNAME beside other records`);
   });
-  for (const key of next.keys()) {
-    const [name, type] = key.split(' ');
-    if (type === 'CNAME' && [...next.keys()].some((other) => other !== key && other.startsWith(`${name} `))) {
-      throw new Error(`${name} would hold a CNAME beside other records`);
-    }
-  }
   return next;
 }
 
@@ -165,6 +191,8 @@ export function batchDirectoryViolations(dir: string): string[] {
   });
 }
 
+const BATCH_NAME =
+  "a batch must be a top-level file named with lower-case letters, digits, '.', and '-' only, starting with a letter or digit and ending in .json, to pair with its reverse by name";
 const isWebsiteChange = (change: Json) => WEBSITE_RECORDS.has(normalize(String(change?.ResourceRecordSet?.Name ?? '')));
 // A change, and the change that undoes it, as Route 53 compares record sets.
 const asNamed = (change: Json) => `${change?.Action} ${comparable(change?.ResourceRecordSet ?? {})}`;
@@ -172,7 +200,7 @@ const asUndone = (change: Json) => `${change.Action === 'CREATE' ? 'DELETE' : 'C
 
 /**
  * Pairs every batch under `dir` that changes a website routing record with its reverse batch, by name: X.json with
- * X.reverse.json, so every batch is a top-level .json file named in lower case. A reverse batch must undo exactly its
+ * X.reverse.json, so every batch is a top-level file named with lower-case letters, digits, '.', and '-' only. A reverse batch must undo exactly its
  * forward batch's website changes, each CREATE deleted and each DELETE created again, and change nothing else. Only
  * exact DELETE and CREATE make that possible, so neither uses UPSERT at a website name. A batch that changes only
  * validation records needs no reverse. Unreadable files are left to batchDirectoryViolations.
@@ -182,7 +210,7 @@ export function batchPairingViolations(dir: string): string[] {
   const batches = new Map<string, Json[]>();
   for (const file of batchFiles(dir)) {
     if (!/^[a-z0-9][a-z0-9.-]*\.json$/.test(file)) {
-      out.push(`${file}: a batch must be a top-level .json file named in lower case, to pair with its reverse by name`);
+      out.push(`${file}: ${BATCH_NAME}`);
       continue;
     }
     try {
@@ -204,6 +232,16 @@ export function batchPairingViolations(dir: string): string[] {
         out.push(`${file}: a reverse batch needs its forward batch, ${forwardFile}`);
       } else if (JSON.stringify(forward.filter(isWebsiteChange).map(asUndone).sort()) !== JSON.stringify(changes.map(asNamed).sort())) {
         out.push(`${file}: must undo exactly the website changes in ${forwardFile}, and change nothing else`);
+      } else {
+        // Route 53 applies a batch change by change, so the pair must also apply in its order, to the record sets the
+        // forward batch deletes. That shows the pair is consistent; only a replay against the zone shows it applies there.
+        const website = forward.filter(isWebsiteChange);
+        try {
+          const assumed = zoneOf(website.filter((change) => change.Action === 'DELETE').map((change) => change.ResourceRecordSet));
+          applyBatch(applyBatch(assumed, { Changes: website }), { Changes: changes });
+        } catch (error) {
+          out.push(`${file}: with ${forwardFile}, does not apply in its order: ${(error as Error).message}`);
+        }
       }
     } else if (website.length > 0 && !batches.has(file.replace(/\.json$/, '.reverse.json'))) {
       out.push(`${file}: a website routing batch needs a reverse batch, ${file.replace(/\.json$/, '.reverse.json')}`);

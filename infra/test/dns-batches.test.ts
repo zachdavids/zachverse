@@ -148,9 +148,9 @@ describe('batchPairingViolations', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('accepts a routing batch whose reverse undoes it, in any order, and a validation batch without one', () => {
+  it('accepts a routing batch whose reverse undoes it, in an order Route 53 applies, and a validation batch without one', () => {
     write('a.json', lower);
-    write('a.reverse.json', [...raise].reverse());
+    write('a.reverse.json', raise);
     write('v.json', [validation]);
     writeFileSync(path.join(dir, 'README.md'), '# Batches\n');
     expect(batchPairingViolations(dir)).toEqual([]);
@@ -174,6 +174,33 @@ describe('batchPairingViolations', () => {
     }
   });
 
+  it('refuses a pair that does not apply in its order, as Route 53 applies a batch change by change', () => {
+    write('a.json', lower);
+    write('a.reverse.json', [...raise].reverse());
+    // Two of www's types: the CNAME can come back only once the alias beside it is gone.
+    const wwwCname = { Name: 'www.zachdavids.com.', Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: 'zachdavids.com' }] };
+    const wwwAlias = { Name: 'www.zachdavids.com.', Type: 'A', AliasTarget: { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: 'd1.cloudfront.net.', EvaluateTargetHealth: false } };
+    write('w.json', [
+      { Action: 'DELETE', ResourceRecordSet: wwwCname },
+      { Action: 'CREATE', ResourceRecordSet: wwwAlias },
+    ]);
+    write('w.reverse.json', [
+      { Action: 'CREATE', ResourceRecordSet: wwwCname },
+      { Action: 'DELETE', ResourceRecordSet: wwwAlias },
+    ]);
+    expect(batchPairingViolations(dir)).toEqual([
+      'a.reverse.json: with a.json, does not apply in its order: change 0 (CREATE zachdavids.com A): it already exists',
+      'w.reverse.json: with w.json, does not apply in its order: change 0 (CREATE www.zachdavids.com CNAME): www.zachdavids.com would hold a CNAME beside other records',
+    ]);
+    write('w.reverse.json', [
+      { Action: 'DELETE', ResourceRecordSet: wwwAlias },
+      { Action: 'CREATE', ResourceRecordSet: wwwCname },
+    ]);
+    expect(batchPairingViolations(dir)).toEqual([
+      'a.reverse.json: with a.json, does not apply in its order: change 0 (CREATE zachdavids.com A): it already exists',
+    ]);
+  });
+
   it('refuses UPSERT at a website name, whose earlier state no reverse could know', () => {
     write('a.json', [{ Action: 'UPSERT', ResourceRecordSet: record(300) }]);
     write('a.reverse.json', [{ Action: 'DELETE', ResourceRecordSet: record(300) }]);
@@ -183,13 +210,10 @@ describe('batchPairingViolations', () => {
     ]);
   });
 
-  it('refuses a batch that could not pair by name: in a folder, in capitals, or hidden', () => {
-    for (const file of ['m9/retire.json', 'A.JSON', '.hidden.json', 'notes.txt']) write(file, lower);
-    expect(batchPairingViolations(dir)).toEqual(
-      ['.hidden.json', 'A.JSON', 'm9/retire.json', 'notes.txt'].map(
-        (file) => `${file}: a batch must be a top-level .json file named in lower case, to pair with its reverse by name`,
-      ),
-    );
+  it('refuses a batch that could not pair by name: in a folder, in capitals, hidden, or with another character', () => {
+    const names = ['.hidden.json', 'A.JSON', 'a b.json', 'a_b.json', 'm9/retire.json', 'notes.txt'];
+    for (const file of names) write(file, lower);
+    expect(batchPairingViolations(dir)).toEqual(names.map((file) => `${file}: a batch must be a top-level file named with lower-case letters, digits, '.', and '-' only, starting with a letter or digit and ending in .json, to pair with its reverse by name`));
   });
 
   it('leaves an unreadable or malformed batch to batchDirectoryViolations, and still compares a reverse', () => {
@@ -200,6 +224,24 @@ describe('batchPairingViolations', () => {
     write('a.json', lower);
     write('a.reverse.json', [null, {}]);
     expect(batchPairingViolations(dir)).toEqual(['a.reverse.json: must undo exactly the website changes in a.json, and change nothing else']);
+    // Malformed values that agree with each other: the pairing check passes them, and the directory check names them.
+    const odd = [
+      { Name: 'zachdavids.com.', Type: 'A', TTL: 300, ResourceRecords: [null] },
+      { Name: 'zachdavids.com.', Type: 'AAAA', TTL: 300, ResourceRecords: 'x' },
+    ];
+    write('a.json', odd.map((ResourceRecordSet) => ({ Action: 'DELETE', ResourceRecordSet })));
+    write('a.reverse.json', odd.map((ResourceRecordSet) => ({ Action: 'CREATE', ResourceRecordSet })));
+    rmSync(path.join(dir, 'odd.json'));
+    expect(batchPairingViolations(dir)).toEqual([]);
+    const SHAPE = 'a website record is either an alias, with no TTL or values, or a TTL with a list of string values';
+    expect(batchDirectoryViolations(dir)).toEqual([
+      `a.json: change 0 (DELETE A zachdavids.com): ${SHAPE}`,
+      `a.json: change 1 (DELETE AAAA zachdavids.com): ${SHAPE}`,
+      `a.reverse.json: change 0 (CREATE A zachdavids.com): ${SHAPE}`,
+      `a.reverse.json: change 1 (CREATE AAAA zachdavids.com): ${SHAPE}`,
+      'broken.json: not readable as JSON',
+      'null.json: batch has no Changes',
+    ]);
   });
 });
 
@@ -236,6 +278,33 @@ describe('dnsBatchViolations', () => {
     expect(dnsBatchViolations({ Comment: 'x', Changes: [validation], Changs: [] })).toEqual([
       'batch has Changs, which is neither Comment nor Changes',
     ]);
+  });
+
+  it('refuses any field but those of a simple record, at website and validation names', () => {
+    const NOT_SIMPLE = 'is not a field of a simple record, the only kind these batches write';
+    const weighted = withRecordSet(upsert('www.zachdavids.com A'), { SetIdentifier: 'blue', Weight: 1, HealthCheckId: 'abc' });
+    expect(dnsBatchViolations({ Changes: [weighted] })).toEqual(
+      ['SetIdentifier', 'Weight', 'HealthCheckId'].map((field) => `change 0 (UPSERT A www.zachdavids.com): ${field} ${NOT_SIMPLE}`),
+    );
+    const aliasWithExtra = apexAliasTo({ HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: 'd111111abcdef8.cloudfront.net.', Region: 'us-east-1' });
+    expect(dnsBatchViolations({ Changes: [aliasWithExtra] })).toEqual([`change 0 (UPSERT A zachdavids.com): AliasTarget.Region ${NOT_SIMPLE}`]);
+    expect(dnsBatchViolations({ Changes: [withRecordSet(validation, { Failover: 'PRIMARY' })] })).toEqual([
+      `change 0 (UPSERT CNAME ${VALIDATION_NAME}): Failover ${NOT_SIMPLE}`,
+    ]);
+  });
+
+  it('refuses a website record that is neither an alias alone nor a TTL with a list of string values', () => {
+    const SHAPE = 'a website record is either an alias, with no TTL or values, or a TTL with a list of string values';
+    const value = upsert('zachdavids.com A');
+    const changes = [
+      withRecordSet(apexAlias, { TTL: 300 }),
+      withRecordSet(apexAlias, { ResourceRecords: [{ Value: 'x' }] }),
+      withRecordSet(value, { TTL: undefined }),
+      ...[[], [null], 'x', [{ Value: 5 }], [{ Value: 'x', Weight: 1 }]].map((ResourceRecords) => withRecordSet(value, { ResourceRecords })),
+    ];
+    for (const change of changes) {
+      expect(dnsBatchViolations({ Changes: [change] }), JSON.stringify(change)).toEqual([`change 0 (UPSERT A zachdavids.com): ${SHAPE}`]);
+    }
   });
 
   it('accepts ACM validation and website cutover changes', () => {
@@ -539,6 +608,18 @@ describe('applyBatch', () => {
     expect(upserted.get('zachdavids.com A')?.TTL).toBe(60);
     const reordered = { ...a, Name: 'ZachDavids.com', ResourceRecords: [...a.ResourceRecords].reverse() };
     expect([...applyBatch(zone, { Changes: [{ Action: 'DELETE', ResourceRecordSet: reordered }] }).keys()]).toEqual([]);
+  });
+
+  it('checks the CNAME rule after each change, as Route 53 does, not only at the end', () => {
+    const wwwA = { Name: 'www.zachdavids.com.', Type: 'A', TTL: 300, ResourceRecords: [{ Value: '192.0.2.1' }] };
+    const wwwCname = { Name: 'www.zachdavids.com.', Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: 'zachdavids.com' }] };
+    const start = zoneOf([wwwA]);
+    const create = { Action: 'CREATE', ResourceRecordSet: wwwCname };
+    const remove = { Action: 'DELETE', ResourceRecordSet: wwwA };
+    expect(() => applyBatch(start, { Changes: [create, remove] })).toThrow(
+      'change 0 (CREATE www.zachdavids.com CNAME): www.zachdavids.com would hold a CNAME beside other records',
+    );
+    expect([...applyBatch(start, { Changes: [remove, create] }).keys()]).toEqual(['www.zachdavids.com CNAME']);
   });
 
   it('refuses a creation of what exists, a deletion that does not match, and a CNAME beside other records', () => {
