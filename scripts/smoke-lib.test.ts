@@ -108,7 +108,6 @@ describe('smokeTest', () => {
       except(dir, (url) => {
         if (url.href === 'https://example.com/favicon.svg') return reply(200, '<svg/>', { 'content-type': 'text/plain' });
         if (url.href === 'https://example.com/about/index.html') return reply(500);
-        if (url.href === 'https://example.com/about') return reply(404);
         if (url.pathname.endsWith('.css')) {
           return reply(200, 'stale', { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'max-age=60' });
         }
@@ -116,15 +115,19 @@ describe('smokeTest', () => {
       }),
     );
     expect(result.passed).toEqual(CHECKS.filter((_check, index) => index !== 2 && index !== 3));
-    // Every file in path order, then the references no earlier check requested: the icon and the stylesheet were, as
-    // files, so only the home page's link to /about is requested, which gets about/index.html.
+    // Every file in path order, then each URL the pages load, once, in page order: the 404 page's icon, then the home
+    // page's stylesheet, its icon already judged. Their replies are the ones the earlier check got, not new requests;
+    // /about gets about/index.html, which serves.
     expect(result.failures).toEqual([
       `${CHECKS[2]}: /about/index.html: status 500, not 200`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
       `${CHECKS[2]}: /assets/index-EfGh5678.css: cache-control is "max-age=60", not "public, max-age=31536000, immutable"`,
       `${CHECKS[2]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
       `${CHECKS[2]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
-      `${CHECKS[3]}: /about: status 404, not 200`,
+      `${CHECKS[3]}: /favicon.svg: content-type is "text/plain", not "image/svg+xml"`,
+      `${CHECKS[3]}: /favicon.svg: cache-control is undefined, not "no-cache"`,
+      `${CHECKS[3]}: /assets/index-EfGh5678.css: the body is not the release's /assets/index-EfGh5678.css`,
+      `${CHECKS[3]}: /assets/index-EfGh5678.css: cache-control is "max-age=60", not "public, max-age=31536000, immutable"`,
     ]);
   });
 
@@ -163,6 +166,20 @@ describe('smokeTest', () => {
     // The fixed seven, the home page, the seven files, and the two page addresses the pages link to, /about and /about/.
     expect(requests).toHaveLength(7 + 1 + 7 + 2);
     expect(distributionRequests(siteFiles(dir))).toBe(requests.length);
+  });
+
+  it('reports a file whose request failed outright under both checks, and goes on with the other references', async () => {
+    const dir = site({ '404.html': '<!doctype html><title>x</title><link rel="icon" href="/favicon.svg" /><a href="/about">About</a>' });
+    const result = await smokeTest(
+      dir,
+      TARGET,
+      except(dir, (url) => {
+        if (url.pathname === '/favicon.svg') throw new Error('read ECONNRESET');
+        return undefined;
+      }),
+    );
+    // The file check stops at the icon; the references check reports it once and still checks /about.
+    expect(result.failures).toEqual([`${CHECKS[2]}: read ECONNRESET`, `${CHECKS[3]}: /favicon.svg: read ECONNRESET`]);
   });
 
   it('fails a page that refers to a file the release does not have', async () => {

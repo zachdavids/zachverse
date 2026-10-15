@@ -53,7 +53,7 @@ That is the order AWS documents (web ACL → distribution → subscription). Not
 
 **Retention.** Like every resource in the site stack, both are retained, so removing them from the template, or deleting the stack, leaves them in place, and the subscription keeps the plan on. CloudFront refuses to detach the web ACL while the plan is on, so deploying a template without `pricingPlan`, such as any from before milestone 7, fails at the distribution, and CloudFormation rolls the update back. Going back to pay-as-you-go is therefore an administrator's sequence, with ADR 0004's runbook:
 
-1. **Cancel the subscription.** Take its ARN from the stack output `PricingPlanSubscriptionArn`, which step 3 removes, and its current `eTag` from `aws pricing-plan-manager get-subscription --region us-east-1 --arn <arn>`. Its status must be `ACTIVE`: one in `SYNC_IN_PROGRESS` can't be changed, so wait out the sync and read the `eTag` again. Then run `aws pricing-plan-manager cancel-subscription --region us-east-1 --arn <arn> --if-match <eTag>`.
+1. **Cancel the subscription.** Take its ARN from the stack output `PricingPlanSubscriptionArn`, which step 3 removes. After a failed update there may be no such output: then take the `arn` of the subscription that names the distribution, from `aws pricing-plan-manager list-subscriptions --region us-east-1 --query "subscriptionSummaries[?contains(resourceArns, 'arn:aws:cloudfront::426499248998:distribution/E3R8NEUOW8Z97U')].[arn, status, statusReason]"`. Right before cancelling, read its `status` and `eTag` with `aws pricing-plan-manager get-subscription --region us-east-1 --arn <arn>`. If it already has a `scheduledChange` of type `CANCELLATION`, go on to step 2. One in `SYNC_IN_PROGRESS` can't be changed: wait out the sync, usually 2 to 5 minutes, and read it again. Any other status can be cancelled, `FAILED` included, which is AWS's remedy for a failed subscription: run `aws pricing-plan-manager cancel-subscription --region us-east-1 --arn <arn> --if-match <eTag>`. A `ConflictException` means the `eTag` changed: read it again.
 2. **Wait for the plan to end.** CloudFront's guide says a Free plan is cancelled at once, but the API reference says an active subscription's cancellation takes effect at the end of the billing period. So wait until `aws pricing-plan-manager list-subscriptions --region us-east-1` no longer lists the subscription. If `get-subscription` shows a `scheduledChange` of type `CANCELLATION` instead, the plan stays on until its `effectiveDate`, and step 3 waits until then.
 3. **Deploy the template without `pricingPlan`.** That detaches the web ACL. If CloudFront still refuses, CloudFormation rolls the update back: go back to step 2.
 4. **Delete the retained web ACL** once that deploy is complete: `aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1` gives its `Id` and `LockToken`, and `aws wafv2 delete-web-acl --scope CLOUDFRONT --region us-east-1 --name zachverse-site --id <Id> --lock-token <LockToken>` deletes it.
@@ -81,18 +81,17 @@ Run this after milestone 6's first release has passed its checks, as an administ
 4. **Review the diff:** `npm run cdk -- diff` in `infra/`. Expect only:
    - the web ACL and the subscription, added;
    - the distribution's `WebACLId`, added;
-   - two new outputs, `WebAclArn` and `PricingPlanSubscriptionArn`;
-   - milestone 6's `SiteDeployPolicy` change, if it isn't deployed yet.
+   - two new outputs, `WebAclArn` and `PricingPlanSubscriptionArn`.
 5. **Deploy:** `npm run cdk -- deploy ZachverseSite --require-approval never`.
 6. **Check the result:**
    - **Subscription:** `aws pricing-plan-manager get-subscription --region us-east-1 --arn <PricingPlanSubscriptionArn>` shows:
      - status `ACTIVE`;
      - tier `FREE`, with no scheduled change;
      - exactly the three resource ARNs (the distribution, the web ACL, the zone).
-   - **Distribution:** `aws cloudfront get-distribution-config` shows the web ACL's ARN as `WebACLId`, and its `DistributionConfig` differs from step 2's in nothing else.
-   - **Web ACL:** `aws wafv2 get-web-acl` shows the rules above, and `ManagedByFirewallManager` is false.
-   - **Bucket policy and deploy role:** as in step 2, apart from milestone 6's change if the diff showed it.
-   - **Stack:** `ZachverseSite` is `UPDATE_COMPLETE`, and its deployed template equals the synthesized one.
+   - **Distribution:** `aws cloudfront get-distribution-config --id E3R8NEUOW8Z97U` shows the web ACL's ARN as `WebACLId`, and its `DistributionConfig` differs from step 2's in nothing else.
+   - **Web ACL:** `aws wafv2 get-web-acl --region us-east-1 --arn <WebAclArn>` shows the rules above, and `ManagedByFirewallManager` is false. The `--region` matters: the default profile's Region is us-east-2, and CloudFront's web ACLs are only in us-east-1.
+   - **Bucket policy and deploy role:** exactly as in step 2.
+   - **Stack:** `aws cloudformation describe-stacks --region us-east-1 --stack-name ZachverseSite` shows `UPDATE_COMPLETE`, and `aws cloudformation get-template --region us-east-1 --stack-name ZachverseSite` equals the synthesized `infra/cdk.out/ZachverseSite.template.json`.
 7. **Smoke-test the live site through the web ACL:** run the Deploy workflow on `main` by hand. It publishes the current release again, as a retry, then smoke-tests it and checks it in a browser.
 8. **Compare the zone:** export it again. Any difference from step 2 must be a separately reviewed change, such as an email record the owner approved.
 9. **Test an in-place update:** with the plan active, make an ordinary reviewed change to the stack: the distribution's comment and the web ACL's description. Export as in step 2, then review the diff, deploy, and check as in steps 4 to 7: only those two may change. This shows that later stack updates, a rule fix among them, still work on the plan.
@@ -106,7 +105,7 @@ Milestone 8's DNS cutover waits until steps 6 to 9 have all passed and `docs/pro
   - **Check what is left,** against step 2's exports:
     - the distribution, and whether its `WebACLId` is empty again;
     - whether the web ACL is gone (the rollback should delete it, since its create rolled back);
-    - the subscription: `aws pricing-plan-manager list-subscriptions --region us-east-1` lists none naming the distribution. One left behind makes a retry's subscription fail, so cancel it ("Retention", steps 1 and 2);
+    - the subscription: `aws pricing-plan-manager list-subscriptions --region us-east-1` lists none naming the distribution. One left behind, most likely `FAILED`, makes a retry's subscription fail, so cancel it ("Retention", steps 1 and 2, taking its ARN from that listing);
     - the certificate, the bucket and its policy, and the deploy role's permissions;
     - the zone.
   - **If the stack is `UPDATE_ROLLBACK_FAILED`** because CloudFront wouldn't detach the web ACL: the subscription was created before the update failed, and the rollback restores the distribution before it deletes what the update created. Cancel the subscription ("Retention", steps 1 and 2), then run `npm run cdk -- rollback ZachverseSite` in `infra/`, and check what is left. Never skip or orphan the distribution (`--force`, `--orphan`, or `--resources-to-skip`): CloudFormation would record it without the web ACL while it keeps one, and that web ACL would stay attached outside the stack, billed at pay-as-you-go rates, under the name a retry needs.
@@ -117,7 +116,10 @@ Milestone 8's DNS cutover waits until steps 6 to 9 have all passed and `docs/pro
   - **The IP reputation group, on a runner's address:** re-run all jobs (ADR 0006, "When a release fails"); a new runner usually has another address.
   - **Another rule, or a block that persists:** make a reviewed change in `infra/lib/site-stack.ts`, with its test, that sets only the matching rule to Count (`ruleActionOverrides` in that rule group's statement). Deploy it with ADR 0004's runbook, and repeat steps 6 and 7. That rule then protects no visitor, so record why. Never change the web ACL in the console, where the next deploy would undo it, and don't cancel the plan or run Restore for this.
   - Until it is fixed, every push to `main` fails and rolls back.
-- **The zone has a change no one reviewed (step 8):** stop, and find it. Fix only the records it touched, through a reviewed batch in `infra/dns/`, never a whole-zone restore; email records need the owner's approval.
+- **The zone has a change no one reviewed (step 8):** stop, find who made it (CloudTrail's `ChangeResourceRecordSets` events in us-east-1), and ask the owner before putting anything back: it may be the owner's own approved change. Never restore a whole-zone export. Put back only the records it touched, exporting and diffing the zone before and after:
+  - a website routing record (the apex `A`/`AAAA`, `www`): through a reviewed batch in `infra/dns/`, with its reverse batch;
+  - one of the site certificate's validation records: with an `UPSERT` copy of its committed batch (`infra/dns/README.md`);
+  - any other record, the email records above all: as a separate change the owner approves, kept outside `infra/dns/`, whose tests refuse such records, as the DMARC record was (Route 53 change `C02252852B8LKRZFNHRAO`). Record its change ID in `docs/progress.md`.
 - **The in-place update fails (step 9):** read the stack's events, and handle it like a failed deploy.
 - **Hold milestone 8's DNS cutover** until steps 6 to 9 all pass.
 
@@ -127,13 +129,13 @@ Milestone 8's DNS cutover waits until steps 6 to 9 have all passed and `docs/pro
   - The guardrails check the web ACL against the Free tier's limits in every synthesis, production's included.
   - `infra/test/site-stack.test.ts` pins the web ACL's properties and rules, the references that order the deployment, that nothing else references or depends on the web ACL or the subscription, the subscription, and the outputs.
   - `infra/test/environment.test.ts` pins the new logical IDs and create-only properties: the web ACL's name and scope, and the subscription's plan family.
-  - `scripts/smoke-lib.test.ts` and `scripts/check-dist-lib.test.ts` pin the smoke test's one request per URL, its count of them, and the budget `check:dist` holds builds to; `tests/repo-policy.test.ts` keeps the budget at most half the rate limit.
-  - Infra tests: 1007 passed; web tests: 447 passed; both at 100% coverage.
+  - `scripts/smoke-lib.test.ts` and `scripts/check-dist-lib.test.ts` pin the smoke test's one request per URL, each check judging the reply it needs, its count of them, and the budget `check:dist` holds builds to; `tests/repo-policy.test.ts` keeps the budget at most half the rate limit.
+  - Infra tests: 1007 passed; web tests: 448 passed; both at 100% coverage.
 - **Diff:** `npm run cdk -- diff --method template` against the live stacks showed:
   - the web ACL and the subscription, added;
   - the distribution's `WebACLId`, added;
   - the two outputs, added;
-  - milestone 6's undeployed `SiteDeployPolicy` change, which this branch carries;
+  - milestone 6's `SiteDeployPolicy` change, which this branch carries, not deployed then (it was later that day, from `a442c2f`, so the runbook's diff won't show it);
   - no differences in `ZachverseIdentity`.
 - **The account, read-only:**
   - No CLOUDFRONT-scope web ACL and no pricing-plan subscription. AWS allows three Free plans per account.
