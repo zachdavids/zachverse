@@ -1,7 +1,7 @@
 # ADR 0006: Releases, smoke tests, and rollback
 
 - Status: Accepted (milestone 6), merged on 2026-10-15 as `d6503b1`, whose Deploy run published and verified the first release ("First release"). The restore rehearsal passed the same day ("Restore rehearsal").
-- Date: 2026-10-15, revised the same day after the Phase 1 review
+- Date: 2026-10-15, revised the same day after the Phase 1 review and for milestone 9
 
 ## Decision
 
@@ -141,7 +141,7 @@ A history entry belongs to the workflow run, in any attempt: the run ID decides,
 | --- | --- | --- | --- |
 | **Application rollback** (this ADR) | Only the site's objects in S3, and CloudFront's cache | The Restore workflow, which holds deploys until someone resumes them; the verify job's automatic rollback after a failed check; or a fix pushed to `main` | Anyone who can run workflows; the deploy role |
 | **CloudFormation rollback** | A stack's resources and configuration: the bucket, distribution, function, policies, identity stack | CloudFormation rolls a failed update back by itself. To undo a deployed change, deploy the previous commit's template with ADR 0004's runbook; `cdk rollback` recovers a stack stuck in `UPDATE_ROLLBACK_FAILED`. Every resource is retained (ADR 0003), and no stack holds the site's content, so none of this changes a release. Rolling the site stack back past milestone 6 removes the release-record deny and the deploy role's page deletion, though: CloudFront then serves the records, so every smoke test fails, and a publish with a page to remove fails, until the stack is deployed again. Since milestone 7, while the Free plan is on, a template without `pricingPlan` fails at the distribution, which CloudFront won't detach from the web ACL, and CloudFormation rolls the update back: going back to pay-as-you-go is ADR 0007's "Retention" sequence. After a failed milestone 7 deploy, `cdk rollback` works only once the subscription is cancelled (ADR 0007, "If a step fails") | An administrator |
-| **DNS rollback** (milestone 8) | The website's records in the hosted zone | The reverse change batch in `infra/dns/` for the website names only, never a whole-zone export, which could erase later email-authentication changes (`infra/dns/README.md`) | An administrator |
+| **DNS rollback** (milestone 8) | The website's records in the hosted zone | The reverse change batch in `infra/dns/` for the website names only, never a whole-zone export, which could erase later email-authentication changes (`infra/dns/README.md`). It lasts only until milestone 9 ends the rollback window and retires the Droplet; after that, nothing is left to roll back to (ADR 0009) | An administrator |
 
 Each changes only its own layer: restoring a release changes no stack and no DNS record, rolling back a stack changes no object in the bucket, and a DNS rollback changes neither. Each still relies on the others: releases on the stack's bucket policy, distribution, and deploy permissions, and the site's hostnames on DNS.
 

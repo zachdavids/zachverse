@@ -1,7 +1,8 @@
 # ADR 0008: Website DNS cutover
 
 - Status: Accepted (milestone 8). Prepared, not applied: the batches wait for the preconditions below.
-- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
+- Date: 2026-10-15, revised the same day after review, after the Phase 1 review, and for milestone 9
+- Retired: milestone 9 deleted these batches, and the tests in `infra/test/dns-batches.test.ts` that replayed them against the 2026-10-15 zone, when it ended the rollback window (ADR 0009). Git history keeps them; this ADR records them as milestone 8 left them.
 
 ## Context
 
@@ -45,6 +46,8 @@ The Droplet serves both names with a Let's Encrypt certificate valid until 2026-
 - each batch fails whole on a zone that differs, including when applied twice;
 - a record added at `www` after step 2 makes the cutover's reverse fail whole ("Limits");
 - the distribution the aliases name is the one ADR 0003 records.
+
+These tests ran until milestone 9 deleted them with the batches (ADR 0009).
 
 Every batch in `infra/dns/` is also checked (`infra/dns/README.md`):
 - each website routing batch has a reverse batch that undoes exactly its website changes and applies in its order, change by change as Route 53 applies it;
@@ -106,6 +109,8 @@ An administrator applies the batches, in the Website account with `--profile def
   The cutover changes nothing email depends on, so an email problem with step 2's diff clean is no reason to roll back the website.
 - **The monitor:** once the checks above pass, the owner turns on the external uptime monitor (ADR 0007, "Monitoring") and sees its first checks pass. Its history from then on is what milestone 9 judges.
 
+**This rollback ended with milestone 9** (ADR 0009). Never apply a reverse batch taken from git history: the Droplet's addresses may now belong to someone else.
+
 **Rollback.** A rollback doesn't wait for a registrar operation (`infra/dns/README.md`). First check that the Droplet can take the site back, and that the reverse batch can apply:
 - **Delegation:** precondition 6's check passes. If it doesn't, the outage is a delegation problem that no batch can fix.
 - **The Droplet:** `curl -sS -o /dev/null -w '%{http_code}\n' --connect-to zachdavids.com:443:159.203.37.93:443 https://zachdavids.com/` prints 200, and so does the same for `www.zachdavids.com`, and both with `[2604:a880:cad:d0::46:6001]` in place of the IPv4 address. curl refuses an expired certificate.
@@ -128,7 +133,7 @@ Never restore a whole-zone export, and don't run the Deploy workflow as part of 
 ## Limits
 
 - **Pinned to 2026-10-15:** the batches name the zone's website records as they were then. Any change to those records makes them fail, as intended, and they must be regenerated and reviewed again. Changes to records at other names don't affect them. After step 2, though, `www` is no longer a `CNAME`, so other record types can be added there, and any record at `www.zachdavids.com` besides the two aliases (a `TXT`, a `CAA`, or an `HTTPS` record, say) makes the cutover's reverse fail whole, since its `CNAME` can't share the name.
-- **The Droplet's address and certificate:** the reverse batches restore that address, so they are useful only while the Droplet serves the site. After step 2 the Droplet can't renew its Let's Encrypt certificate by itself, since its challenges reach CloudFront, and nothing warns before the certificate expires. So the rollback window ends at the `notAfter` that step 2 records, unless the Droplet renews by hand after a rollback; past it, CloudFront's HSTS turns the expired certificate into an error visitors can't click through. Milestone 9 retires the Droplet before that date, and deletes the reverse batches together with their forward batches, since the tests refuse a routing batch without its reverse.
+- **The Droplet's address and certificate:** the reverse batches restore that address, so they are useful only while the Droplet serves the site. After step 2 the Droplet can't renew its Let's Encrypt certificate by itself, since its challenges reach CloudFront, and nothing warns before the certificate expires. So the rollback window ends at the `notAfter` that step 2 records, unless the Droplet renews by hand after a rollback; past it, CloudFront's HSTS turns the expired certificate into an error visitors can't click through. Milestone 9 retires the Droplet before that date, and deletes the reverse batches together with their forward batches, since the tests refuse a routing batch without its reverse (ADR 0009).
 - **What the tests can't check:** they model Route 53's rules and check each batch's envelope against its documented limits, but they can't check what Route 53 itself will accept, and Route 53 has no dry run, so a reverse batch is first tested when it is used. A batch Route 53 refuses applies nothing, at any step, a rollback included; its fix goes through review.
 - **One vantage point:** the checks after the cutover see DNS and CloudFront from one network, and the checks before it reach the web ACL from one address. Resolvers elsewhere move to the new answers as their caches expire.
 - **Record count:** the zone grows by one record (the `www` `CNAME` becomes two aliases), to 12 of the Free plan's 50.

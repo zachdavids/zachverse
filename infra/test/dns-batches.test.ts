@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { applyBatch, batchDirectoryViolations, batchPairingViolations, dnsBatchViolations, type Zone, zoneOf } from './support/dns-batch';
+import { applyBatch, batchDirectoryViolations, batchPairingViolations, dnsBatchViolations, zoneOf } from './support/dns-batch';
 
 const DNS_DIR = path.join(__dirname, '..', 'dns');
 const VALIDATION_NAME = '_0123456789abcdef0123456789abcdef.zachdavids.com';
@@ -201,6 +201,30 @@ describe('batchPairingViolations', () => {
     ]);
   });
 
+  it("lets a batch delete a record at the retired Droplet's address with no reverse that brings it back, and refuses one that does", () => {
+    const stale = { Name: 'zachdavids.com.', Type: 'A', TTL: 300, ResourceRecords: [{ Value: '159.203.37.93' }] };
+    const alias = { Name: 'zachdavids.com.', Type: 'A', AliasTarget: { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: 'd1.cloudfront.net.', EvaluateTargetHealth: false } };
+    // Removing it alone needs no reverse at all.
+    write('remove.json', [{ Action: 'DELETE', ResourceRecordSet: stale }]);
+    // Replacing it with the alias needs a reverse only for the alias.
+    write('repoint.json', [
+      { Action: 'DELETE', ResourceRecordSet: stale },
+      { Action: 'CREATE', ResourceRecordSet: alias },
+    ]);
+    write('repoint.reverse.json', [{ Action: 'DELETE', ResourceRecordSet: alias }]);
+    expect(batchDirectoryViolations(dir)).toEqual([]);
+    expect(batchPairingViolations(dir)).toEqual([]);
+    // A reverse that brings the record back, under any spelling, is refused by both checks.
+    write('repoint.reverse.json', [
+      { Action: 'DELETE', ResourceRecordSet: alias },
+      { Action: 'CREATE', ResourceRecordSet: { ...stale, ResourceRecords: [{ Value: '159.203.37.93.' }] } },
+    ]);
+    expect(batchDirectoryViolations(dir)).toEqual([
+      "repoint.reverse.json: change 1 (CREATE A zachdavids.com): 159.203.37.93. is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else",
+    ]);
+    expect(batchPairingViolations(dir)).toEqual(['repoint.reverse.json: must undo exactly the website changes in repoint.json, and change nothing else']);
+  });
+
   it('refuses UPSERT at a website name, whose earlier state no reverse could know', () => {
     write('a.json', [{ Action: 'UPSERT', ResourceRecordSet: record(300) }]);
     write('a.reverse.json', [{ Action: 'DELETE', ResourceRecordSet: record(300) }]);
@@ -307,6 +331,37 @@ describe('dnsBatchViolations', () => {
     }
   });
 
+  it("refuses a website A or AAAA value at the retired Droplet's addresses, however written, but lets a batch delete one", () => {
+    const RETIRED = "is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else";
+    const at = (action: string, type: string, value: string, name = 'zachdavids.com.') => ({
+      Action: action,
+      ResourceRecordSet: { Name: name, Type: type, TTL: 300, ResourceRecords: [{ Value: value }] },
+    });
+    for (const [action, type, value] of [
+      ['CREATE', 'A', '159.203.37.93'],
+      ['UPSERT', 'A', ' 159.203.37.93 '],
+      ['UPSERT', 'A', '159.203.37.93.'],
+      ['CREATE', 'AAAA', '2604:a880:cad:d0::46:6001'],
+      ['UPSERT', 'AAAA', '2604:A880:CAD:D0:0:0:46:6001'],
+      ['UPSERT', 'AAAA', '::ffff:159.203.37.93'],
+      ['UPSERT', 'AAAA', '::FFFF:9FCB:255D'],
+    ] as const) {
+      expect(dnsBatchViolations({ Changes: [at(action, type, value)] }), value).toEqual([
+        `change 0 (${action} ${type} zachdavids.com): ${value} ${RETIRED}`,
+      ]);
+    }
+    // At www too, and second among several values.
+    const both = at('UPSERT', 'A', '192.0.2.1', 'www.zachdavids.com.');
+    both.ResourceRecordSet.ResourceRecords.push({ Value: '159.203.37.93' });
+    expect(dnsBatchViolations({ Changes: [both] })).toEqual([`change 0 (UPSERT A www.zachdavids.com): 159.203.37.93 ${RETIRED}`]);
+    // Deleting a stale pointer at the Droplet is how it would be removed.
+    expect(dnsBatchViolations({ Changes: [at('DELETE', 'A', '159.203.37.93')] })).toEqual([]);
+    // Other addresses, and a value that isn't an IPv6 address at all, are not the Droplet's.
+    for (const [type, value] of [['A', '192.0.2.1'], ['AAAA', '2001:db8::1'], ['AAAA', 'zz::1']]) {
+      expect(dnsBatchViolations({ Changes: [at('UPSERT', type!, value!)] }), value).toEqual([]);
+    }
+  });
+
   it('accepts ACM validation and website cutover changes', () => {
     const wwwAlias = withRecordSet(apexAlias, { Name: 'www.zachdavids.com.' });
     expect(dnsBatchViolations({ Changes: [validation, apexAlias, wwwAlias, deleteWwwCname] })).toEqual([]);
@@ -316,7 +371,7 @@ describe('dnsBatchViolations', () => {
   const RECORD_TYPES = ['A', 'AAAA', 'CAA', 'CNAME', 'DS', 'HTTPS', 'MX', 'NAPTR', 'NS', 'PTR', 'SOA', 'SPF', 'SRV', 'SSHFP', 'SVCB', 'TLSA', 'TXT'];
   const ROUTING_RECORDS = ['zachdavids.com A', 'zachdavids.com AAAA', 'www.zachdavids.com A', 'www.zachdavids.com AAAA', 'www.zachdavids.com CNAME'];
   const websiteRecords = ['zachdavids.com', 'www.zachdavids.com'].flatMap((name) => RECORD_TYPES.map((type) => `${name} ${type}`));
-  /** A change to the named record; values are not checked at the website names, only alias targets. */
+  /** A change to the named record; at the website names, values are checked only for their shape and the retired addresses. */
   const upsert = (record: string) => {
     const [name, type] = record.split(' ');
     return { Action: 'UPSERT', ResourceRecordSet: { Name: `${name}.`, Type: type, TTL: 300, ResourceRecords: [{ Value: 'example' }] } };
@@ -509,90 +564,6 @@ describe('dnsBatchViolations', () => {
       'change 1 (undefined undefined ): unknown action',
       'change 1 (undefined undefined ): only website routing and ACM validation records may change',
     ]);
-  });
-});
-
-// The zone as read on 2026-10-15 (aws route53 list-resource-record-sets), when milestone 8's batches were written. The
-// website records are exact; the others stand in for what is there, with values the website batches must not touch.
-const ZONE_2026_10_15 = [
-  { Name: 'zachdavids.com.', Type: 'A', TTL: 1800, ResourceRecords: [{ Value: '159.203.37.93' }] },
-  { Name: 'zachdavids.com.', Type: 'AAAA', TTL: 1800, ResourceRecords: [{ Value: '2604:a880:cad:d0::46:6001' }] },
-  { Name: 'www.zachdavids.com.', Type: 'CNAME', TTL: 1800, ResourceRecords: [{ Value: 'zachdavids.com' }] },
-  {
-    Name: 'zachdavids.com.',
-    Type: 'MX',
-    TTL: 1800,
-    ResourceRecords: ['1 aspmx.l.google.com.', '5 alt1.aspmx.l.google.com.', '5 alt2.aspmx.l.google.com.', '10 alt3.aspmx.l.google.com.', '10 alt4.aspmx.l.google.com.'].map((Value) => ({ Value })),
-  },
-  { Name: 'zachdavids.com.', Type: 'NS', TTL: 172800, ResourceRecords: [{ Value: 'ns-1989.awsdns-56.co.uk.' }] },
-  { Name: 'zachdavids.com.', Type: 'SOA', TTL: 900, ResourceRecords: [{ Value: 'ns-1989.awsdns-56.co.uk. awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400' }] },
-  { Name: 'zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=spf1 include:_spf.google.com ~all"' }] },
-  { Name: '_dmarc.zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=DMARC1; p=none"' }] },
-  { Name: 'google._domainkey.zachdavids.com.', Type: 'TXT', TTL: 3600, ResourceRecords: [{ Value: '"v=DKIM1; k=rsa"' }] },
-  ...SITE_CERTIFICATE_RECORDS.map(([name, value]) => ({ Name: `${name}.`, Type: 'CNAME', TTL: 300, ResourceRecords: [{ Value: `${value}.` }] })),
-];
-// The site distribution, E3R8NEUOW8Z97U, as ADR 0003's "Deployed state" records it.
-const SITE_DISTRIBUTION = 'd15987dzppdzr.cloudfront.net';
-
-describe('the milestone 8 cutover batches', () => {
-  const batch = (file: string) => JSON.parse(readFileSync(path.join(DNS_DIR, file), 'utf8'));
-  const ttl = batch('2026-10-15-website-ttl.json');
-  const ttlReverse = batch('2026-10-15-website-ttl.reverse.json');
-  const cutover = batch('2026-10-15-website-cutover.json');
-  const cutoverReverse = batch('2026-10-15-website-cutover.reverse.json');
-  const start = zoneOf(ZONE_2026_10_15);
-  const WEBSITE = /^(?:www\.)?zachdavids\.com (?:A|AAAA|CNAME)$/;
-  const website = (zone: Zone) => [...zone.entries()].filter(([key]) => WEBSITE.test(key));
-  const others = (zone: Zone) => [...zone.entries()].filter(([key]) => !WEBSITE.test(key));
-
-  it('records the distribution they alias in ADR 0003', () => {
-    expect(readFileSync(path.join(__dirname, '..', '..', 'docs', 'adr', '0003-site-distribution-design.md'), 'utf8')).toContain(
-      `\`E3R8NEUOW8Z97U\` (\`${SITE_DISTRIBUTION}\`)`,
-    );
-  });
-
-  it('roll back only while www holds nothing but its two aliases, as ADR 0008 says', () => {
-    const cut = applyBatch(applyBatch(start, ttl), cutover);
-    const withTxt = (name: string) => zoneOf([...cut.values(), { Name: name, Type: 'TXT', TTL: 300, ResourceRecords: [{ Value: '"x"' }] }]);
-    expect(() => applyBatch(withTxt('www.zachdavids.com.'), cutoverReverse)).toThrow('www.zachdavids.com would hold a CNAME beside other records');
-    // At the apex, or at a name under www, such as a validation record, it doesn't.
-    for (const name of ['zachdavids.com.', 'x.www.zachdavids.com.']) expect(() => applyBatch(withTxt(name), cutoverReverse)).not.toThrow();
-  });
-
-  it('lower the TTLs, then point both names at the site distribution in A and AAAA aliases, touching nothing else', () => {
-    const lowered = applyBatch(start, ttl);
-    expect(website(lowered).map(([key, rrs]) => [key, rrs.TTL])).toEqual([
-      ['zachdavids.com A', 300],
-      ['zachdavids.com AAAA', 300],
-      ['www.zachdavids.com CNAME', 300],
-    ]);
-    // Only the TTLs: every value, and every other record, as it was on 2026-10-15.
-    expect(lowered).toEqual(new Map([...start].map(([key, rrs]) => [key, WEBSITE.test(key) ? { ...rrs, TTL: 300 } : rrs])));
-    const cut = applyBatch(lowered, cutover);
-    const alias = { HostedZoneId: 'Z2FDTNDATAQYW2', DNSName: `${SITE_DISTRIBUTION}.`, EvaluateTargetHealth: false };
-    expect(website(cut).map(([key, rrs]) => [key, rrs.AliasTarget, rrs.TTL])).toEqual([
-      ['zachdavids.com A', alias, undefined],
-      ['zachdavids.com AAAA', alias, undefined],
-      ['www.zachdavids.com A', alias, undefined],
-      ['www.zachdavids.com AAAA', alias, undefined],
-    ]);
-    // The email, delegation, and certificate validation records are exactly as they were.
-    expect(others(cut)).toEqual(others(start));
-  });
-
-  it('undo each step exactly with its reverse batch, back to the zone as it was', () => {
-    const lowered = applyBatch(start, ttl);
-    expect(applyBatch(applyBatch(lowered, cutover), cutoverReverse)).toEqual(lowered);
-    expect(applyBatch(lowered, ttlReverse)).toEqual(start);
-  });
-
-  it('fail whole, changing nothing, on a zone that differs from the one they were written for', () => {
-    // The cutover without the TTL step first, and the TTL step after someone changed the Droplet's address.
-    expect(() => applyBatch(start, cutover)).toThrow('change 0 (DELETE zachdavids.com A): it does not match the zone');
-    const moved = zoneOf([{ ...ZONE_2026_10_15[0]!, ResourceRecords: [{ Value: '192.0.2.1' }] }, ...ZONE_2026_10_15.slice(1)]);
-    expect(() => applyBatch(moved, ttl)).toThrow('change 0 (DELETE zachdavids.com A): it does not match the zone');
-    // Applied twice, each refuses the second time.
-    expect(() => applyBatch(applyBatch(applyBatch(start, ttl), cutover), cutover)).toThrow('it does not match the zone');
   });
 });
 
