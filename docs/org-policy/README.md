@@ -23,12 +23,13 @@ Every other control is unchanged:
 
 ## Apply (management account; each step leaves access no looser than the final state)
 
-Run future changes under the management account's AWS Settings role session, never as root: sign in with `aws login --profile zachverse-management` and choose that role. Save each script to a file and run it with `sh` from the repository root: its `file://` paths are relative to the root, and its `exit` then ends the script rather than your shell. Each script stops at the first failed command (`set -eu`), refuses a root session, checks the live policy before changing it, and signs out of every profile when it ends, however it ends (ADR 0004, "Administrative access").
+Run future changes under the management account's AWS Settings role session, never as root: sign in with `aws login --profile zachverse-management` and choose that role. Save each script to a file and run it with `sh` from the repository root: its `file://` paths are relative to the root, and its `exit` then ends the script rather than your shell. Each script stops at the first failed command (`set -eu`), refuses a root session, checks the live policy before changing it, and signs out of every `aws login` profile when it ends, however it ends. It can't sign the browser out, so sign out of the AWS console session you chose afterwards (ADR 0004, "Administrative access").
 
 Since 2026-10-12 the live `p-ie47xwqg` holds `proposed/p-ie47xwqg.json`, so Apply's step 0 passes only after a Rollback. If AWS Settings has rewritten the policy, derive a new proposal from its new text rather than re-running Apply.
 
 ```sh
 set -eu
+trap 'aws logout --all' EXIT
 P="--profile zachverse-management"
 [ -f docs/org-policy/README.md ] || { echo "Run this from the repository root." >&2; exit 1; }
 for f in proposed/region-floor.json proposed/website-us-east-1.json proposed/p-ie47xwqg.json backup-2026-10-12/p-ie47xwqg.content.json; do
@@ -36,8 +37,7 @@ for f in proposed/region-floor.json proposed/website-us-east-1.json proposed/p-i
 done
 # Guard: stop unless this is a role session (never root) in the management account.
 ARN=$(aws sts get-caller-identity $P --query Arn --output text | tr -d '\r')
-case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN): sign in with the AWS Settings role." >&2; aws logout --all; exit 1 ;; esac
-trap 'aws logout --all' EXIT
+case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN): sign in with the AWS Settings role." >&2; exit 1 ;; esac
 # The policy text as AWS holds it; command substitution drops the trailing newline, and tr a CR.
 live() { aws organizations describe-policy $P --policy-id p-ie47xwqg --query Policy.Content --output text | tr -d '\r'; }
 # 0. The live policy must still match the backup; a failed read matches nothing.
@@ -61,7 +61,7 @@ echo "Applied: ZachverseRegionFloor $F, ZachverseWebsiteUsEast1 $W. Record both 
 
 ## Verify
 
-SCPs and RCPs do not apply to the management account itself, so the policies' effects are verified from the Website account. Run these there (`--profile default`, temporary `AccountFullAccessRole` credentials):
+SCPs and RCPs do not apply to the management account itself, so the policies' effects are verified from the Website account. Run these there, in a session of their own (`aws login --profile default`, temporary `AccountFullAccessRole` credentials), after checking that `aws sts get-caller-identity` returns `426499248998`, and end it with `aws logout --all` and a sign-out of the AWS console (ADR 0004, "Administrative access"):
 
 - `aws cloudformation list-stacks --region us-east-1`
 - `aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --region us-east-1` (returns `ParameterNotFound` before bootstrap; in Git Bash, prefix it with `MSYS_NO_PATHCONV=1`, or Git Bash turns the name into a Windows path)
@@ -73,10 +73,10 @@ Then, from the management account, list the attachments and compare them with `a
 
 ```sh
 set -eu
+trap 'aws logout --all' EXIT
 P="--profile zachverse-management"
 ARN=$(aws sts get-caller-identity $P --query Arn --output text | tr -d '\r')
-case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN)." >&2; aws logout --all; exit 1 ;; esac
-trap 'aws logout --all' EXIT
+case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN)." >&2; exit 1 ;; esac
 for target in r-58a9 426499248998 796429457615; do
   for type in SERVICE_CONTROL_POLICY RESOURCE_CONTROL_POLICY; do
     echo "$target $type: $(aws organizations list-policies-for-target $P --target-id "$target" --filter "$type" --query 'Policies[].Name' --output text)"
@@ -90,6 +90,7 @@ The IDs are those of the 2026-10-12 apply; after a later Apply, use the IDs it p
 
 ```sh
 set -eu
+trap 'aws logout --all' EXIT
 P="--profile zachverse-management"
 F=p-xwdm4cce W=p-1mpgzmjr
 [ -f docs/org-policy/README.md ] || { echo "Run this from the repository root." >&2; exit 1; }
@@ -98,8 +99,7 @@ for f in proposed/p-ie47xwqg.json backup-2026-10-12/p-ie47xwqg.content.json; do
 done
 # Guard: stop unless this is a role session (never root) in the management account.
 ARN=$(aws sts get-caller-identity $P --query Arn --output text | tr -d '\r')
-case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN): sign in with the AWS Settings role." >&2; aws logout --all; exit 1 ;; esac
-trap 'aws logout --all' EXIT
+case "$ARN" in arn:aws:sts::969788248923:assumed-role/*) ;; *) echo "Not a management-account role session ($ARN): sign in with the AWS Settings role." >&2; exit 1 ;; esac
 live() { aws organizations describe-policy $P --policy-id p-ie47xwqg --query Policy.Content --output text | tr -d '\r'; }
 [ "$(live)" = "$(cat docs/org-policy/proposed/p-ie47xwqg.json)" ] || { echo "p-ie47xwqg is not the applied text: stop and review." >&2; exit 1; }
 # Restoring the original text first reinstates every original deny before anything is removed.

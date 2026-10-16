@@ -13,8 +13,8 @@ describe('cdk.json', () => {
 
   it('runs no build step, so a signed-in CLI loads only itself and the app', () => {
     // ADR 0004's runbook typechecks and runs the tests before the administrator signs in, so no test code runs beside
-    // the session. The CLI refuses a build key in ~/.cdk.json, so only --build or CDK_BUILD could add one, and the
-    // runbook rules both out.
+    // the session. The CLI refuses a build key in ~/.cdk.json, so only --build or a CDK variable such as CDK_BUILD or
+    // CDKBUILD could add one, and the runbook rules both out.
     expect(cdkJson).not.toHaveProperty('build');
   });
 

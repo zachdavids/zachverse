@@ -35,7 +35,7 @@ npm ci
 npm run typecheck
 npm test             # synthesizes the stacks and runs the guardrail checks
 npm run test:coverage  # the same, with the 100% coverage gate CI enforces
-npm run cdk -- diff  # an administrative step: ADR 0004's runbook runs the checks above first, then signs in
+npm run cdk -- diff  # an administrative step: ADR 0004's runbook runs the tests, then npm ci again, then signs in
 ```
 
 The app always synthesizes both stacks, `ZachverseIdentity` and `ZachverseSite`. `certificateArn` in `infra/lib/config.ts` names the site certificate (ADR 0002), and an empty or malformed one fails synthesis. `pricingPlan` there turns on the Free flat-rate plan, as production does since milestone 7: the site stack then also creates the distribution's web ACL and the plan's subscription (ADR 0007). Every synthesis also runs the template guardrails as a CDK validation plugin, and `bin/zachverse.ts` makes any violation fail the synthesis, so every CLI command that synthesizes the app fails on one, even with `--ignore-errors`. Changed code, or an assembly synthesized earlier and passed with `--app` (or `CDK_APP`), still gets past them (ADR 0003, "Limits"). The CDK bootstrap (`npm run bootstrap` in `infra/`) changes the account and was already run; ADR 0004's runbook covers it.

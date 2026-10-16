@@ -1,7 +1,7 @@
 # ADR 0003: Site distribution design
 
 - Status: Accepted and deployed 2026-10-14 (UTC)
-- Date: 2026-10-11, revised 2026-10-12 after review, 2026-10-13 for the identity stack (ADR 0004), the certificate, and the guardrails in every synthesis, 2026-10-14 after the first deployment, and 2026-10-15 for the release records and caching (milestone 6, ADR 0006) and for the web ACL and the Free plan (milestone 7, ADR 0007)
+- Date: 2026-10-11, revised 2026-10-12 after review, 2026-10-13 for the identity stack (ADR 0004), the certificate, and the guardrails in every synthesis, 2026-10-14 after the first deployment, and 2026-10-15 for the release records and caching (milestone 6, ADR 0006), for the web ACL and the Free plan (milestone 7, ADR 0007), and after the Phase 1 review
 
 ## Decision
 
@@ -39,7 +39,7 @@ Deployed from `b569384` by ADR 0004's runbook (step 8). Nothing is uploaded yet 
 
 The template rules are in `infra/lib/guardrails/checks.ts`, summarized here:
 
-- **Prohibited resources:** no hosted zones, Route 53 records or domains, Amplify domains or Cloud Map resources (both write DNS themselves), Cognito resources (an identity pool could exchange GitHub tokens for credentials), custom resources, Lambda functions, CloudFormation-managed certificates, or StackSets.
+- **Prohibited resources:** no `AWS::Route53::` or `AWS::Route53Domains::` resources (hosted zones, records, health checks, DNSSEC, and the rest), Amplify domains or Cloud Map resources (both write DNS themselves), Cognito resources (an identity pool could exchange GitHub tokens for credentials), custom resources, Lambda functions, CloudFormation-managed certificates, or StackSets.
 - **Template indirection:** no nested stacks, `AWS::ServiceCatalog::` resources, or other `AWS::CloudFormation::` types; no `Transform` or `Fn::Transform`; and no resource types outside `AWS::`.
 - **No DNS write access:** no IAM permission that can write Route 53 or Route 53 Domains, wildcards included. The check fails closed: a grant it cannot read, such as `NotAction`, a computed action or document, a managed policy or group from outside the stack, or an Identity Center resource, fails too. It can allow CNAME CREATE/UPSERT on the exact ACM validation names in this zone, through the literal `route53:ChangeResourceRecordSets` action, but no stack gets that allowance: validation is out of band (ADR 0002).
 - **Retention:** every resource retained (`DeletionPolicy` `Retain` or `RetainExceptOnCreate`, and `UpdateReplacePolicy` `Retain`) except `AWS::CDK::Metadata`.

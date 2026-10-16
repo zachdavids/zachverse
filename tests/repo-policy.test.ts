@@ -1343,8 +1343,8 @@ describe('Release and smoke-test scripts', () => {
       'scripts/smoke-lib.ts',
       'scripts/smoke.ts',
     ]);
-    // What tsc cannot follow: require, createRequire, and an import whose specifier is computed.
-    const unfollowed = /\brequire\s*\(|\bcreateRequire\b|\bimport\s*\(\s*(?!['"])/;
+    // What tsc might not follow: require, createRequire, and a dynamic import whose argument is not one string literal.
+    const unfollowed = /\brequire\s*\(|\bcreateRequire\b|\bimport\s*\((?!\s*(['"])[^'"\n]*\1\s*\))/;
     expect(own.filter((file) => unfollowed.test(read(file)))).toEqual([]);
   });
 
