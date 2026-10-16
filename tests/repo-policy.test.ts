@@ -9,6 +9,7 @@ import { resolveConfig } from 'vite';
 import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { ASSETS, RECORDS } from '../scripts/release-lib.ts';
+import { SITE_ORIGIN } from '../scripts/site-origin.ts';
 import { SMOKE_REQUEST_BUDGET } from '../scripts/smoke-lib.ts';
 import { site } from '../src/content.ts';
 import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
@@ -1302,7 +1303,9 @@ describe('Release and smoke-test scripts', () => {
   });
 
   it('check the site at the hostnames the distribution serves', () => {
-    // The smoke test and the browser check reach site.origin; infra/lib/config.ts gives the distribution its aliases.
+    // The browser check reaches site.origin, and the smoke test SITE_ORIGIN, its copy for the scripts that run with the
+    // deploy role; infra/lib/config.ts gives the distribution its aliases.
+    expect(SITE_ORIGIN).toBe(site.origin);
     const host = new URL(site.origin).host;
     const config = read('infra/lib/config.ts');
     expect(config).toContain(`domainName: '${host}',`);
@@ -1335,13 +1338,13 @@ describe('Release and smoke-test scripts', () => {
       'scripts/release-github.ts',
       'scripts/release-lib.ts',
       'scripts/release.ts',
+      'scripts/site-origin.ts',
       'scripts/smoke-http.ts',
       'scripts/smoke-lib.ts',
       'scripts/smoke.ts',
-      'src/content.ts',
     ]);
-    // What tsc cannot follow: require, createRequire, and an import whose specifier is computed.
-    const unfollowed = /\brequire\s*\(|\bcreateRequire\b|\bimport\s*\(\s*(?!['"])/;
+    // What tsc might not follow: require, createRequire, and a dynamic import whose argument is not one string literal.
+    const unfollowed = /\brequire\s*\(|\bcreateRequire\b|\bimport\s*\((?!\s*(['"])[^'"\n]*\1\s*\))/;
     expect(own.filter((file) => unfollowed.test(read(file)))).toEqual([]);
   });
 
