@@ -43,7 +43,7 @@ The plan's milestone 9 retires the Droplet after 7 to 14 days of successful oper
 
 ## Runbook
 
-The owner does the DigitalOcean and Workspace steps. An administrator does the AWS checks, in Git Bash with `--profile default`. They sign in only for a step's checks, first check that `aws sts get-caller-identity --profile default` returns `426499248998`, and end the session with `aws logout --all` (ADR 0004, "Administrative access"). The checks only read. This change's merge (step 5), like every push to `main`, publishes a release through the Deploy workflow (ADR 0006).
+The owner does the DigitalOcean and Workspace steps. An administrator does the AWS checks, in Git Bash with `--profile default`. They sign in only for a step's checks, first check that `aws sts get-caller-identity --profile default` returns `426499248998`, and end the session with `aws logout --all` and a sign-out of the AWS console (ADR 0004, "Administrative access"). The checks only read. This change's merge (step 5), like every push to `main`, publishes a release through the Deploy workflow (ADR 0006).
 
 Before the first export, create the folder with `mkdir -p ~/droplet-retirement`, check that `ls -A ~/droplet-retirement` prints nothing, and run `set -o noclobber` in each session, so no export overwrites another. Give `nslookup` names with a final dot, as below. Without one, Windows `nslookup` first tries the machine's DNS suffix, and DigitalOcean's name servers answer for some of those, which can hide a zone that still exists.
 
