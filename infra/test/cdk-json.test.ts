@@ -11,9 +11,11 @@ describe('cdk.json', () => {
     expect(cdkJson.app).toBe('node --import tsx bin/zachverse.ts');
   });
 
-  it('typechecks and runs the tests before every synth, diff, and deploy', () => {
-    // tsx does not typecheck. The output goes to stderr so `cdk synth` still prints only the template.
-    expect(cdkJson.build).toBe('npm run typecheck 1>&2 && npm test 1>&2');
+  it('runs no build step, so a signed-in CLI loads only itself and the app', () => {
+    // ADR 0004's runbook typechecks and runs the tests before the administrator signs in, so no test code runs beside
+    // the session. The CLI refuses a build key in ~/.cdk.json, so only --build or a CDK variable such as CDK_BUILD or
+    // CDKBUILD could add one, and the runbook rules both out.
+    expect(cdkJson).not.toHaveProperty('build');
   });
 
   it('keeps version reporting on', () => {
