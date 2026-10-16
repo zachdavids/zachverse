@@ -1,7 +1,7 @@
 # ADR 0007: Web ACL and the Free flat-rate plan
 
 - Status: Accepted (milestone 7), and deployed on 2026-10-15 with the runbook below, after milestone 6's first release had passed its checks. Its steps 6 to 9 passed ("Deployed").
-- Date: 2026-10-15, revised the same day after review
+- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
 
 ## Context
 
@@ -38,7 +38,7 @@ Attaching the hosted zone is a pricing association: the plan pays the zone's mon
   - The Common Rule Set blocks requests without a `User-Agent`; the smoke test sends one (`scripts/smoke-http.ts`, pinned by its tests), and Chromium sends its own.
   - Neither check's requests match the other rules' patterns.
   - The smoke test sends all its requests from one runner address: seven fixed ones, then each URL at the apex once (the home page, every file, and every other address a page links to), 15 for the placeholder. `check:dist` fails a build that would need more than 500, half the rate limit, since WAF counts approximately (`SMOKE_REQUEST_BUDGET` in `scripts/smoke-lib.ts`, which `tests/repo-policy.test.ts` keeps at most half of `RATE_LIMIT_PER_IP`).
-  - A visitor's browser sends far fewer requests than the limit: it keeps the hashed assets for a year (ADR 0006).
+  - A visitor's browser sends far fewer requests than the limit while pages need few: a first visit to the placeholder takes four requests, so the limit allows about 250 first visits per address in 5 minutes, and the browser keeps the hashed assets for a year (ADR 0006).
   - The IP reputation group judges the address each request comes from, and for the checks that is a GitHub-hosted runner's, which the project doesn't control. A runner on a listed address fails its run with 403s, and a re-run gets another runner ("If a step fails").
 
 **Paid tiers take a reviewed code change.** `PricingPlanConfig.tier` admits only `FREE`. CloudFormation activates a Free subscription at once, but leaves a paid one pending until someone approves it outside CloudFormation. It also refuses to change the tier of an existing subscription.
@@ -60,11 +60,27 @@ That is the order AWS documents (web ACL → distribution → subscription). Not
 
 From step 1 to step 4, AWS WAF bills the web ACL, its rules, and its requests at pay-as-you-go rates, and Route 53 bills the zone, so each step follows the one before it promptly.
 
+**Monitoring.** The account can't alarm on the site ("Limits"), so from milestone 8's cutover on, the owner runs an external uptime monitor, outside AWS and this repository. Every 5 minutes, from one or two locations, it checks:
+- that `https://zachdavids.com/` returns 200 with `zachverse-release` in the body;
+- that `https://www.zachdavids.com/` returns a 301 to `https://zachdavids.com/`, without following it, as far as the service can check: some services check only the status code;
+- both URLs over IPv6 too, if the service can;
+- the certificate's expiry, and the domain's, if the service offers them.
+
+It alerts an address outside zachdavids.com, since mail for zachdavids.com depends on the same zone as the site. Its requests pass through the web ACL like a visitor's, so it must send a `User-Agent`, and in its first hour the owner checks the web ACL's sampled requests for its addresses, in case the IP reputation group lists them. Its checks also count against the plan's allowance: about 17,000 requests a month per location, twice that with the IPv6 checks. Its history is what shows the site has run cleanly before the DigitalOcean Droplet is retired (milestone 9).
+
+If it alerts, start from the error it reports, signed in only for the checks (ADR 0004, "Administrative access"):
+- **No answer, or a page without `zachverse-release`:** the delegation (`infra/dns/README.md`), whether the domain is on hold (`clientHold` or `serverHold`), and the zone's website records.
+- **A certificate error:** the certificate's status in ACM.
+- **A 403:** the web ACL. Find the rule as for a blocked check ("If a step fails", step 7), within 3 hours, while WAF keeps sampled requests.
+- **A 5xx:** CloudFront's error-rate metrics.
+
+To check the distribution whatever DNS says, run the Deploy workflow on `main` by hand (runbook step 7).
+
 ## Runbook
 
 Run this after milestone 6's first release has passed its checks, as an administrator with ADR 0004's runbook. Until #7 merges, deploy the site stack only from its branch or a branch built on it: once the plan is on, a deploy of `main`'s template, which has no `pricingPlan`, fails at the distribution (see "Retention").
 
-1. **Preflight:** follow ADR 0004's steps 1 and 2: the account is `426499248998`, and no `CDK` variable or `~/.cdk.json` is set.
+1. **Preflight:** follow ADR 0004's steps before step 1, then its steps 1 and 2: the typecheck and the tests pass in `infra/` with no session live, the account is `426499248998`, and no `CDK` variable or `~/.cdk.json` is set.
 2. **Export what the deploy could change,** to compare later:
    - the zone: `aws route53 list-resource-record-sets --hosted-zone-id Z03492543O0YEY0RDZZ0J`;
    - the distribution: `aws cloudfront get-distribution-config --id E3R8NEUOW8Z97U`, whose `DistributionConfig` is what matters (its `ETag` changes with every update);
@@ -171,9 +187,10 @@ An administrator ran the runbook from #7's branch, with the owner's approval:
 ## Limits
 
 - **Usage allowances:** the Free tier's 1 million requests and 100 GB a month are not hard limits. AWS notifies at 50%, 80%, and 100%, and may slow delivery after sustained excess. Phase 2's 3D assets may need a higher tier.
-- **Rule group updates:** AWS updates its managed rule groups, and the web ACL uses their default versions, so a new rule could start blocking legitimate requests. The smoke test and browser check would see it only at the next release.
+- **Rule group updates:** AWS updates its managed rule groups, and the web ACL uses their default versions, so a new rule could start blocking legitimate requests. The smoke test and browser check would see it only at the next release, and the owner's monitor ("Monitoring") only if it blocks the monitor's own requests.
 - **Seeing blocks:** without request logs, a block shows only in sampled requests, which WAF keeps for 3 hours, and in CloudWatch metrics.
 - **The checks' addresses:** the IP reputation group can list a GitHub-hosted runner's address, and so fail that run ("If a step fails").
-- **The rate limit:** it counts per IP address, so visitors behind one shared address share it. The smoke test's requests count too: `check:dist` keeps each build under half the limit, and a release with more files than that needs a higher limit or a smoke test that paces itself.
+- **The rate limit:** it counts per IP address, so visitors behind one shared address share it. The smoke test's requests count too: `check:dist` keeps each build under half the limit, and a release with more files than that needs a higher limit or a smoke test that paces itself, though the release jobs' time limits bind first (ADR 0006, "Limits"). The live browser check's requests count as well, with no budget: three page loads with an empty cache, from one runner. The limit was sized for the placeholder; Phase 2 re-derives it from its pages' request counts (`docs/phase-2-inputs.md`).
 - **Hosted zone records:** the zone must stay within the Free tier's 50 records while it is attached.
+- **No alerting:** nothing in AWS or this repository watches the live site between releases. The Website account's SCP denies CloudWatch alarm writes, SNS, EventBridge, and Synthetics in us-east-1, where CloudFront's and the web ACL's metrics live, and an alarm can't watch another Region's metrics. The repository's workflows run only on pushes, pull requests, and by hand. The release checks connect to the distribution directly, whatever DNS says. What still reaches the owner is email: AWS Health notices, ACM's renewal warnings, the usage notices above, the payer budget's alerts, and a failed Deploy run. Any of it sent to a zachdavids.com address depends on the same zone as the site. From milestone 8's cutover on, the owner's monitor ("Monitoring") is the only check that goes through public DNS.
 - **What the guardrails can't check:** they read templates. They can't see another distribution's use of the viewer-request function, a web ACL attached outside CloudFormation, Shield Advanced, the account's plan, or usage that rules out a tier. Runbook step 3 checks the first three and compares the usage with the allowances; the owner confirmed the account's plan, which no API reports. AWS judges usage by a rule it doesn't publish, and refuses an ineligible subscription at deploy time, which rolls the update back ("If a step fails").

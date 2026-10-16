@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { site } from '../src/content.ts';
+import { SITE_ORIGIN } from './site-origin.ts';
 import { request } from './smoke-http.ts';
 import { retrying, smokeTest } from './smoke-lib.ts';
 
@@ -16,7 +16,7 @@ function required(name: string): string {
 async function main(args: string[]): Promise<string[]> {
   if (args.length !== 1) throw new Error('Usage: node scripts/smoke.ts <dir>');
   const target = {
-    origin: site.origin,
+    origin: SITE_ORIGIN,
     cloudfront: required('CLOUDFRONT_DOMAIN'),
     bucket: required('BUCKET'),
     probe: `smoke-test-${randomUUID()}`,

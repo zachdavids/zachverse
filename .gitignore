@@ -153,3 +153,4 @@ dist-ssr/
 cdk.out/
 
 CLAUDE.md
+.claude/worktrees/
