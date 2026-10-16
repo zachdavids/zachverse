@@ -1,7 +1,7 @@
 # ADR 0006: Releases, smoke tests, and rollback
 
 - Status: Accepted (milestone 6), merged on 2026-10-15 as `d6503b1`, whose Deploy run published and verified the first release ("First release"). The restore rehearsal passed the same day ("Restore rehearsal").
-- Date: 2026-10-15, revised the same day after the Phase 1 review
+- Date: 2026-10-15, revised the same day after the Phase 1 review and for milestone 9
 
 ## Decision
 
