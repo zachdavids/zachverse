@@ -1,8 +1,9 @@
 // Validates Route 53 change batches (the JSON passed to
 // `aws route53 change-resource-record-sets --change-batch`) kept in infra/dns/.
 // Website batches may only touch website routing and ACM validation records,
-// may never delete a validation record, and may give the site certificate's
-// validation records no value but the one committed.
+// may never delete a validation record, may give the site certificate's
+// validation records no value but the one committed, and may never give a
+// website A or AAAA record the retired DigitalOcean Droplet's address.
 import { readdirSync, readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { ACM_VALIDATION_NAME } from '../../lib/guardrails/checks';
@@ -29,6 +30,34 @@ const NOT_SIMPLE = 'is not a field of a simple record, the only kind these batch
 const CLOUDFRONT_ALIAS_ZONE = 'Z2FDTNDATAQYW2';
 
 const normalize = (name: string) => name.toLowerCase().replace(/\.$/, '');
+
+/**
+ * An address in one spelling: without a final dot, which comparable() also drops, and IPv6 compressed and in lower
+ * case, as the URL parser writes it (an IPv4-mapped address in hex).
+ */
+function canonicalAddress(value: string): string {
+  const address = value.trim().toLowerCase().replace(/\.$/, '');
+  if (!address.includes(':')) return address;
+  try {
+    return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  } catch {
+    // Not an IPv6 address at all, so not a retired one.
+    return address;
+  }
+}
+
+/**
+ * The DigitalOcean Droplet's addresses, which served the website until milestone 8 and were retired in milestone 9
+ * (ADR 0009), with the IPv4 one's IPv4-mapped form. Once the Droplet is destroyed, DigitalOcean can give them to another
+ * customer, who would then receive the website's traffic. So no committed batch may give a website A or AAAA record one
+ * of them again. The check compares values: a CNAME to a name that resolves to them gets past it (ADR 0009, "Limits").
+ */
+const RETIRED_ADDRESSES = new Set(['159.203.37.93', '2604:a880:cad:d0::46:6001', '::ffff:159.203.37.93'].map(canonicalAddress));
+
+/** Whether any of a record set's values is a retired address. */
+const atRetiredAddress = (rrs: Json) =>
+  Array.isArray(rrs?.ResourceRecords) &&
+  rrs.ResourceRecords.some((record: Json) => typeof record?.Value === 'string' && RETIRED_ADDRESSES.has(canonicalAddress(record.Value)));
 
 /**
  * The site certificate's validation records, as its committed batch creates them: each name with its value, both
@@ -107,6 +136,14 @@ export function dnsBatchViolations(batch: Json): string[] {
       records.every((record) => typeof record?.Value === 'string' && Object.keys(record).length === 1);
     if (alias ? rrs.TTL !== undefined || records !== undefined : typeof rrs.TTL !== 'number' || !valued) {
       out.push(`${where}: a website record is either an alias, with no TTL or values, or a TTL with a list of string values`);
+    }
+    // A DELETE of such a record still passes, and needs no reverse (batchPairingViolations): it removes a stale pointer.
+    if (change?.Action !== 'DELETE' && Array.isArray(records)) {
+      for (const record of records) {
+        if (typeof record?.Value === 'string' && RETIRED_ADDRESSES.has(canonicalAddress(record.Value))) {
+          out.push(`${where}: ${record.Value} is the retired DigitalOcean Droplet's address (ADR 0009), which DigitalOcean may have given to someone else`);
+        }
+      }
     }
   });
   return out;
@@ -197,11 +234,16 @@ const isWebsiteChange = (change: Json) => WEBSITE_RECORDS.has(normalize(String(c
 // A change, and the change that undoes it, as Route 53 compares record sets.
 const asNamed = (change: Json) => `${change?.Action} ${comparable(change?.ResourceRecordSet ?? {})}`;
 const asUndone = (change: Json) => `${change.Action === 'CREATE' ? 'DELETE' : 'CREATE'} ${comparable(change.ResourceRecordSet)}`;
+// A website change a reverse batch must undo: any but the DELETE of a record set at a retired address, which no batch
+// may create again, so a reverse that undoes the rest leaves that name without it (ADR 0009).
+const needsUndo = (change: Json) =>
+  isWebsiteChange(change) && !(change?.Action === 'DELETE' && atRetiredAddress(change?.ResourceRecordSet));
 
 /**
  * Pairs every batch under `dir` that changes a website routing record with its reverse batch, by name: X.json with
- * X.reverse.json, so every batch is a top-level file named with lower-case letters, digits, '.', and '-' only. A reverse batch must undo exactly its
- * forward batch's website changes, each CREATE deleted and each DELETE created again, and change nothing else. Only
+ * X.reverse.json, so every batch is a top-level file named with lower-case letters, digits, '.', and '-' only. A
+ * reverse batch must undo exactly its forward batch's website changes, each CREATE deleted and each DELETE created
+ * again, except the DELETE of a record at a retired address, which no batch may create, and change nothing else. Only
  * exact DELETE and CREATE make that possible, so neither uses UPSERT at a website name. A batch that changes only
  * validation records needs no reverse. Unreadable files are left to batchDirectoryViolations.
  */
@@ -230,7 +272,7 @@ export function batchPairingViolations(dir: string): string[] {
       const forward = batches.get(forwardFile);
       if (forward === undefined) {
         out.push(`${file}: a reverse batch needs its forward batch, ${forwardFile}`);
-      } else if (JSON.stringify(forward.filter(isWebsiteChange).map(asUndone).sort()) !== JSON.stringify(changes.map(asNamed).sort())) {
+      } else if (JSON.stringify(forward.filter(needsUndo).map(asUndone).sort()) !== JSON.stringify(changes.map(asNamed).sort())) {
         out.push(`${file}: must undo exactly the website changes in ${forwardFile}, and change nothing else`);
       } else {
         // Route 53 applies a batch change by change, so the pair must also apply in its order, to the record sets the
@@ -243,7 +285,7 @@ export function batchPairingViolations(dir: string): string[] {
           out.push(`${file}: with ${forwardFile}, does not apply in its order: ${(error as Error).message}`);
         }
       }
-    } else if (website.length > 0 && !batches.has(file.replace(/\.json$/, '.reverse.json'))) {
+    } else if (changes.some(needsUndo) && !batches.has(file.replace(/\.json$/, '.reverse.json'))) {
       out.push(`${file}: a website routing batch needs a reverse batch, ${file.replace(/\.json$/, '.reverse.json')}`);
     }
   }
