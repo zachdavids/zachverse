@@ -1,7 +1,7 @@
 # ADR 0008: Website DNS cutover
 
-- Status: Accepted (milestone 8). Prepared, not applied: the batches wait for the preconditions below.
-- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
+- Status: Accepted (milestone 8), and applied on 2026-10-18 with the runbook below ("Cutover").
+- Date: 2026-10-15, revised the same day after review and after the Phase 1 review, and on 2026-10-18 for the cutover
 
 ## Context
 
@@ -64,7 +64,7 @@ An administrator applies the batches, in the Website account with `--profile def
 5. **No registrar operation is pending, and the registration is in order:** `aws route53domains list-operations --region us-east-1 --query "Operations[?DomainName=='zachdavids.com' && Status!='SUCCESSFUL' && Status!='FAILED']"` prints `[]`, so the transfer to Route 53 Domains is over (`infra/dns/README.md`). An operation in `ERROR` may still resume, so it counts; settle it with `aws route53domains get-operation-detail --region us-east-1 --operation-id <OperationId>`, or an AWS Support case. The command sees only this account's operations, where the domain's are. Once the transfer is over, check the registration too:
    - `aws route53domains get-contact-reachability-status --region us-east-1 --domain-name zachdavids.com --query status --output text` prints `DONE`. `PENDING` means the registrant hasn't confirmed their email address, which AWS asks for soon after a transfer is requested and suspends the domain without: the owner resends the email from the Route 53 console (Domains > Requests) and follows its link, and the cutover waits. `EXPIRED` means the domain is suspended or about to be: treat it as an incident.
    - `aws route53domains get-domain-detail --region us-east-1 --domain-name zachdavids.com --query "{Status:StatusList,AutoRenew:AutoRenew,Expires:ExpirationDate,Privacy:[AdminPrivacy,RegistrantPrivacy,TechPrivacy,BillingPrivacy]}"` shows neither `clientHold` nor `serverHold` in the status list. Keep the `--query`, so the contacts' details aren't printed. Record the status list, auto-renew, the privacy flags, and the expiry date, about 2028-06-10, in `docs/progress.md`.
-   - If the status list lacks `clientTransferProhibited`, turn the transfer lock back on, which the transfer left off: `aws route53domains enable-domain-transfer-lock --region us-east-1 --domain-name zachdavids.com` (applies). It starts a registrar operation, so check this precondition again once that operation is `SUCCESSFUL`. Auto-renew and privacy came with the transfer request, so they need nothing.
+   - If the status list lacks `clientTransferProhibited`, turn the transfer lock back on, which the transfer left off: `aws route53domains enable-domain-transfer-lock --region us-east-1 --domain-name zachdavids.com` (applies). It starts a registrar operation, so check this precondition again once that operation is `SUCCESSFUL`. Auto-renew came with the transfer request. Privacy, which the request also asked for, came through off and was turned on at the cutover ("Cutover").
 6. **Delegation matches:** `nslookup -norecurse -type=NS zachdavids.com. 192.5.6.30` (`a.gtld-servers.net`) lists exactly `ns-1989.awsdns-56.co.uk`, `ns-163.awsdns-20.com`, `ns-980.awsdns-58.net`, and `ns-1399.awsdns-46.org`.
 7. **`www` is no mail domain:** `www.zachdavids.com` is neither a domain nor an alias domain in Google Workspace ("Decision", `www`). The owner confirmed it on 2026-10-15; if Workspace's domains change, check again in its Admin console (Account > Domains > Manage domains).
 8. **The Droplet can renew its certificate until the cutover:** its renewal method, `authenticator` in its `/etc/letsencrypt/renewal/` file (or `sudo certbot renew --dry-run`), is not `dns-digitalocean`. If it is, renewal has failed since the delegation moved to Route 53, and the Droplet's certificate expires on 2026-11-18 whatever the cutover does: switch it to `nginx` or `webroot` while DNS still points at the Droplet.
@@ -124,6 +124,31 @@ Then, from the repository root:
 5. **If the cutover is abandoned,** export to `~/dns-cutover/zone-r2.json`, apply `2026-10-15-website-ttl.reverse.json` (applies) to restore the records' TTL, export to `~/dns-cutover/zone-r3.json`, and diff the two: only the three TTLs differ.
 
 Never restore a whole-zone export, and don't run the Deploy workflow as part of a rollback: it would publish again and check the distribution, not the Droplet. Resolvers that cached an alias answer keep it for up to its TTL, which an alias takes from CloudFront's records (60 seconds).
+
+## Cutover (2026-10-18)
+
+An administrator ran the runbook from #8's branch at `0b685c1`, with the owner's approval. The administrator's session ended with `aws logout --all` at 08:10 UTC, after step 2's diff, since Verify needs no AWS access until the monitor's first-hour look at the web ACL's sampled requests. A read-only session made that look at 21:48 UTC and ended the same way. An earlier read, at 21:08 UTC and before the monitor's first run, was made in the session that applied the DMARC change (`docs/progress.md`, "Email records"), which gave that session a second step, against ADR 0004's one step per session. The owner confirmed the AWS console sign-out at 21:53 UTC, after the last session. The zone exports are in `~/dns-cutover/`, outside the repository.
+- **Preconditions:** all passed except 8, which was not checked.
+  - The transfer completed at 05:17 UTC, by the registry's record, with Amazon Registrar.
+  - Precondition 3: the newest release was `fdb81f1`, published and verified by Deploy run 38852599400.
+  - Precondition 5: no registrar operation was pending, the registrant email was `DONE`, there was no hold, auto-renew was on, and the domain expires 2028-06-10. The transfer had left the lock off, so the administrator turned it on (operation `373891c3-092d-4411-8257-79a0c0211c80`, `SUCCESSFUL`). It had also left privacy off for all four contacts, so the registrar's public record, which lists only the registrant and technical contacts, showed their names, addresses, phone numbers, and email. With the owner's approval, the administrator turned privacy on for all four (`7564460f-eda1-478c-86f6-883cb241a02d`, `SUCCESSFUL`), after which the public record showed the privacy service's details. Precondition 5 then passed again, with `clientTransferProhibited` the only status.
+  - Precondition 8: not checked, since nobody read the Droplet's `authenticator`. It could not affect the cutover: certbot renews 30 days before expiry by default, from 2026-10-19 01:32 UTC for this certificate, so no renewal was due before step 2. The method still matters. With `dns-digitalocean`, the Rollback paragraph's `sudo certbot renew` fails, since the zone stays on Route 53, and milestone 9 would have the plugin's DigitalOcean token to revoke. Read it from the renewal file before either; `--dry-run` now fails whatever the method, since challenges reach CloudFront.
+- **Step 1:** `zone-0.json` held the three website records exactly as in "Context". Route 53 change `C100673219WVS8KXZFJA4`, submitted 07:26:35 UTC, lowered their TTLs from 1800 to 300, and the diff showed nothing else.
+- **Step 2,** from 08:08 UTC:
+  - Preconditions 3, 5, and 6 passed again. Over IPv4 and IPv6, the distribution served `fdb81f1` and both 301s.
+  - `zone-1b.json` equalled `zone-1.json`, with 11 record sets.
+  - The Droplet's certificate: `notAfter` 2026-11-18 01:32:12 UTC for both names, over IPv4 and IPv6. That ends the rollback window ("Limits").
+  - Route 53 change `C00762141APGCY8WB9ATF`, submitted 08:09:05 UTC. The diff showed exactly the three Droplet records gone and the four aliases added, and every other record unchanged; the zone has 12 record sets.
+- **Verify:**
+  - The zone's name server, `8.8.8.8`, and `1.1.1.1` returned only CloudFront's addresses for both names, at TTL 60, at 08:09:48 UTC and again at 08:14:41 UTC.
+  - Through real DNS, over IPv4 and IPv6: the home page returned 200 from CloudFront with release `fdb81f1`; `http://` returned a 301 to `https://zachdavids.com/`; `www` returned a 301 to the apex, path and query kept; a missing path returned the 404 page with status 404; both names presented the site certificate (Amazon RSA 2048 M04, valid until 2027-04-28).
+  - Deploy run 39110421584, started by hand, passed all four jobs.
+  - Email: step 2's diff left the MX, SPF, DKIM, and DMARC records unchanged, and `www` has no MX. The owner then sent a message from an outside account to the Workspace mailbox and replied from it. Both arrived, at 20:05 and 20:07 UTC, with SPF, DKIM, and DMARC passing in each; the reply's checks were of zachdavids.com's own records. Later that day, at 21:07 UTC, the DMARC policy moved from `p=none` to `p=reject`, a separate change the owner approved (`docs/progress.md`, "Email records").
+  - The monitor (ADR 0007, "Monitoring"): the owner set up Grafana Cloud's Synthetic Monitoring on a new free account, which Grafana starts on a 14-day trial before it moves to the Free plan, with four HTTP checks every 5 minutes from one public probe, in North Virginia.
+    - Two check the apex, over IPv4 and over IPv6, and pass only on a 200 with `zachverse-release` in the body.
+    - Two check `www` the same two ways, and pass only on a 301, not followed, whose `Location` is `https://zachdavids.com/`.
+    - Each alerts the owner, at an address outside zachdavids.com, after 2 failed runs in 15 minutes, and a test from the contact point reached the owner. The apex IPv4 check also alerts when the certificate has less than 30 days left. There is no domain-expiry check; auto-renew covers that (precondition 5).
+    - The owner reported all four checks passing at 21:48 UTC. In the read-only session, the web ACL's sampled requests held 12 of its requests, from all four checks and over both IP versions, all allowed: the first at 21:29 UTC, while the checks were still being set up, and the last at 21:47 UTC.
 
 ## Limits
 
