@@ -1,0 +1,54 @@
+{
+  "Comment": "Milestone 8, reverse of step 2: point the website names back at the Droplet, at TTL 300. If the cutover is abandoned, then 2026-10-15-website-ttl.reverse.json.",
+  "Changes": [
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "A",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "www.zachdavids.com.",
+        "Type": "A",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "www.zachdavids.com.",
+        "Type": "AAAA",
+        "AliasTarget": { "HostedZoneId": "Z2FDTNDATAQYW2", "DNSName": "d15987dzppdzr.cloudfront.net.", "EvaluateTargetHealth": false }
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": { "Name": "zachdavids.com.", "Type": "A", "TTL": 300, "ResourceRecords": [{ "Value": "159.203.37.93" }] }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "TTL": 300,
+        "ResourceRecords": [{ "Value": "2604:a880:cad:d0::46:6001" }]
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": { "Name": "www.zachdavids.com.", "Type": "CNAME", "TTL": 300, "ResourceRecords": [{ "Value": "zachdavids.com" }] }
+    }
+  ]
+}

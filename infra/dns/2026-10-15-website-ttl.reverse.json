@@ -1,0 +1,39 @@
+{
+  "Comment": "Milestone 8, reverse of step 1: put the Droplet website records' TTL back to 1800 seconds. After step 2, apply 2026-10-15-website-cutover.reverse.json first.",
+  "Changes": [
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": { "Name": "zachdavids.com.", "Type": "A", "TTL": 300, "ResourceRecords": [{ "Value": "159.203.37.93" }] }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": { "Name": "zachdavids.com.", "Type": "A", "TTL": 1800, "ResourceRecords": [{ "Value": "159.203.37.93" }] }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "TTL": 300,
+        "ResourceRecords": [{ "Value": "2604:a880:cad:d0::46:6001" }]
+      }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "zachdavids.com.",
+        "Type": "AAAA",
+        "TTL": 1800,
+        "ResourceRecords": [{ "Value": "2604:a880:cad:d0::46:6001" }]
+      }
+    },
+    {
+      "Action": "DELETE",
+      "ResourceRecordSet": { "Name": "www.zachdavids.com.", "Type": "CNAME", "TTL": 300, "ResourceRecords": [{ "Value": "zachdavids.com" }] }
+    },
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": { "Name": "www.zachdavids.com.", "Type": "CNAME", "TTL": 1800, "ResourceRecords": [{ "Value": "zachdavids.com" }] }
+    }
+  ]
+}
