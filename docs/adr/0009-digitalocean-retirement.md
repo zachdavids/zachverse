@@ -1,7 +1,7 @@
 # ADR 0009: DigitalOcean retirement
 
-- Status: Accepted (milestone 9). Prepared, not carried out: it normally runs 7 to 14 days after milestone 8's cutover, before the `notAfter` that ADR 0008's step 2 records for the Droplet's certificate.
-- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
+- Status: Accepted (milestone 9). Runbook steps 1 to 4 were done on 2026-10-18, the day of milestone 8's cutover, by the owner's decision ("When"); this change's merge ends the rollback window (step 5).
+- Date: 2026-10-15, revised the same day after review and after the Phase 1 review, and on 2026-10-18 for the retirement
 
 ## Context
 
@@ -18,7 +18,7 @@ The plan's milestone 9 retires the Droplet after 7 to 14 days of successful oper
 
 ## Decision
 
-**When.** The owner ends the rollback window 7 to 14 days after the cutover, once the site has run on CloudFront without a DNS rollback. Normally that falls before the `notAfter` that ADR 0008's step 2 recorded. If that date comes first, the clean window ended then, and the retirement goes ahead on the owner's decision.
+**When.** The owner ends the rollback window 7 to 14 days after the cutover, once the site has run on CloudFront without a DNS rollback. Normally that falls before the `notAfter` that ADR 0008's step 2 recorded. If that date comes first, the clean window ended then, and the retirement goes ahead on the owner's decision. On 2026-10-18 the owner chose to end the window the day of the cutover instead, waiving precondition 1's 7 days: the cutover's checks had passed, and the runbook's other checks ran as written (`docs/progress.md`, row 9).
 
 **This change ends the rollback window.** It deletes milestone 8's four batches, forward and reverse (`2026-10-15-website-ttl.json`, `2026-10-15-website-cutover.json`, and a `.reverse.json` for each), and the tests that replayed them. Git history keeps them.
 - **The reverse batches are a hazard after retirement:** they point both names at the Droplet. Once it's destroyed, DigitalOcean can give its addresses to another customer, who would then receive the website's traffic and could obtain certificates for its names.
