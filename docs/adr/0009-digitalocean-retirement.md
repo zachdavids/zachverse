@@ -1,6 +1,6 @@
 # ADR 0009: DigitalOcean retirement
 
-- Status: Accepted (milestone 9). Runbook steps 1 to 4 were done on 2026-10-18, the day of milestone 8's cutover, by the owner's decision ("When"); this change's merge ends the rollback window (step 5).
+- Status: Accepted (milestone 9), and carried out on 2026-10-18, the day of milestone 8's cutover, by the owner's decision ("When", "Retirement").
 - Date: 2026-10-15, revised the same day after review and after the Phase 1 review, and on 2026-10-18 for the retirement
 
 ## Context
@@ -88,6 +88,19 @@ Before the first export, create the folder with `mkdir -p ~/droplet-retirement`,
    - **The site:** ADR 0008's "The site, through real DNS" checks pass again, and step 5's Deploy run passed (`gh run list --workflow deploy.yml --branch main --limit 1`).
 10. **Record** steps 1 to 9 in `docs/progress.md`, in a pull request right after step 9.
 11. **Later:** delete the snapshot, if one was taken, by its recorded date, and record it. Record when the last automated backup has expired.
+
+## Retirement (2026-10-18)
+
+The owner chose to retire the Droplet on 2026-10-18, the day of the cutover, waiving precondition 1's 7 days ("When"), and to keep no archive and no snapshot. An administrator ran the AWS checks, which only read, in four sessions, one each for steps 1, 2, 5, and 9. Each ended with `aws logout --all`, and the owner confirmed the AWS console sign-out after the last. The exports are in `~/droplet-retirement/`, outside the repository.
+- **Step 1:** ADR 0008's cutover verification had passed, with no DNS rollback since. The owner's monitor showed every check passing since its setup that evening. Both Deploy runs on `main` since the cutover had passed (39110421584 and 39173755616), and the release history's newest entry was a verified publish of `88ebe99`. The Droplet certificate's `notAfter`, 2026-11-18 01:32 UTC, was still ahead.
+- **Step 2:** `zone-0.json`, with 12 record sets, equalled the export after the DMARC change (`~/dns-cutover/zone-4.json`). No record pointed at the Droplet's addresses, and the `.com` servers delegated to the zone's four name servers. The owner found nothing else that needed the Droplet or used another name in DigitalOcean's zone, no automated backups, and the Workspace subscription active.
+- **Steps 3 and 4:** no archive and no snapshot.
+- **Step 5:** at 23:13 UTC, still no record pointed at the Droplet's addresses, and the site passed ADR 0008's checks through real DNS over IPv4 and IPv6. This change merged as `6880db7` at 23:15 UTC, ending the rollback window, and its Deploy run (39175754173) published and verified that release.
+- **Step 6:** the owner destroyed the Droplet and confirmed that the Droplets list no longer showed it. The Droplet had no volumes, and Reserved IPs held nothing from it. The certbot revocation was skipped: with no backups or snapshot, no copy of its keys outlived it. Its renewal method was never read (ADR 0008, precondition 8), so whether certbot held a DigitalOcean API token stayed unknown; asked instead to revoke any API token not in use, the owner revoked none.
+- **Step 7:** the owner deleted DigitalOcean's zone. At 23:24 UTC, `ns1.digitalocean.com` refused the query for `zachdavids.com.`; earlier that day it had answered with DigitalOcean's three name servers.
+- **Step 8:** the Admin console showed the Workspace subscription active. A message from an outside account reached the Workspace mailbox at 23:26 UTC, and its reply got back at 23:27 UTC, with SPF, DKIM, and DMARC passing in each; the reply's DMARC result showed the `p=reject` policy.
+- **Step 9:** `zone-1.json` equalled `zone-0.json`, and no record pointed at the Droplet's addresses. At 23:24 UTC the zone's name server, `8.8.8.8`, and `1.1.1.1` returned only CloudFront's addresses for both names, in their `A` and `AAAA` answers, and neither Droplet address answered HTTPS. At 23:29 UTC the site served `6880db7` through real DNS over IPv4 and IPv6, with both 301s and the 404 page, and both names presented the site certificate.
+- **Step 11:** nothing is left to delete: there is no snapshot, and there were no automated backups.
 
 ## Limits
 
