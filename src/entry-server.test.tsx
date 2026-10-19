@@ -71,7 +71,7 @@ describe('render', () => {
       }
     });
 
-    it("lists the résumé's lines and skills in its order: the summary, then each role's lines and then its projects'", () => {
+    it("lists the résumé's lines and skills in its order: the summary, then each role's, then its projects'", () => {
       const lines = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map((match) => match[1]);
       expect(lines).toEqual(
         [

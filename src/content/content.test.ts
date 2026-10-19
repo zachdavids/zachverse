@@ -30,7 +30,9 @@ describe('pages', () => {
 
   it('has a home page at the root and one 404 page with no address', () => {
     expect(pages.find((page) => page.id === 'home')).toMatchObject({ path: '/', file: 'index.html' });
-    expect(pages.filter((page) => page.path === null)).toEqual([expect.objectContaining({ id: 'not-found', file: '404.html' })]);
+    expect(pages.filter((page) => page.path === null)).toEqual([
+      expect.objectContaining({ id: 'not-found', file: '404.html' }),
+    ]);
   });
 });
 
@@ -57,9 +59,9 @@ describe('the résumé', () => {
 });
 
 // The résumé the content comes from has a phone number, and a "City, ST, Country" line for Zach and for each employer
-// and the school; the site shows neither (approved 2026-10-18). The places themselves aren't named here, since this
-// repository is public. Instead, no content type has a field for a location (resume.ts), which `satisfies` holds to,
-// and these patterns catch the résumé's forms of both in the content and in every page as it renders.
+// and the school; the site shows neither (approved 2026-10-18). This test names none of the places it guards against,
+// since this repository is public. Instead, no content type has a field for a location (resume.ts), which `satisfies`
+// holds to, and these patterns catch the résumé's forms of both in the content and in every page as it renders.
 const PHONE = /\(?\d{3}\)?[\s.-]?\d{3}[\s.-]\d{4}/;
 const LOCATION = /\b[A-Z][a-z]+(?: [A-Z][a-z]+)*, [A-Z]{2}\b/;
 

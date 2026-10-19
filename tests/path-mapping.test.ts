@@ -87,7 +87,10 @@ describe("the smoke test's and the local server's copy of the mapping (servedPat
 
   // So a /.well-known/ file without a dot in its name fails closed in those checks (ADR 0006, "Limits").
   it("leaves out the function's /.well-known/ exception", () => {
-    expect(WELL_KNOWN.map(servedPath)).toEqual(['.well-known/security.txt', '.well-known/acme-challenge/token/index.html']);
+    expect(WELL_KNOWN.map(servedPath)).toEqual([
+      '.well-known/security.txt',
+      '.well-known/acme-challenge/token/index.html',
+    ]);
     expect(WELL_KNOWN.map(keyFor)).toEqual(['.well-known/security.txt', '.well-known/acme-challenge/token']);
   });
 });

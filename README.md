@@ -28,7 +28,7 @@ npm run test:coverage  # Vitest with the 100% coverage gate CI enforces
 npm run build        # client build, SSR build, prerender into dist/
 npx playwright install --only-shell chromium  # once, the browser for check:browser and check:lighthouse (CI adds --with-deps on Linux)
 npm run check:browser  # load every page in headless Chromium: errors, layout, every Tab stop, axe-core, addresses, 404s
-npm run check:lighthouse  # Lighthouse lab measurements of every page, as a phone and a desktop (CI runs it)
+npm run check:lighthouse  # Lighthouse lab measurements of each page with an address, as a phone and a desktop (CI runs it)
 npm run check:dist   # verify prerendered HTML and head, link previews, 404 page, crawler files, references, size budgets
 
 cd infra

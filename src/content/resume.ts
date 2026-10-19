@@ -1,8 +1,9 @@
 // Zach's résumé, as the résumé page shows it: the public version of his latest résumé ("ZachDavidsResume",
 // 2026-10-14), which he approved for the site on 2026-10-18 and 2026-10-19. It keeps the résumé's wording, without its
 // bold and italic emphasis, but leaves out the phone number and every location (his city and each employer's and
-// school's), and the figures he keeps private: business, traffic, and engagement numbers, and exact fleet scale, which
-// it gives in round words instead ("millions of devices"). The full résumé is shared on request, not published.
+// school's), and the figures he keeps private: business, traffic, and engagement numbers, raw reliability rates, a
+// service's latency, and region and country counts. It gives scale in round words instead ("millions of devices",
+// "multiple" regions). The full résumé is shared on request, not published.
 
 export interface Project {
   /** Stable: never reused for another project. */

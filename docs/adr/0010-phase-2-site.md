@@ -39,10 +39,10 @@ The layout may stay for good, or a redesign by the owner or a designer may repla
 
 **The résumé is a public version of the owner's résumé of 2026-10-14.**
 - **Approved 2026-10-18:** the résumé as written, without its emphasis, its phone number, or any location: his city, his employers', or his school's.
-- **Changed 2026-10-19:** the owner chose to leave out the figures he keeps private: business, traffic, and engagement numbers, and raw reliability rates. Fleet scale is given in round words ("millions of devices"). The rest is unchanged.
+- **Changed 2026-10-19:** the owner left out the figures he keeps private: business, traffic, and engagement numbers, raw reliability rates, a service's latency, and region and country counts. Scale is given in round words ("billions of decisions per day", "millions of devices", "hundreds of gated features", "multiple" regions and countries). The rest is unchanged.
 - **No download link:** the full résumé goes out privately, on request. The owner judged a trimmed PDF not worth offering.
 
-Tests keep phone numbers, and the résumé's "City, ST" form of a location, out of the content and the rendered pages, and no content type has a field for a location. The places themselves aren't named in this repository, which is public. The owner approved the home page's two summary lines, worded from the résumé, on 2026-10-18.
+`src/content/content.test.ts` keeps phone numbers and the résumé's "City, ST" location lines out of the content and the rendered pages, and no content type has a field for a location. The test names none of the places it guards against, since this repository is public; names the résumé gives, such as the Rockstar studio's, stay as written. The owner approved the home page's two summary lines, worded from the résumé, on 2026-10-18.
 
 **Pages and addresses.** One table, `pages` in `src/content/site.ts`, lists every page. Each entry has the page's ID, its address, the file the build writes, its link label, its title, and its description. The app, the prerender, the sitemap's test, `check:dist`, both browser-check runs, and the Lighthouse run all read it (`docs/phase-2-inputs.md`, "Routes"). An address ends in a slash, and that form is canonical.
 
@@ -60,7 +60,7 @@ The viewer-request function and the distribution's 404 response (ADR 0003) alrea
 | `/_releases/...` | the record itself | S3's 403 (ADR 0006) |
 | `www.zachdavids.com/...` | none | 301 to the apex, keeping the path and query |
 
-The function looks up a path whose last segment holds a dot as a file, so a page address can't contain one. The page table's test enforces this: each address is a run of lowercase words, each ending in a slash, and its file is the address followed by `index.html`.
+The function looks up a path whose last segment holds a dot as a file, so a page address can't contain one: addresses are lowercase segments, each ending in a slash, and a page's file is its address followed by `index.html` (`src/content/content.test.ts`).
 
 A release writes the home page after every other page, since it links to each of them (ADR 0006, "Publishes the pages").
 
@@ -75,11 +75,10 @@ The 404 page asks not to be indexed and has none of these tags. `public/sitemap.
 **Checks.** Each check is named here, and its tests say what it checks.
 - **`scripts/check-dist-lib.ts`** (`npm run check:dist`) runs in CI and in the deploy build. It checks every page's head, its link-preview tags, its structured data, and its links, and the size budgets below.
 - **`scripts/browser-check-lib.ts`**, the browser check, runs in CI, in the deploy build, and on the live release (ADR 0006).
-  - Each page with an address is loaded at 320, 768, and 1280 pixels, and at 320 in dark mode. The 404 page is loaded at 320 pixels, in light and dark mode.
-  - Each load checks the page's Tab stops and runs axe-core's WCAG 2.0, 2.1, and 2.2 A and AA rules, and its best practices.
+  - Each page with an address is loaded at 320, 768, and 1280 pixels, and at 320 in dark mode, and the 404 page at 320 pixels, in light and dark mode. In CI, a screenshot of each of these loads is kept with the run.
+  - The loads at 320 pixels walk the page's Tab stops, and all of them run axe-core's WCAG 2.0, 2.1, and 2.2 A and AA rules, and its best practices.
   - Each page is also loaded at its other addresses, and a missing page below it must get the 404 page.
   - All the loads stay within 200 requests, a fifth of the web ACL's rate limit for one address.
-  - In CI, it saves a screenshot of each of those loads, and CI keeps them with the run.
 - **`scripts/lighthouse-lib.ts`** (`npm run check:lighthouse`) runs in CI's web job only. It measures each page with an address as a phone and as a desktop. It holds them to the plan's LCP and CLS targets, to total blocking time (TBT) of at most 200 ms in place of INP, and to Lighthouse's scores. The deploy workflow skips it, because lab scores vary from run to run and CI on the pull request gates the merge.
 - **`tests/path-mapping.test.ts`** runs the viewer-request function against the two copies of its mapping. One is `check:dist`'s. The other is in `scripts/release-lib.ts`, and the smoke test and the local server share it.
 

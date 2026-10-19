@@ -2,14 +2,15 @@
 
 From the Phase 1 review of 2026-10-15: six reviewers covered the whole of Phase 1, and two skeptics checked each finding. What Phase 1 had to fix went into ADRs 0003 to 0007, into ADRs 0008 and 0009 on #8 and #11, and, for what the owner does, `docs/progress.md`. What's left here needs no change before Phase 2; an item that names no time applies from the start of Phase 2's design.
 
-**Status after Phase 2's milestone 1 (2026-10-18).** Phase 2, as the owner planned it on 2026-10-16, has no 3D (ADR 0010; `docs/progress.md`, "Phase 2"). So the "3D content" section, and the 3D parts of "Rate limit" and "Compression", now apply to Phase 3.
+**Status after Phase 2's milestone 1 (2026-10-18).** Phase 2, as the owner planned it on 2026-10-16, has no 3D (ADR 0010; `docs/progress.md`, "Phase 2"). So the "3D content" section, apart from "Content module", "Styles", and "Prerendering", which apply to every page, and the 3D parts of "Rate limit" and "Compression", now apply to Phase 3.
 
 Milestone 1 addressed these items:
 - **Routes:** one page table, `pages` in `src/content/site.ts`.
 - **Path mapping:** `tests/path-mapping.test.ts` runs the real function against both copies.
 - **Browser check:** a request budget tied to the rate limit.
 - **Content module:** now `src/content/`, still plain data.
-- **Styles:** in part. The browser check now walks every Tab stop on every page, at a middle width, with scrollbars shown. `src/styles.test.ts` stays, since no canvas has come.
+- **Styles:** in part. The browser check now walks every Tab stop on every page at 320 pixels, loads each page at a middle width, 768 pixels, and shows scrollbars. `src/styles.test.ts` stays, since no canvas has come.
+- **Allowance:** estimated for milestone 1's pages (ADR 0010, "Load and allowance"); Phase 3 estimates it again for its 3D assets.
 - **Docs:** milestone 1's verification log is in its pull request's description, and ADR 0010 names its tests rather than restating them.
 
 "Dependencies" is set aside for now: the owner's Phase 2 plan rules out unrelated upgrades (`docs/progress.md`, "Phase 2"). The rest are open.

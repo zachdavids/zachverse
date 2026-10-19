@@ -7,19 +7,20 @@
 //
 // The fonts are the machine's: the committed picture was rendered on Windows, in Segoe UI. It runs Playwright, a
 // project package, so it refuses to start while an AWS CLI session is live (ADR 0004, "Administrative access").
+// Only Node's built-in modules load before the check: a static import of Playwright would run its code first.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
-import { profile } from '../../src/content/profile.ts';
-import { site } from '../../src/content/site.ts';
 
 const loginCache = join(homedir(), '.aws', 'login', 'cache');
 if (existsSync(loginCache) && readdirSync(loginCache).length > 0) {
   console.error('An AWS session is live (~/.aws/login/cache is not empty); end it with `aws logout --all` first.');
   process.exit(1);
 }
+const { chromium } = await import('playwright');
+const { profile } = await import('../../src/content/profile.ts');
+const { site } = await import('../../src/content/site.ts');
 
 // The stylesheet's first :root rule holds the light palette; the dark one follows inside a media query.
 const styles = readFileSync(new URL('../../src/styles.css', import.meta.url), 'utf8');
