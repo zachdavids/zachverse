@@ -151,6 +151,8 @@ vite.config.ts.timestamp-*
 # Zachverse build output
 dist-ssr/
 cdk.out/
+# The browser check's screenshots, when BROWSER_CHECK_SCREENSHOTS names this directory, as CI does
+screenshots/
 
 CLAUDE.md
 .claude/worktrees/

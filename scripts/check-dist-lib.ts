@@ -11,13 +11,12 @@ import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { type Page, type PageId, pages, profile, resume, site } from '../src/content/index.ts';
-import { encodingFor } from './browser-check-lib.ts';
 import { escapeHtml } from './prerender-lib.ts';
-import { ASSETS, HASHED_NAME, isAsset, type SiteFile, siteFiles } from './release-lib.ts';
+import { ASSETS, encodingFor, HASHED_NAME, isAsset, type SiteFile, siteFiles } from './release-lib.ts';
 import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
 
 // The file CloudFront serves for a path, as infra/functions/viewer-request.js maps it.
-function servedFile(path: string): string {
+export function servedFile(path: string): string {
   if (path.startsWith('/.well-known/')) return path;
   if (path.endsWith('/')) return `${path}index.html`;
   return path.lastIndexOf('.') < path.lastIndexOf('/') ? `${path}/index.html` : path;

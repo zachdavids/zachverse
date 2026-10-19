@@ -12,7 +12,6 @@ import {
   axeProblems,
   BROWSER_REQUEST_BUDGET,
   browserCheck,
-  encodingFor,
   FOCUS_SETTLE_MS,
   type Focus,
   focusProblems,
@@ -407,6 +406,40 @@ describe('browserCheck', () => {
     ]);
   });
 
+  it('with a screenshots directory, saves each page at each width and in dark mode, and nothing for the other loads', async () => {
+    const open = site();
+    await browserCheck({ ...target, screenshots: 'shots' }, pages, open);
+    expect(open.mock.calls).toStrictEqual([
+      [`${LOCAL}/`, 320, { tab: true, axe: true, screenshot: 'shots/home-320.png' }],
+      [`${LOCAL}/`, 768, { axe: true, screenshot: 'shots/home-768.png' }],
+      [`${LOCAL}/`, 1280, { axe: true, screenshot: 'shots/home-1280.png' }],
+      [`${LOCAL}/`, 320, { tab: true, axe: true, dark: true, screenshot: 'shots/home-320-dark.png' }],
+      [`${LOCAL}/?from=browser-check`, 320, {}],
+      [`${LOCAL}/about/`, 320, { tab: true, axe: true, screenshot: 'shots/about-320.png' }],
+      [`${LOCAL}/about/`, 768, { axe: true, screenshot: 'shots/about-768.png' }],
+      [`${LOCAL}/about/`, 1280, { axe: true, screenshot: 'shots/about-1280.png' }],
+      [`${LOCAL}/about/`, 320, { tab: true, axe: true, dark: true, screenshot: 'shots/about-320-dark.png' }],
+      [`${LOCAL}/about`, 320, {}],
+      [`${LOCAL}/about/?from=browser-check`, 320, {}],
+      [`${LOCAL}/about/`, 320, { reload: true }],
+      [`${LOCAL}/about/browser-check-probe/`, 320, {}],
+      [`${LOCAL}/browser-check-probe/`, 320, { tab: true, axe: true, screenshot: 'shots/not-found-320.png' }],
+      [
+        `${LOCAL}/browser-check-probe/`,
+        320,
+        { tab: true, axe: true, dark: true, screenshot: 'shots/not-found-320-dark.png' },
+      ],
+    ]);
+    // A page deeper down is named by its whole address.
+    const deep = site();
+    await browserCheck({ ...target, screenshots: 'shots' }, [{ path: '/work/feature-gating/' }], deep);
+    expect(deep.mock.calls[0]).toStrictEqual([
+      `${LOCAL}/work/feature-gating/`,
+      320,
+      { tab: true, axe: true, screenshot: 'shots/work-feature-gating-320.png' },
+    ]);
+  });
+
   it('starts each load only once the one before it has finished', async () => {
     let loading = 0;
     let most = 0;
@@ -584,7 +617,7 @@ describe('serve', () => {
       const url = `${server.origin}/assets/index-AbCd1234.js`;
       const br = await getRaw(url, 'gzip, deflate, br, zstd');
       expect([br.status, br.encoding, brotliDecompressSync(br.body).toString()]).toEqual([200, 'br', script]);
-      // A second request gets the same bytes, compressed once.
+      // A second request gets the same bytes: each file is compressed once, before the server starts.
       expect((await getRaw(url, 'br')).body).toEqual(br.body);
       const gzip = await getRaw(url, 'gzip');
       expect([gzip.status, gzip.encoding, gunzipSync(gzip.body).toString()]).toEqual([200, 'gzip', script]);
@@ -600,33 +633,6 @@ describe('serve', () => {
       ]);
     } finally {
       await server.close();
-    }
-  });
-});
-
-describe('encodingFor', () => {
-  const file = (contentType: string, length: number) => ({ contentType, body: Buffer.alloc(length) });
-
-  it('prefers Brotli, then gzip, for a type CloudFront compresses, at the sizes it compresses', () => {
-    expect(encodingFor(file('text/html; charset=utf-8', 1000), 'gzip, deflate, br, zstd')).toBe('br');
-    expect(encodingFor(file('text/javascript; charset=utf-8', 5000), 'gzip;q=1.0, identity')).toBe('gzip');
-    expect(encodingFor(file('image/svg+xml', 10_000_000), 'BR')).toBe('br');
-    for (const type of ['text/css; charset=utf-8', 'text/plain; charset=utf-8', 'application/json', 'application/xml']) {
-      expect(encodingFor(file(type, 2000), 'gzip'), type).toBe('gzip');
-    }
-  });
-
-  it('sends no encoding the browser did not ask for', () => {
-    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'identity')).toBeNull();
-    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'zstd, deflate')).toBeNull();
-    expect(encodingFor(file('text/css; charset=utf-8', 2000))).toBeNull();
-  });
-
-  it('leaves a file outside 1,000 to 10,000,000 bytes, or of a type CloudFront does not compress, as it is', () => {
-    expect(encodingFor(file('text/html; charset=utf-8', 999), 'br')).toBeNull();
-    expect(encodingFor(file('text/html; charset=utf-8', 10_000_001), 'br')).toBeNull();
-    for (const type of ['image/png', 'font/woff2', 'application/manifest+json', 'model/gltf+json', 'text/htmlx']) {
-      expect(encodingFor(file(type, 5000), 'br, gzip'), type).toBeNull();
     }
   });
 });
@@ -664,6 +670,7 @@ describe('open', () => {
         calls.push(`add ${content === AXE ? 'axe-core' : content}`),
       ),
       waitForTimeout: vi.fn(async (ms: number) => calls.push(`wait ${ms}`)),
+      screenshot: vi.fn(async (options: object) => calls.push(`screenshot ${JSON.stringify(options)}`)),
       keyboard: { press: vi.fn(async (key: string) => calls.push(`press ${key}`)) },
     });
     const context = Object.assign(new EventEmitter(), {
@@ -703,6 +710,23 @@ describe('open', () => {
       `goto ${ORIGIN}/ {"waitUntil":"networkidle"}`,
       `wait ${SETTLE_MS}`,
       'evaluate measure',
+      'close',
+    ]);
+  });
+
+  it('saves a screenshot of the whole page when asked, after measuring it and before the first Tab press', async () => {
+    const { browser, calls } = fakeBrowser([200], () => {}, [focused(RESUME)]);
+    await open(browser, `${ORIGIN}/`, 768, { tab: true, screenshot: 'shots/home-768.png' });
+    expect(calls).toEqual([
+      'context {"viewport":{"width":768,"height":800},"colorScheme":"light"}',
+      `goto ${ORIGIN}/ {"waitUntil":"networkidle"}`,
+      `wait ${SETTLE_MS}`,
+      'evaluate measure',
+      'screenshot {"path":"shots/home-768.png","fullPage":true}',
+      'press Tab',
+      `evaluate measureFocus ${FOCUS_SETTLE_MS}`,
+      'press Tab',
+      `evaluate measureFocus ${FOCUS_SETTLE_MS}`,
       'close',
     ]);
   });

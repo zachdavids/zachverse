@@ -6,7 +6,7 @@
 import { appendFileSync } from 'node:fs';
 import { type AddressInfo, createServer } from 'node:net';
 import lighthouse, { desktopConfig } from 'lighthouse';
-import { type Browser, chromium } from 'playwright';
+import { chromium } from 'playwright';
 import { pages } from '../src/content/index.ts';
 import { serve } from './browser-check-lib.ts';
 import { CATEGORIES, type FormFactor, lighthouseCheck, report, type Run } from './lighthouse-lib.ts';
@@ -28,33 +28,18 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-// serve() compresses a file the first time a browser asks for it, and answers no other request until it is done: for
-// the script, about 200 ms. Lighthouse's simulation charges every request the median of the server's response times,
-// so the first run would measure the local server as well as the page, painting about 400 ms later as a phone than a
-// run with the files already compressed. Loading each page once first, until its network goes quiet, compresses every
-// file a run loads. The page has a browser context of its own, and Lighthouse clears the browser's cache before each
-// run, so only the server's compressed copies carry over.
-async function warmServer(browser: Browser, urls: string[]): Promise<void> {
-  const page = await browser.newPage();
-  try {
-    for (const url of urls) await page.goto(url, { waitUntil: 'networkidle' });
-  } finally {
-    await page.close();
-  }
-}
-
 async function main(args: string[]): Promise<string[]> {
   if (args.length !== 1) throw new Error('Usage: node scripts/lighthouse.ts <dir>');
   const dir = args[0]!;
   // The 404 page has no address: every missing one serves it.
   const paths = pages.flatMap(({ path }) => (path === null ? [] : [path]));
+  // serve() compresses the files before it answers, so no run's timing includes the server compressing one.
   const server = await serve(dir);
   try {
     const port = await freePort();
     // Lighthouse opens a tab of its own in this browser for each run, and closes it after.
     const browser = await chromium.launch({ args: [`--remote-debugging-port=${port}`] });
     try {
-      await warmServer(browser, paths.map((path) => `${server.origin}${path}`));
       const runs: Run[] = [];
       // One run at a time: runs side by side would share the machine's CPU, and each would measure the others' work.
       for (const path of paths) {

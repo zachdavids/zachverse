@@ -41,6 +41,18 @@ jobs:
       - run: npx playwright install --with-deps --only-shell chromium
       - name: Check the pages in a browser
         run: npm run check:browser
+        env:
+          # A screenshot of each page at each width, and in dark mode, for the pull request's review.
+          BROWSER_CHECK_SCREENSHOTS: screenshots
+      # Kept with the run for 30 days, also when the check failed, to show what it saw.
+      - name: Keep the screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 30
       # Lab measurements of the built pages. The deploy workflow doesn't take them: lab scores vary from run to run,
       # and this job, on the pull request, gates the merge.
       - name: Measure the pages with Lighthouse (lab)

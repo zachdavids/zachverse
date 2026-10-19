@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { brotliCompressSync, gzipSync } from 'node:zlib';
 import type { Browser, Page } from 'playwright';
-import { type SiteFile, siteFiles } from './release-lib.ts';
+import { encodingFor, servedPath, siteFiles } from './release-lib.ts';
 
 /**
  * An element as a problem names it: its tag, and its text, or its href when it has none; and the number the page knows
@@ -127,6 +127,8 @@ export interface LoadOptions {
   axe?: boolean;
   /** Loads the page in dark mode (prefers-color-scheme: dark), which the site's stylesheet gives its own colours. */
   dark?: boolean;
+  /** Saves a screenshot of the whole page to this file, as loaded, before the walk puts the focus anywhere. */
+  screenshot?: string;
 }
 
 /** Loads url in a window width pixels wide and reports on it. */
@@ -146,6 +148,11 @@ export interface Target {
   release: string | null;
   /** A path segment no release has, different on each run, for the missing pages. */
   probe: string;
+  /**
+   * A directory for a screenshot of each page at each width, and in dark mode, named like resume-768.png and
+   * resume-320-dark.png, or undefined to take none. The other loads take none.
+   */
+  screenshots?: string;
 }
 
 export interface Result {
@@ -473,7 +480,13 @@ type Expected = Parameters<typeof pageProblems>[1];
  * together must stay within BROWSER_REQUEST_BUDGET.
  */
 export async function browserCheck(target: Target, pages: readonly SitePage[], open: Open): Promise<Result> {
-  const { origin, canonicalOrigin, release, probe } = target;
+  const { origin, canonicalOrigin, release, probe, screenshots } = target;
+  // Where a page's screenshot at a width goes, by the page's address: home for the root, not-found for the 404 page.
+  const shot = (path: string | null, width: number, dark = false): LoadOptions => {
+    if (screenshots === undefined) return {};
+    const page = path === null ? 'not-found' : path === '/' ? 'home' : path.slice(1, -1).replaceAll('/', '-');
+    return { screenshot: `${screenshots}/${page}-${width}${dark ? '-dark' : ''}.png` };
+  };
   let loads = 0;
   let requests = 0;
   // A load that throws reports nothing, so its requests go uncounted; its check fails anyway.
@@ -497,12 +510,12 @@ export async function browserCheck(target: Target, pages: readonly SitePage[], o
         [
           "a missing page shows the 404 page, with status 404, which works, passes axe-core's rules, and shows " +
             'keyboard focus at every Tab stop',
-          audited(url, missing, {}),
+          audited(url, missing, shot(null, 320)),
         ],
         [
           "a missing page shows the 404 page in dark mode, with status 404, which works, passes axe-core's rules, " +
             'and shows keyboard focus at every Tab stop',
-          audited(url, missing, { dark: true }),
+          audited(url, missing, { dark: true, ...shot(null, 320, true) }),
         ],
       );
       continue;
@@ -513,19 +526,19 @@ export async function browserCheck(target: Target, pages: readonly SitePage[], o
       [
         `the page at ${path} works in a 320-pixel window, passes axe-core's rules, and shows keyboard focus at every ` +
           'Tab stop',
-        audited(url, expected, {}),
+        audited(url, expected, shot(path, 320)),
       ],
       ...[768, 1280].map((width): Check => [
         `the page at ${path} works in a ${width}-pixel window, and passes axe-core's rules`,
         async () => {
-          const report = await load(url, width, { axe: true });
+          const report = await load(url, width, { axe: true, ...shot(path, width) });
           return [...pageProblems(report, expected), ...axeProblems(report)];
         },
       ]),
       [
         `the page at ${path} works in a 320-pixel window in dark mode, passes axe-core's rules, and shows keyboard ` +
           'focus at every Tab stop',
-        audited(url, expected, { dark: true }),
+        audited(url, expected, { dark: true, ...shot(path, 320, true) }),
       ],
     );
     const query: Check = [
@@ -579,48 +592,34 @@ export async function browserCheck(target: Target, pages: readonly SitePage[], o
   return { passed, failures };
 }
 
-// The content types CloudFront compresses, of those release-lib.ts gives files, and the sizes it compresses: 1,000 to
-// 10,000,000 bytes (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/ServingCompressedFiles.html,
-// read 2026-10-18). The distribution's behavior compresses (infra/lib/site-stack.ts).
-const COMPRESSED_TYPES = /^(?:text\/(?:html|javascript|css|plain)|application\/(?:json|xml)|image\/svg\+xml)(?:;|$)/;
-
-/**
- * The encoding CloudFront would send file in to a browser that accepts the encodings named in acceptEncoding: Brotli
- * when the browser takes both it and gzip, as CloudFront prefers it, and none for a type or size it leaves alone.
- */
-export function encodingFor(file: Pick<SiteFile, 'contentType' | 'body'>, acceptEncoding = ''): 'br' | 'gzip' | null {
-  const { length } = file.body;
-  if (!COMPRESSED_TYPES.test(file.contentType) || length < 1000 || length > 10_000_000) return null;
-  const accepted = acceptEncoding.toLowerCase().split(',').map((part) => part.split(';')[0]!.trim());
-  if (accepted.includes('br')) return 'br';
-  return accepted.includes('gzip') ? 'gzip' : null;
-}
-
 /**
  * Serves the files in dir as CloudFront serves the bucket: a directory path gets its index.html, through the
- * viewer-request function's mapping, a missing file gets the 404 page with status 404, and a file CloudFront would
- * compress goes out compressed, so a browser downloads what it would from the site. The files are read once, up
- * front, and a request only looks one up by name.
+ * viewer-request function's mapping (servedPath), a missing file gets the 404 page with status 404, and a file
+ * CloudFront would compress goes out compressed (encodingFor), so a browser downloads what it would from the site. The
+ * files are read and compressed once, before the server starts: compressing the bundle takes about 200 ms, which a
+ * request would otherwise wait for, and Lighthouse's simulation charges every request the server's typical response
+ * time. A request only looks a file up by name.
  */
 export async function serve(dir: string): Promise<{ origin: string; close: () => Promise<void> }> {
   const files = new Map(siteFiles(dir).map((file) => [file.path, file]));
   const notFound = files.get('404.html');
   if (notFound === undefined) throw new Error(`${dir} has no 404.html to serve.`);
-  const compressed = new Map<string, Buffer>();
+  const compressed = new Map<string, { br: Buffer; gzip: Buffer }>();
+  for (const file of files.values()) {
+    if (encodingFor(file, 'br') !== null) {
+      compressed.set(file.path, { br: brotliCompressSync(file.body), gzip: gzipSync(file.body) });
+    }
+  }
   const server = createServer((req, res) => {
     // A request an HTTP server receives always has a URL.
-    const path = new URL(req.url!, 'http://localhost').pathname;
-    const name = path.slice(path.lastIndexOf('/') + 1);
-    const key = path.slice(1) + (name === '' ? 'index.html' : name.includes('.') ? '' : '/index.html');
-    const file = files.get(key);
+    const file = files.get(servedPath(new URL(req.url!, 'http://localhost').pathname));
     const served = file ?? notFound;
     const encoding = encodingFor(served, req.headers['accept-encoding']);
     const headers: Record<string, string> = { 'content-type': served.contentType, 'cache-control': served.cacheControl };
     let body = served.body;
     if (encoding !== null) {
-      const cacheKey = `${encoding} ${served.path}`;
-      body = compressed.get(cacheKey) ?? (encoding === 'br' ? brotliCompressSync(body) : gzipSync(body));
-      compressed.set(cacheKey, body);
+      // encodingFor gives an encoding only for a file it would compress, and every such file was compressed above.
+      body = compressed.get(served.path)![encoding];
       headers['content-encoding'] = encoding;
     }
     res.writeHead(file ? 200 : 404, headers);
@@ -658,8 +657,8 @@ export const FOCUS_SETTLE_MS = 3000;
  */
 export const BROWSER_REQUEST_BUDGET = 200;
 
-// axe-core's browser build, read when a load first runs its rules, and kept: a module that imports only encodingFor,
-// serve, or the budget reads nothing, and needs no axe-core installed. open adds it to each page it audits as an inline
+// axe-core's browser build, read when a load first runs its rules, and kept: a module that imports only serve or the
+// budget reads nothing, and needs no axe-core installed. open adds it to each page it audits as an inline
 // script, so it costs the site no request; a Content-Security-Policy that blocks inline scripts would block it too
 // (docs/phase-2-inputs.md, "Headers").
 let axeSource: string | undefined;
@@ -720,6 +719,7 @@ export async function open(browser: Browser, url: string, width: number, options
     if (options.reload) response = await page.reload({ waitUntil: 'networkidle' });
     await page.waitForTimeout(SETTLE_MS);
     const measured = await page.evaluate(measure);
+    if (options.screenshot !== undefined) await page.screenshot({ path: options.screenshot, fullPage: true });
     // The walk starts from the fresh load, with nothing focused, where a visitor's first Tab press starts.
     const walk = options.tab ? await walkTabStops(page) : undefined;
     let violations: Violation[] | undefined;

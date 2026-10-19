@@ -40,8 +40,15 @@ async function main(args: string[]): Promise<string[]> {
     // from the page's, so a layout 100vw wide scrolls sideways, as it would there.
     const browser = await chromium.launch({ args: launchArgs, ignoreDefaultArgs: ['--hide-scrollbars'] });
     try {
-      // The pages name their canonical URLs at the site's own origin, wherever they are served from.
-      const target = { origin, canonicalOrigin: site.origin, release, probe: `browser-check-${randomUUID()}` };
+      // The pages name their canonical URLs at the site's own origin, wherever they are served from. CI keeps a
+      // screenshot of each page at each width for the pull request's review, in BROWSER_CHECK_SCREENSHOTS.
+      const target = {
+        origin,
+        canonicalOrigin: site.origin,
+        release,
+        probe: `browser-check-${randomUUID()}`,
+        screenshots: process.env.BROWSER_CHECK_SCREENSHOTS || undefined,
+      };
       const { passed, failures } = await browserCheck(target, pages, (url, width, options) =>
         open(browser, url, width, options),
       );

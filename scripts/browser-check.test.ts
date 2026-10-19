@@ -92,6 +92,19 @@ describe('browser check script', () => {
     expect(exit).not.toHaveBeenCalled();
   });
 
+  it('keeps screenshots in the directory BROWSER_CHECK_SCREENSHOTS names, as CI asks', async () => {
+    vi.stubEnv('BROWSER_CHECK_SCREENSHOTS', 'screenshots');
+    await run('local', 'dist');
+    expect(lib.browserCheck.mock.calls[0]![0]).toMatchObject({ screenshots: 'screenshots' });
+    // Unset or empty, as in the deploy workflow, it takes none.
+    vi.restoreAllMocks();
+    vi.resetModules();
+    lib.browserCheck.mockClear();
+    vi.stubEnv('BROWSER_CHECK_SCREENSHOTS', '');
+    await run('local', 'dist');
+    expect(lib.browserCheck.mock.calls[0]![0].screenshots).toBeUndefined();
+  });
+
   it('checks the live site through the distribution, for the release it must name', async () => {
     vi.stubEnv('RELEASE_COMMIT', RELEASE);
     vi.stubEnv('GITHUB_STEP_SUMMARY', '');

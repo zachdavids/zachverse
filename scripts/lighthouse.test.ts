@@ -10,9 +10,8 @@ type Flags = { port: number; logLevel: string; onlyCategories: string[] };
 const lib = vi.hoisted(() => ({
   serve: vi.fn<(dir: string) => Promise<{ origin: string; close: () => Promise<void> }>>(),
 }));
-// The page the script loads each page in before the runs, and the browser it opens it in.
-const page = vi.hoisted(() => ({ goto: vi.fn<(url: string, options: object) => Promise<null>>(), close: vi.fn() }));
-const browser = vi.hoisted(() => ({ newPage: vi.fn(), close: vi.fn(async () => {}) }));
+// The browser the script launches for Lighthouse to connect to.
+const browser = vi.hoisted(() => ({ close: vi.fn(async () => {}) }));
 const playwright = vi.hoisted(() => ({ chromium: { launch: vi.fn() } }));
 const lighthouse = vi.hoisted(() => ({
   default: vi.fn<(url: string, flags: Flags, config?: object) => Promise<{ lhr: Lhr } | undefined>>(),
@@ -56,7 +55,6 @@ describe('Lighthouse script', () => {
     vi.stubEnv('GITHUB_STEP_SUMMARY', join(summaryDir, 'summary.md'));
     lib.serve.mockResolvedValue({ origin: ORIGIN, close });
     playwright.chromium.launch.mockResolvedValue(browser);
-    browser.newPage.mockResolvedValue(page);
     // Lighthouse emulates the form factor its config asks for: a desktop with the desktop config, or else a phone.
     lighthouse.default.mockImplementation(async (_url, _flags, config) => ({
       lhr: lhrFor(config === undefined ? 'mobile' : 'desktop'),
@@ -70,7 +68,6 @@ describe('Lighthouse script', () => {
     for (const mock of [lib.serve, playwright.chromium.launch, lighthouse.default, browser.close, close]) {
       mock.mockReset();
     }
-    for (const mock of [browser.newPage, page.goto, page.close]) mock.mockReset();
     rmSync(summaryDir, { recursive: true, force: true });
   });
 
@@ -91,16 +88,9 @@ describe('Lighthouse script', () => {
     return output;
   };
 
-  it('serves a build, loads each page with an address, then measures each as a phone and a desktop, a run at a time', async () => {
-    // What the script asks of the page it loads the pages in first, and of Lighthouse, in order.
+  it('serves a build, then measures each page with an address as a phone and a desktop, a run at a time', async () => {
+    // What the script asks of Lighthouse, in order.
     const calls: string[] = [];
-    page.goto.mockImplementation(async (url) => {
-      calls.push(`load ${url}`);
-      return null;
-    });
-    page.close.mockImplementation(async () => {
-      calls.push('close the page');
-    });
     // The runs in progress at once, which must never be more than one.
     let running = 0;
     let most = 0;
@@ -130,15 +120,9 @@ describe('Lighthouse script', () => {
       ]),
     );
     expect(most).toBe(1);
-    // Each page is loaded once, until its network goes quiet, and that page closed, before the first run, so serve()
-    // has compressed every file a run loads.
-    expect(browser.newPage).toHaveBeenCalledExactlyOnceWith();
-    expect(page.goto.mock.calls).toEqual(paths.map((path) => [`${ORIGIN}${path}`, { waitUntil: 'networkidle' }]));
-    expect(calls).toEqual([
-      ...paths.map((path) => `load ${ORIGIN}${path}`),
-      'close the page',
-      ...paths.flatMap((path) => [`measure ${ORIGIN}${path} as mobile`, `measure ${ORIGIN}${path} as desktop`]),
-    ]);
+    expect(calls).toEqual(
+      paths.flatMap((path) => [`measure ${ORIGIN}${path} as mobile`, `measure ${ORIGIN}${path} as desktop`]),
+    );
     const runs = paths.flatMap((path): Run[] => [
       { path, formFactor: 'mobile', lhr: lhrFor('mobile') },
       { path, formFactor: 'desktop', lhr: lhrFor('desktop') },
@@ -195,18 +179,6 @@ describe('Lighthouse script', () => {
     expect(error).toHaveBeenCalledExactlyOnceWith('::error::no browser installed');
     expect(exit).toHaveBeenCalledExactlyOnceWith(1);
     expect(lighthouse.default).not.toHaveBeenCalled();
-    expect(close).toHaveBeenCalledOnce();
-  });
-
-  it('fails when a page will not load before the runs, still closing the page, the browser, and the server', async () => {
-    page.goto.mockRejectedValueOnce(new Error(`page.goto: net::ERR_CONNECTION_REFUSED at ${ORIGIN}/`));
-    const { exit, error, log } = await run('dist');
-    expect(error).toHaveBeenCalledExactlyOnceWith(`::error::page.goto: net::ERR_CONNECTION_REFUSED at ${ORIGIN}/`);
-    expect(exit).toHaveBeenCalledExactlyOnceWith(1);
-    expect(log).not.toHaveBeenCalled();
-    expect(lighthouse.default).not.toHaveBeenCalled();
-    expect(page.close).toHaveBeenCalledOnce();
-    expect(browser.close).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
   });
 
