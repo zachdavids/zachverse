@@ -25,7 +25,7 @@ Phase 2, as the owner planned it on 2026-10-16, makes the site a complete HTML p
 
 | # | Milestone | Status | PR / evidence |
 | --- | --- | --- | --- |
-| 1 | Design direction, content module, home page, navigation, and verified URL handling, plus the résumé page, brought forward from milestone 2 | In review | [#14](https://github.com/zachdavids/zachverse/pull/14), whose description holds the verification before the merge; ADR 0010 |
+| 1 | Design direction, content module, home page, navigation, and verified URL handling, plus the résumé page, brought forward from milestone 2 | Done 2026-10-19: merged as `ed7e45a`, then released and verified the same day | [#14](https://github.com/zachdavids/zachverse/pull/14), whose description holds the verification before the merge; ADR 0010. Deploy run 39222905869 published `ed7e45a`. Its smoke test, and its live browser check of every address through CloudFront (`/resume`, the query strings, the reload, and the 404 pages included), passed, and it recorded the release as verified. The record's pull request has the details |
 | 2 | Flagship case study (and a second, if approved material is ready), and "How this site is built" | Not started | |
 | 3 | Cross-page checks, a real-device review, a five-second test with five people, fixes, and release verification | Not started | |
 
