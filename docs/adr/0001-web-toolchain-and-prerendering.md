@@ -1,7 +1,7 @@
 # ADR 0001: Web toolchain and prerendering
 
 - Status: Accepted
-- Date: 2026-10-11, revised 2026-10-12 after review
+- Date: 2026-10-11, revised 2026-10-12 after review, and on 2026-10-19 for Phase 2's first upgrades
 
 ## Context
 
@@ -11,11 +11,11 @@ Phase 1 ships a placeholder page; the later 3D portfolio will use React Three Fi
 
 | Package | Version | Compatibility evidence |
 | --- | --- | --- |
-| Node.js | 24 LTS (`.nvmrc`; engines `>=24.11.0 <25`; 24.20.0 locally) | Vitest 5 engines `^22.12 \|\| ^24 \|\| >=26`; Vite 8 `^20.19 \|\| >=22.12`; jsdom 30.1.1 (tests only) and three of its dependencies `^22.22.2 \|\| ^24.15.0 \|\| >=26` |
-| react, react-dom | 19.3.0 | `@react-three/fiber` 9.8.1 peers `react >=19 <19.4` |
+| Node.js | 24 LTS (`.nvmrc`; engines `>=24.11.0 <25`; 24.20.0 locally) | Vitest 5 engines `^22.12 \|\| ^24 \|\| >=26`; Vite 8 `^20.19 \|\| >=22.12`; jsdom 30.1.3 (tests only) and three of its dependencies `^22.22.2 \|\| ^24.15.0 \|\| >=26` |
+| react, react-dom | 19.3.1 | `@react-three/fiber` 9.8.2 peers `react >=19 <19.4` |
 | vite | 8.3.4 | — |
 | @vitejs/plugin-react | 6.1.2 | peers `vite ^8.0.0` |
-| vitest | 5.0.3 | peers `vite ^6.4 \|\| ^7 \|\| ^8` |
+| vitest | 5.0.5 | peers `vite ^6.4 \|\| ^7 \|\| ^8` |
 | typescript | ~7.0.2 | same range `cdk init` (aws-cdk 2.1145.0) generates |
 | aws-cdk-lib / aws-cdk CLI | 2.273.0 / 2.1145.0 | `aws-cdk-lib` peers `constructs ^10.5.0` |
 

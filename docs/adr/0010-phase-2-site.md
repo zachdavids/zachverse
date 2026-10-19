@@ -103,8 +103,8 @@ Most of the JavaScript is React, which hydrates every page (ADR 0001). The one b
 - **Allowance:** a visitor's first load of the home page is 4 requests and about 80 KB as sent. Against the Free plan's monthly allowance, 1 million requests last about 250,000 such visits, and 100 GB about 1.25 million (`docs/phase-2-inputs.md`, "Allowance").
 
 **Test tooling.** Two new dev dependencies, pinned exactly like Playwright:
-- axe-core 4.13.0, published 2026-08-05.
-- Lighthouse 13.5.0, published 2026-09-18. Its own axe-core range, `^4.13.0`, resolves to the same copy.
+- axe-core 4.14.0, published 2026-10-05.
+- Lighthouse 13.5.0, published 2026-09-18. Its own axe-core range, `^4.13.0`, takes the same copy.
 
 They are pinned because a new rule or a scoring change could fail CI with no change to the site. The 109 packages they add include none with an install script beyond the reviewed ones, and every package in the lockfile still comes from its npm registry tarball with a sha512 hash (`tests/repo-policy.test.ts`). Dependabot's version updates cover only the GitHub Actions. npm's security updates arrive as pull requests, reviewed like any other change (ADR 0005).
 

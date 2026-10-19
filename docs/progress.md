@@ -37,8 +37,16 @@ Phase 2, as the owner planned it on 2026-10-16, makes the site a complete HTML p
 
 Under the owner's plan, Phase 2 has no 3D, controls, physics, or game assets, so those notes now apply to Phase 3. ADR 0007 now says so. Of the "3D content" section, three items still apply to Phase 2's pages: "Content module", "Styles", and "Prerendering". The inputs file marks which items milestone 1 addressed.
 
+**Upgrades (2026-10-19).** `docs/phase-2-inputs.md`'s "Dependencies" item asks for deliberate upgrades as each milestone starts, and the owner's Phase 2 plan ruled out unrelated ones; the owner chose to upgrade. Milestone 1 takes every release `npm outdated` listed in both packages:
+- React 19.3.1, a patch released the same day as patches to React's older lines, and still within React Three Fiber's peer range;
+- Vitest and its coverage plugin 5.0.5, in both packages;
+- jsdom 30.1.3;
+- Playwright 1.64.1, with the Chromium it downloads;
+- axe-core 4.14.0.
+
+`@types/node` stays on 24.x, since Node 24 runs the site. The CDK packages, TypeScript, Vite, and Lighthouse were current.
+
 **Outstanding outside Phase 2's milestones.** None of these is a milestone 1 change, and each is tracked here:
 - **CAA record:** an apex CAA record set naming Amazon is now due, since milestone 9 ended the rollback window (`docs/phase-2-inputs.md`, "CAA"). It takes a reviewed `infra/dns/` batch and its reverse, applied by an administrator.
 - **Registrant email:** the check of the registrant's email after the transfer is still open for the owner (the domain transfer paragraph in Phase 1, above).
 - **Owner decisions:** detection and response, and read-only access for agents (`docs/phase-2-inputs.md`, "Operations and security").
-- **Upgrades:** `docs/phase-2-inputs.md`'s "Dependencies" item asks for deliberate upgrades as each milestone starts, but the owner's Phase 2 plan rules out unrelated upgrades. So milestone 1 upgraded nothing. On 2026-10-19, `npm outdated` listed patch releases of React, Vitest, jsdom, and Playwright; whether to take them is the owner's call.

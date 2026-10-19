@@ -12,8 +12,9 @@ Milestone 1 addressed these items:
 - **Styles:** in part. The browser check now walks every Tab stop on every page at 320 pixels, loads each page at a middle width, 768 pixels, and shows scrollbars. `src/styles.test.ts` stays, since no canvas has come.
 - **Allowance:** estimated for milestone 1's pages (ADR 0010, "Load and allowance"); Phase 3 estimates it again for its 3D assets.
 - **Docs:** milestone 1's verification log is in its pull request's description, and ADR 0010 names its tests rather than restating them.
+- **Dependencies:** for milestone 1, by the owner's choice on 2026-10-19 (`docs/progress.md`, "Phase 2").
 
-"Dependencies" is set aside for now: the owner's Phase 2 plan rules out unrelated upgrades (`docs/progress.md`, "Phase 2"). The rest are open.
+The rest are open.
 
 ## Releases
 
