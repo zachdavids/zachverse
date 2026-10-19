@@ -1,11 +1,14 @@
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 import type { Browser } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   browserCheck,
+  encodingFor,
   type Focus,
   focusProblems,
   type Measure,
@@ -272,6 +275,78 @@ describe('serve', () => {
   it('needs a 404 page to serve', async () => {
     const dir = build({ 'index.html': 'home' });
     await expect(serve(dir)).rejects.toThrow(`${dir} has no 404.html to serve.`);
+  });
+
+  // fetch would decode the body itself, so these read the bytes as sent.
+  function getRaw(url: string, acceptEncoding: string) {
+    return new Promise<{ status?: number; encoding?: string; body: Buffer }>((resolve, reject) => {
+      httpGet(url, { headers: { 'accept-encoding': acceptEncoding } }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () =>
+          resolve({
+            status: response.statusCode,
+            encoding: response.headers['content-encoding'],
+            body: Buffer.concat(chunks),
+          }),
+        );
+      }).on('error', reject);
+    });
+  }
+
+  it('compresses what CloudFront would, in the encoding it would choose, and the 404 page too', async () => {
+    const script = `console.log(${JSON.stringify('x'.repeat(2000))});`;
+    const missing = `<!doctype html><title>Missing</title>${'<p>gone</p>'.repeat(100)}`;
+    const dir = build({ 'index.html': 'home', '404.html': missing, 'assets/index-AbCd1234.js': script });
+    const server = await serve(dir);
+    try {
+      const url = `${server.origin}/assets/index-AbCd1234.js`;
+      const br = await getRaw(url, 'gzip, deflate, br, zstd');
+      expect([br.status, br.encoding, brotliDecompressSync(br.body).toString()]).toEqual([200, 'br', script]);
+      // A second request gets the same bytes, compressed once.
+      expect((await getRaw(url, 'br')).body).toEqual(br.body);
+      const gzip = await getRaw(url, 'gzip');
+      expect([gzip.status, gzip.encoding, gunzipSync(gzip.body).toString()]).toEqual([200, 'gzip', script]);
+      const plain = await getRaw(url, 'identity');
+      expect([plain.status, plain.encoding, plain.body.toString()]).toEqual([200, undefined, script]);
+      // Under 1,000 bytes, the home page goes out as it is.
+      expect(await getRaw(`${server.origin}/`, 'br')).toEqual({ status: 200, encoding: undefined, body: Buffer.from('home') });
+      const notFound = await getRaw(`${server.origin}/nowhere/`, 'br');
+      expect([notFound.status, notFound.encoding, brotliDecompressSync(notFound.body).toString()]).toEqual([
+        404,
+        'br',
+        missing,
+      ]);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+describe('encodingFor', () => {
+  const file = (contentType: string, length: number) => ({ contentType, body: Buffer.alloc(length) });
+
+  it('prefers Brotli, then gzip, for a type CloudFront compresses, at the sizes it compresses', () => {
+    expect(encodingFor(file('text/html; charset=utf-8', 1000), 'gzip, deflate, br, zstd')).toBe('br');
+    expect(encodingFor(file('text/javascript; charset=utf-8', 5000), 'gzip;q=1.0, identity')).toBe('gzip');
+    expect(encodingFor(file('image/svg+xml', 10_000_000), 'BR')).toBe('br');
+    for (const type of ['text/css; charset=utf-8', 'text/plain; charset=utf-8', 'application/json', 'application/xml']) {
+      expect(encodingFor(file(type, 2000), 'gzip'), type).toBe('gzip');
+    }
+  });
+
+  it('sends no encoding the browser did not ask for', () => {
+    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'identity')).toBeNull();
+    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'zstd, deflate')).toBeNull();
+    expect(encodingFor(file('text/css; charset=utf-8', 2000))).toBeNull();
+  });
+
+  it('leaves a file outside 1,000 to 10,000,000 bytes, or of a type CloudFront does not compress, as it is', () => {
+    expect(encodingFor(file('text/html; charset=utf-8', 999), 'br')).toBeNull();
+    expect(encodingFor(file('text/html; charset=utf-8', 10_000_001), 'br')).toBeNull();
+    for (const type of ['image/png', 'font/woff2', 'application/manifest+json', 'model/gltf+json', 'text/htmlx']) {
+      expect(encodingFor(file(type, 5000), 'br, gzip'), type).toBeNull();
+    }
   });
 });
 

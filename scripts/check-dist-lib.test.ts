@@ -109,8 +109,8 @@ describe('checkDist', () => {
 
   it('passes a build whose content has characters React escapes', async () => {
     vi.resetModules();
-    vi.doMock('../src/content.ts', async (importOriginal) => {
-      const { profile, site } = await importOriginal<typeof import('../src/content.ts')>();
+    vi.doMock('../src/content/index.ts', async (importOriginal) => {
+      const { profile, site } = await importOriginal<typeof import('../src/content/index.ts')>();
       return {
         profile: {
           ...profile,
@@ -123,7 +123,7 @@ describe('checkDist', () => {
       };
     });
     onTestFinished(() => {
-      vi.doUnmock('../src/content.ts');
+      vi.doUnmock('../src/content/index.ts');
     });
     // Fresh copies of every module that reads the content, as a build with it would run.
     const { render: renderPage } = await import('../src/entry-server.tsx');

@@ -11,7 +11,7 @@ import { parse } from 'yaml';
 import { ASSETS, RECORDS } from '../scripts/release-lib.ts';
 import { SITE_ORIGIN } from '../scripts/site-origin.ts';
 import { SMOKE_REQUEST_BUDGET } from '../scripts/smoke-lib.ts';
-import { site } from '../src/content.ts';
+import { pages, site } from '../src/content/index.ts';
 import { files, git, read, readJson, root, tsc, vitestFiles } from './support/repo.ts';
 
 // jsdom ships no type declarations; these checks only need its window's DOMParser.
@@ -632,7 +632,7 @@ describe('CI workflow', () => {
       );
       // The list must reach nested files: git matches none when it takes pathspecs literally
       // (GIT_LITERAL_PATHSPECS=1), and a * stops at / when it takes them as globs (GIT_GLOB_PATHSPECS=1).
-      expect(sources, dir).toContain(dir === '' ? 'src/content.ts' : 'infra/lib/config.ts');
+      expect(sources, dir).toContain(dir === '' ? 'src/content/site.ts' : 'infra/lib/config.ts');
       expect(sources.filter((file) => !checked.includes(file)), `${dir}tsconfig*.json`).toEqual([]);
     }
   });
@@ -781,7 +781,7 @@ describe('CI workflow', () => {
     const optOut = new RegExp(String.raw`(?:istanbul|[cv]8|node:coverage)\s+ignore\b|@ts-${'no'}check`, 'i');
     const sources = files(['ts', 'tsx', 'mts', 'cts', 'js', 'jsx', 'mjs', 'cjs'].map((extension) => `*.${extension}`));
     // The scan must reach both packages' sources: an empty list would pass, as when git takes pathspecs literally.
-    expect(sources).toEqual(expect.arrayContaining(['src/content.ts', 'infra/functions/viewer-request.js']));
+    expect(sources).toEqual(expect.arrayContaining(['src/content/site.ts', 'infra/functions/viewer-request.js']));
     expect(sources.filter((file) => optOut.test(read(file)))).toEqual([]);
   });
 });
@@ -1543,7 +1543,7 @@ describe('credentials', () => {
     // whatever its pathspec settings, but an empty list would still pass.
     const scanned = files([]);
     expect(scanned).toEqual(
-      expect.arrayContaining(['src/content.ts', 'infra/lib/config.ts', 'docs/progress.md', 'infra/dns/README.md']),
+      expect.arrayContaining(['src/content/site.ts', 'infra/lib/config.ts', 'docs/progress.md', 'infra/dns/README.md']),
     );
     // Only file names are reported, so a failing run does not copy the credential into the CI log.
     expect(scanned.filter((file) => leaks(read(file)))).toEqual([]);
@@ -1641,7 +1641,7 @@ describe('crawler files', () => {
     expect(read('public/robots.txt')).toBe(`User-agent: *\nAllow: /\n\nSitemap: ${sitemap}\n`);
   });
 
-  it('sitemap.xml is well-formed XML listing exactly the origin root', () => {
+  it('sitemap.xml is well-formed XML listing exactly the pages that have an address, in order', () => {
     const ns = 'http://www.sitemaps.org/schemas/sitemap/0.9';
     const { window } = new JSDOM();
     try {
@@ -1651,7 +1651,10 @@ describe('crawler files', () => {
       const urls = Array.from(sitemap.getElementsByTagNameNS(ns, 'url'), (url) =>
         url.getElementsByTagNameNS(ns, 'loc')[0]?.textContent?.trim(),
       );
-      expect(urls).toEqual([new URL('/', site.origin).href]);
+      // The 404 page has none: every missing address serves it, and it asks not to be indexed.
+      const addressed = pages.flatMap((page) => (page.path === null ? [] : [new URL(page.path, site.origin).href]));
+      expect(addressed).toContain(`${site.origin}/`);
+      expect(urls).toEqual(addressed);
     } finally {
       window.close();
     }

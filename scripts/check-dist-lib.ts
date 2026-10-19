@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { profile, site } from '../src/content.ts';
+import { pages, profile, site } from '../src/content/index.ts';
 import { escapeHtml } from './prerender-lib.ts';
 import { ASSETS, HASHED_NAME, isAsset, siteFiles } from './release-lib.ts';
 import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
@@ -82,37 +82,40 @@ export function checkDist(rootDir: URL, release?: string): string[] {
     }
   }
 
-  // React escapes the text and attribute values it renders, so the content needles are escaped too.
-  const index = read('index.html');
-  expectIncludes('index.html', index, [
-    `<title>${site.title}</title>`,
-    'data-page="home"',
+  // Every page in the table, with its own title, description, and page id; a page with an address names its canonical
+  // URL, and the 404 page asks not to be indexed. React escapes the text and attribute values it renders, so the content
+  // needles are escaped too.
+  const built = pages.map((page) => ({ page, file: page.file, html: read(page.file) }));
+  for (const { page, file, html } of built) {
+    expectIncludes(file, html, [
+      `<title>${escapeHtml(page.title)}</title>`,
+      `<meta name="description" content="${escapeHtml(page.description)}" />`,
+      `data-page="${page.id}"`,
+      page.path === null
+        ? '<meta name="robots" content="noindex" />'
+        : `<link rel="canonical" href="${escapeHtml(`${site.origin}${page.path}`)}" />`,
+    ]);
+  }
+
+  const home = built.find(({ page }) => page.id === 'home');
+  expectIncludes('index.html', home?.html ?? '', [
     `>${escapeHtml(profile.name)}</h1>`,
-    // Tag-delimited: the meta description repeats both phrases.
+    // Tag-delimited: the meta description repeats these phrases.
     `>${escapeHtml(profile.role)}</p>`,
-    `>${escapeHtml(profile.status)}</p>`,
-    `<link rel="canonical" href="${site.origin}/" />`,
+    ...profile.summary.map((line) => `>${escapeHtml(line)}</p>`),
     ...profile.links.map((link) => `href="${escapeHtml(link.href)}"`),
   ]);
+  const notFound = built.find(({ page }) => page.id === 'not-found');
+  expectIncludes('404.html', notFound?.html ?? '', ['>Page not found</h1>']);
 
-  const notFound = read('404.html');
-  expectIncludes('404.html', notFound, [
-    `<title>${site.notFoundTitle}</title>`,
-    'data-page="not-found"',
-    '<meta name="robots" content="noindex" />',
-    '>Page not found</h1>',
-  ]);
-
-  for (const [file, html] of [['index.html', index], ['404.html', notFound]] as const) {
+  for (const { file, html } of built) {
     // The template's head: standards mode, the language, the encoding the
-    // titles' em dash needs, the viewport the responsive layout needs, and the
-    // description prerendering fills in from content.ts.
+    // titles' em dash needs, and the viewport the responsive layout needs.
     expectIncludes(file, html, [
       '<!doctype html>',
       '<html lang="en">',
       '<meta charset="UTF-8" />',
       '<meta name="viewport" content="width=device-width, initial-scale=1" />',
-      `<meta name="description" content="${escapeHtml(site.description)}" />`,
     ]);
     if (html.includes('<!--app-')) failures.push(`dist/${file} still contains a prerender marker`);
     const releaseTags = html.match(/<meta name="zachverse-release"[^>]*>/g) ?? [];
@@ -149,7 +152,11 @@ export function checkDist(rootDir: URL, release?: string): string[] {
   }
 
   expectIncludes('robots.txt', read('robots.txt'), [`Sitemap: ${site.origin}/sitemap.xml`]);
-  expectIncludes('sitemap.xml', read('sitemap.xml'), [`<loc>${site.origin}/</loc>`]);
+  expectIncludes(
+    'sitemap.xml',
+    read('sitemap.xml'),
+    pages.flatMap((page) => (page.path === null ? [] : [`<loc>${site.origin}${page.path}</loc>`])),
+  );
 
   return failures;
 }

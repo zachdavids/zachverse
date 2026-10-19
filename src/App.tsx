@@ -1,47 +1,20 @@
-import { profile } from './content.ts';
+import type { ComponentType } from 'react';
+import { pages, type PageId } from './content/index.ts';
+import { Home } from './pages/Home.tsx';
+import { NotFound } from './pages/NotFound.tsx';
+import { Resume } from './pages/Resume.tsx';
 
-export const pageIds = ['home', 'not-found'] as const;
-export type PageId = (typeof pageIds)[number];
+export type { PageId };
+
+export const pageIds: readonly PageId[] = pages.map((page) => page.id);
 
 export function isPageId(value: unknown): value is PageId {
   return pageIds.includes(value as PageId);
 }
 
+const views: Record<PageId, ComponentType> = { home: Home, resume: Resume, 'not-found': NotFound };
+
 export function App({ page }: { page: PageId }) {
-  return page === 'home' ? <Home /> : <NotFound />;
-}
-
-function Home() {
-  return (
-    <main className="card">
-      <p className="eyebrow">Zachverse</p>
-      <h1>{profile.name}</h1>
-      <p className="role">{profile.role}</p>
-      <p className="status">{profile.status}</p>
-      <nav aria-label="Contact">
-        <ul className="links">
-          {profile.links.map((link) => (
-            <li key={link.label}>
-              <a href={link.href} rel={link.href.startsWith('https:') ? 'me' : undefined}>
-                {link.label}
-              </a>
-            </li>
-          ))}
-        </ul>
-      </nav>
-    </main>
-  );
-}
-
-function NotFound() {
-  return (
-    <main className="card">
-      <p className="eyebrow">404</p>
-      <h1>Page not found</h1>
-      <p className="status">There's nothing at this address.</p>
-      <p>
-        <a href="/">Go to the home page</a>
-      </p>
-    </main>
-  );
+  const View = views[page];
+  return <View />;
 }

@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { appendFileSync } from 'node:fs';
 import { chromium } from 'playwright';
-import { site } from '../src/content.ts';
+import { site } from '../src/content/index.ts';
 import { browserCheck, open, serve } from './browser-check-lib.ts';
 
 function required(name: string): string {

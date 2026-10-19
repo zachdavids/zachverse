@@ -1,30 +1,13 @@
-import { readFile, rm, writeFile } from 'node:fs/promises';
-import { site } from '../src/content.ts';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { type Page, type PageId, pages, profile, site } from '../src/content/index.ts';
 
 export interface PrerenderPage {
-  id: 'home' | 'not-found';
+  id: PageId;
   file: string;
   title: string;
   description: string;
   head: string;
 }
-
-export const prerenderPages: readonly PrerenderPage[] = [
-  {
-    id: 'home',
-    file: 'index.html',
-    title: site.title,
-    description: site.description,
-    head: `<link rel="canonical" href="${site.origin}/" />`,
-  },
-  {
-    id: 'not-found',
-    file: '404.html',
-    title: site.notFoundTitle,
-    description: site.description,
-    head: '<meta name="robots" content="noindex" />',
-  },
-];
 
 const markers = {
   head: '<!--app-head-->',
@@ -39,6 +22,63 @@ export function escapeHtml(value: string): string {
   const entities: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
   return value.replace(/[&<>"']/g, (char) => entities[char]!);
 }
+
+/**
+ * Structured data for a page about Zach: the page, and Zach as its main entity, with the profiles that are also his.
+ * JSON.stringify escapes nothing that could end the script element, so every < is written as \u003c, which JSON reads
+ * back as <.
+ */
+export function profilePageData(url: string): string {
+  const data = {
+    '@context': 'https://schema.org',
+    '@type': 'ProfilePage',
+    url,
+    mainEntity: {
+      '@type': 'Person',
+      '@id': `${site.origin}/#person`,
+      name: profile.name,
+      url: `${site.origin}/`,
+      jobTitle: profile.title,
+      worksFor: { '@type': 'Organization', name: profile.employer },
+      sameAs: profile.links.filter((link) => link.href.startsWith('https:')).map((link) => link.href),
+    },
+  };
+  return JSON.stringify(data).replace(/</g, '\\u003c');
+}
+
+/**
+ * The head tags a page adds to the template's. A page with an address names its canonical URL, gives link previews
+ * their title, description, and picture (Open Graph, which X also reads), and carries structured data; the 404 page,
+ * which every missing address serves, asks search engines not to index it.
+ */
+export function headFor(page: Page): string {
+  if (page.path === null) return '<meta name="robots" content="noindex" />';
+  const url = `${site.origin}${page.path}`;
+  const meta = (property: string, content: string | number) =>
+    `<meta property="${property}" content="${escapeHtml(String(content))}" />`;
+  return [
+    `<link rel="canonical" href="${escapeHtml(url)}" />`,
+    meta('og:type', 'website'),
+    meta('og:site_name', site.name),
+    meta('og:title', page.title),
+    meta('og:description', page.description),
+    meta('og:url', url),
+    meta('og:image', `${site.origin}${site.image.path}`),
+    meta('og:image:width', site.image.width),
+    meta('og:image:height', site.image.height),
+    meta('og:image:alt', site.image.alt),
+    '<meta name="twitter:card" content="summary_large_image" />',
+    `<script type="application/ld+json">${profilePageData(url)}</script>`,
+  ].join('\n    ');
+}
+
+export const prerenderPages: readonly PrerenderPage[] = pages.map((page) => ({
+  id: page.id,
+  file: page.file,
+  title: page.title,
+  description: page.description,
+  head: headFor(page),
+}));
 
 function replaceOnce(source: string, search: string | RegExp, value: string): string {
   const count =
@@ -56,7 +96,7 @@ export function renderDocument(template: string, page: PrerenderPage, appHtml: s
   if (!appHtml.trim()) throw new Error(`Prerendered markup for "${page.id}" is empty`);
   const description = escapeHtml(page.description);
   const releaseTag = release === undefined ? '' : `\n    <meta name="zachverse-release" content="${release}" />`;
-  let html = replaceOnce(template, markers.title, `<title>${page.title}</title>`);
+  let html = replaceOnce(template, markers.title, `<title>${escapeHtml(page.title)}</title>`);
   html = replaceOnce(html, markers.description, `<meta name="description" content="${description}" />`);
   html = replaceOnce(html, markers.head, `${page.head}${releaseTag}`);
   html = replaceOnce(html, markers.page, `data-page="${page.id}"`);
@@ -80,7 +120,10 @@ export async function prerender(rootDir: URL, release?: string): Promise<void> {
   };
 
   for (const page of prerenderPages) {
-    await writeFile(new URL(page.file, distDir), renderDocument(template, page, render(page.id), release));
+    const file = new URL(page.file, distDir);
+    // A page served at a directory's address, such as resume/index.html, is written into that directory.
+    await mkdir(new URL('./', file), { recursive: true });
+    await writeFile(file, renderDocument(template, page, render(page.id), release));
     console.log(`prerendered ${page.id} -> dist/${page.file}`);
   }
 

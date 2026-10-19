@@ -3,8 +3,9 @@
 // layouts that scroll sideways on a phone, and keyboard focus that cannot be seen.
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { brotliCompressSync, gzipSync } from 'node:zlib';
 import type { Browser } from 'playwright';
-import { siteFiles } from './release-lib.ts';
+import { type SiteFile, siteFiles } from './release-lib.ts';
 
 /** What the checks read from a rendered page. */
 export interface Measure {
@@ -253,15 +254,34 @@ export async function browserCheck(target: Target, open: Open): Promise<Result> 
   return { passed, failures };
 }
 
+// The content types CloudFront compresses, of those release-lib.ts gives files, and the sizes it compresses: 1,000 to
+// 10,000,000 bytes (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/ServingCompressedFiles.html,
+// read 2026-10-18). The distribution's behavior compresses (infra/lib/site-stack.ts).
+const COMPRESSED_TYPES = /^(?:text\/(?:html|javascript|css|plain)|application\/(?:json|xml)|image\/svg\+xml)(?:;|$)/;
+
+/**
+ * The encoding CloudFront would send file in to a browser that accepts the encodings named in acceptEncoding: Brotli
+ * when the browser takes both it and gzip, as CloudFront prefers it, and none for a type or size it leaves alone.
+ */
+export function encodingFor(file: Pick<SiteFile, 'contentType' | 'body'>, acceptEncoding = ''): 'br' | 'gzip' | null {
+  const { length } = file.body;
+  if (!COMPRESSED_TYPES.test(file.contentType) || length < 1000 || length > 10_000_000) return null;
+  const accepted = acceptEncoding.toLowerCase().split(',').map((part) => part.split(';')[0]!.trim());
+  if (accepted.includes('br')) return 'br';
+  return accepted.includes('gzip') ? 'gzip' : null;
+}
+
 /**
  * Serves the files in dir as CloudFront serves the bucket: a directory path gets its index.html, through the
- * viewer-request function's mapping, and a missing file gets the 404 page with status 404. The files are read once,
- * up front, and a request only looks one up by name.
+ * viewer-request function's mapping, a missing file gets the 404 page with status 404, and a file CloudFront would
+ * compress goes out compressed, so a browser downloads what it would from the site. The files are read once, up
+ * front, and a request only looks one up by name.
  */
 export async function serve(dir: string): Promise<{ origin: string; close: () => Promise<void> }> {
   const files = new Map(siteFiles(dir).map((file) => [file.path, file]));
   const notFound = files.get('404.html');
   if (notFound === undefined) throw new Error(`${dir} has no 404.html to serve.`);
+  const compressed = new Map<string, Buffer>();
   const server = createServer((req, res) => {
     // A request an HTTP server receives always has a URL.
     const path = new URL(req.url!, 'http://localhost').pathname;
@@ -269,8 +289,17 @@ export async function serve(dir: string): Promise<{ origin: string; close: () =>
     const key = path.slice(1) + (name === '' ? 'index.html' : name.includes('.') ? '' : '/index.html');
     const file = files.get(key);
     const served = file ?? notFound;
-    res.writeHead(file ? 200 : 404, { 'content-type': served.contentType, 'cache-control': served.cacheControl });
-    res.end(served.body);
+    const encoding = encodingFor(served, req.headers['accept-encoding']);
+    const headers: Record<string, string> = { 'content-type': served.contentType, 'cache-control': served.cacheControl };
+    let body = served.body;
+    if (encoding !== null) {
+      const cacheKey = `${encoding} ${served.path}`;
+      body = compressed.get(cacheKey) ?? (encoding === 'br' ? brotliCompressSync(body) : gzipSync(body));
+      compressed.set(cacheKey, body);
+      headers['content-encoding'] = encoding;
+    }
+    res.writeHead(file ? 200 : 404, headers);
+    res.end(body);
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;
@@ -282,6 +311,14 @@ export async function serve(dir: string): Promise<{ origin: string; close: () =>
 
 /** How long a page is watched after its network goes quiet, before it is measured. */
 export const SETTLE_MS = 2000;
+
+/**
+ * The most requests one browser check may send to the site. They all come from one runner address, which the web
+ * ACL's rate limit counts (infra/lib/site-stack.ts, RATE_LIMIT_PER_IP), so this is a fifth of that limit, leaving the
+ * rest to visitors who share the address; tests/repo-policy.test.ts keeps the two in step (docs/phase-2-inputs.md,
+ * "Browser check").
+ */
+export const BROWSER_REQUEST_BUDGET = 200;
 
 /** Loads url in its own browser context, collecting what failed, and measures the page; with tab, also the focus. */
 export async function open(browser: Browser, url: string, width: number, tab: boolean): Promise<PageReport> {

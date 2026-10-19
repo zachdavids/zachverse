@@ -4,10 +4,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { escapeHtml, prerender, prerenderPages, renderDocument } from './prerender-lib.ts';
+import { pages } from '../src/content/index.ts';
+import { escapeHtml, headFor, prerender, prerenderPages, profilePageData, renderDocument } from './prerender-lib.ts';
 
 const template = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
-const [home, notFound] = prerenderPages;
+const byId = (id: string) => prerenderPages.find((page) => page.id === id)!;
+const home = byId('home');
+const resume = byId('resume');
+const notFound = byId('not-found');
 
 describe('escapeHtml', () => {
   it('escapes the characters React escapes in text and attribute values', () => {
@@ -19,9 +23,11 @@ describe('escapeHtml', () => {
 describe('renderDocument', () => {
   it('fills the title, description, head, page id, and markup for the home page', () => {
     const html = renderDocument(template, home!, '<main>hello</main>');
-    expect(html).toContain('<title>Zachverse — Zach Davids</title>');
+    expect(html).toContain('<title>Zach Davids — Senior Software Engineer at Amazon</title>');
     expect(html).toContain(
-      '<meta name="description" content="Zach Davids, Senior Software Engineer at Amazon. Interactive portfolio coming soon." />',
+      '<meta name="description" content="Zach Davids, Senior Software Engineer at Amazon. I build embedded C++ systems, ' +
+        'device-platform software, and AWS services for Kindle e-readers. Before Amazon, I was a gameplay programmer at ' +
+        'Rockstar Games." />',
     );
     expect(html).toContain('<link rel="canonical" href="https://zachdavids.com/" />');
     expect(html).toContain('<div id="root" data-page="home"><main>hello</main></div>');
@@ -32,9 +38,7 @@ describe('renderDocument', () => {
   it('names the release in the head only when given one', () => {
     const release = '0123456789abcdef0123456789abcdef01234567';
     const tag = `<meta name="zachverse-release" content="${release}" />`;
-    expect(renderDocument(template, home!, '<main>hi</main>', release)).toContain(
-      `<link rel="canonical" href="https://zachdavids.com/" />\n    ${tag}\n  </head>`,
-    );
+    expect(renderDocument(template, home!, '<main>hi</main>', release)).toContain(`</script>\n    ${tag}\n  </head>`);
     expect(renderDocument(template, notFound!, '<main>hi</main>', release)).toContain(
       `<meta name="robots" content="noindex" />\n    ${tag}\n  </head>`,
     );
@@ -43,10 +47,24 @@ describe('renderDocument', () => {
 
   it('marks the 404 page noindex and records its page id for hydration', () => {
     const html = renderDocument(template, notFound!, '<main>missing</main>');
-    expect(html).toContain('<title>Page not found — Zachverse</title>');
+    expect(html).toContain('<title>Page not found — Zach Davids</title>');
     expect(html).toContain('<meta name="robots" content="noindex" />');
     expect(html).toContain('data-page="not-found"');
     expect(html).not.toContain('rel="canonical"');
+    expect(html).not.toContain('og:');
+  });
+
+  it('fills the résumé page with its own title, canonical URL, and page id', () => {
+    expect(resume).toMatchObject({ file: 'resume/index.html', title: 'Résumé — Zach Davids' });
+    const html = renderDocument(template, resume, '<main>cv</main>');
+    expect(html).toContain('<title>Résumé — Zach Davids</title>');
+    expect(html).toContain('<link rel="canonical" href="https://zachdavids.com/resume/" />');
+    expect(html).toContain('<div id="root" data-page="resume"><main>cv</main></div>');
+  });
+
+  it('escapes the title for the title element', () => {
+    const html = renderDocument(template, { ...home, title: 'Tom & <Jerry>' }, '<main />');
+    expect(html).toContain('<title>Tom &amp; &lt;Jerry&gt;</title>');
   });
 
   it("replaces the template's description with the page's, escaped for the attribute", () => {
@@ -97,6 +115,63 @@ describe('renderDocument', () => {
   });
 });
 
+describe('headFor', () => {
+  it('gives a page with an address its canonical URL, link-preview tags, and structured data, one tag a line', () => {
+    const page = pages.find((p) => p.id === 'resume')!;
+    expect(headFor(page).split('\n    ')).toEqual([
+      '<link rel="canonical" href="https://zachdavids.com/resume/" />',
+      '<meta property="og:type" content="website" />',
+      '<meta property="og:site_name" content="Zachverse" />',
+      '<meta property="og:title" content="Résumé — Zach Davids" />',
+      `<meta property="og:description" content="${escapeHtml(page.description)}" />`,
+      '<meta property="og:url" content="https://zachdavids.com/resume/" />',
+      '<meta property="og:image" content="https://zachdavids.com/og-image.png" />',
+      '<meta property="og:image:width" content="1200" />',
+      '<meta property="og:image:height" content="630" />',
+      '<meta property="og:image:alt" content="Zach Davids, Senior Software Engineer at Amazon" />',
+      '<meta name="twitter:card" content="summary_large_image" />',
+      `<script type="application/ld+json">${profilePageData('https://zachdavids.com/resume/')}</script>`,
+    ]);
+  });
+
+  it('asks search engines not to index the 404 page, and gives it nothing else', () => {
+    expect(headFor(pages.find((p) => p.id === 'not-found')!)).toBe('<meta name="robots" content="noindex" />');
+  });
+
+  it("escapes a page's title and description in the tags' values", () => {
+    const head = headFor({ ...pages[0], title: 'A "B" & C', description: "D's <E>" });
+    expect(head).toContain('<meta property="og:title" content="A &quot;B&quot; &amp; C" />');
+    expect(head).toContain('<meta property="og:description" content="D&#x27;s &lt;E&gt;" />');
+  });
+});
+
+describe('profilePageData', () => {
+  it('describes the page and Zach, with the profiles that are also his', () => {
+    expect(JSON.parse(profilePageData('https://zachdavids.com/'))).toEqual({
+      '@context': 'https://schema.org',
+      '@type': 'ProfilePage',
+      url: 'https://zachdavids.com/',
+      mainEntity: {
+        '@type': 'Person',
+        '@id': 'https://zachdavids.com/#person',
+        name: 'Zach Davids',
+        url: 'https://zachdavids.com/',
+        jobTitle: 'Senior Software Engineer',
+        worksFor: { '@type': 'Organization', name: 'Amazon' },
+        sameAs: ['https://github.com/zachdavids', 'https://www.linkedin.com/in/zacharydavids/'],
+      },
+    });
+  });
+
+  it('writes no < that could end the script element, and JSON reads the escape back', () => {
+    const url = 'https://zachdavids.com/</script><script>alert(1)</script>';
+    const data = profilePageData(url);
+    expect(data).not.toContain('<');
+    expect(data).toContain('\\u003c/script>');
+    expect(JSON.parse(data).url).toBe(url);
+  });
+});
+
 describe('prerender', () => {
   // Stands in for the `vite build --ssr` output.
   const serverEntry = 'export const render = (page) => "<main>rendered " + page + "</main>";\n';
@@ -126,21 +201,27 @@ describe('prerender', () => {
     await prerender(rootUrl);
 
     const index = await readDist(rootUrl, 'index.html');
-    expect(index).toContain('<title>Zachverse — Zach Davids</title>');
+    expect(index).toContain('<title>Zach Davids — Senior Software Engineer at Amazon</title>');
     expect(index).toContain('<link rel="canonical" href="https://zachdavids.com/" />');
     expect(index).toContain('<div id="root" data-page="home"><main>rendered home</main></div>');
     expect(index).toBe(renderDocument(template, home!, '<main>rendered home</main>'));
 
     // Rendered from the original template, not the index.html written just before it.
     const notFoundPage = await readDist(rootUrl, '404.html');
-    expect(notFoundPage).toContain('<title>Page not found — Zachverse</title>');
+    expect(notFoundPage).toContain('<title>Page not found — Zach Davids</title>');
     expect(notFoundPage).toContain('<meta name="robots" content="noindex" />');
     expect(notFoundPage).toContain('<div id="root" data-page="not-found"><main>rendered not-found</main></div>');
     expect(notFoundPage).toBe(renderDocument(template, notFound!, '<main>rendered not-found</main>'));
 
+    // A page at a directory's address goes into a directory the client build did not make.
+    expect(await readDist(rootUrl, 'resume/index.html')).toBe(
+      renderDocument(template, resume, '<main>rendered resume</main>'),
+    );
+
     expect(existsSync(new URL('dist-ssr/', rootUrl))).toBe(false);
     expect(log.mock.calls).toEqual([
       ['prerendered home -> dist/index.html'],
+      ['prerendered resume -> dist/resume/index.html'],
       ['prerendered not-found -> dist/404.html'],
     ]);
   });
