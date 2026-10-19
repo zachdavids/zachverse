@@ -21,8 +21,10 @@ describe('render', () => {
         '<p class="role">Senior Software Engineer at Amazon</p>' +
         '<p class="summary">I build embedded C++ systems, device-platform software, and AWS services for Kindle e-readers.</p>' +
         '<p class="summary">Before Amazon, I was a gameplay programmer at Rockstar Games.</p>' +
+        '<div class="actions">' +
         '<nav aria-label="Site"><ul class="links"><li><a href="/resume/">Résumé</a></li></ul></nav>' +
         contactLinks +
+        '</div>' +
         '</main>',
     );
   });

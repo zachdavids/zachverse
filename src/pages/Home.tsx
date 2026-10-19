@@ -1,7 +1,10 @@
 import { ContactLinks, SiteLinks } from '../components/Links.tsx';
 import { profile } from '../content/index.ts';
 
-/** Who Zach is, in one card: his name, role, and both employers, then the site's pages and his contact links. */
+/**
+ * Who Zach is, in one card: his name, role, and both employers, then the site's pages and his contact links, in one
+ * row of buttons that wraps where it runs out of room.
+ */
 export function Home() {
   return (
     <main className="card">
@@ -12,8 +15,10 @@ export function Home() {
           {line}
         </p>
       ))}
-      <SiteLinks />
-      <ContactLinks />
+      <div className="actions">
+        <SiteLinks />
+        <ContactLinks />
+      </div>
     </main>
   );
 }
