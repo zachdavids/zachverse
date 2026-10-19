@@ -10,8 +10,9 @@ Milestone 1 addressed these items:
 - **Browser check:** a request budget tied to the rate limit.
 - **Content module:** now `src/content/`, still plain data.
 - **Styles:** in part. The browser check now walks every Tab stop on every page, at a middle width, with scrollbars shown. `src/styles.test.ts` stays, since no canvas has come.
+- **Docs:** milestone 1's verification log is in its pull request's description, and ADR 0010 names its tests rather than restating them.
 
-The rest are open.
+"Dependencies" is set aside for now: the owner's Phase 2 plan rules out unrelated upgrades (`docs/progress.md`, "Phase 2"). The rest are open.
 
 ## Releases
 

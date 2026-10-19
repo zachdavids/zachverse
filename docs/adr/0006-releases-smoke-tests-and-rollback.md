@@ -31,7 +31,7 @@ The jobs with the role install no packages. The browser checks, which need Playw
    - **Checksums:** each upload carries a SHA-256 checksum, which S3 checks before it accepts the object.
 5. **Saves a copy**, if there is none: every file of the release under `_releases/<commit>/site/`, then its manifest (each file's path, SHA-256, size, content type, and `Cache-Control`) as `_releases/<commit>/manifest.json`. The manifest is written last, so a manifest means a complete copy.
 6. **Records the release as started** in `_releases/history.json`: the action, the commit, the run (`<run ID>-<attempt>`), and the time.
-7. **Publishes the pages**, every file outside `assets/`: other files first, then HTML, then each `index.html`, so whatever a page refers to is there before it.
+7. **Publishes the pages**, every file outside `assets/`: other files first, then HTML, then each `index.html`, and the home page last, since it links to every other page with an address (ADR 0010), so whatever a page refers to is there before it.
 8. **Removes the pages the release no longer has:** every object outside `assets/` and `_releases/` that the release does not list.
 9. **Invalidates**, and waits for the invalidation to complete (the AWS CLI gives up after 10 minutes):
    - the paths of its pages and of the pages it removed;
@@ -79,7 +79,7 @@ A failed check fails its job, and the release is never recorded as verified, so 
 - in CI on each pull request, and in the build job, on the built pages served locally the way CloudFront serves them (`npm run check:browser`);
 - then in the browser job, on the live release at `zachdavids.com`, with Chromium resolving the site's hostnames to the distribution, so it too runs before DNS points at CloudFront. That job installs its packages and Chromium after the release is live, and a failed install would roll the release back, so it retries each install twice, 30 seconds apart.
 
-It loads every page in the site's page table, with scrollbars shown: since Phase 2, at 320, 768, and 1280 pixels, and at 320 pixels in dark mode. It also loads each page at its other addresses, a reload, and missing pages below each address and at the root (ADR 0010, "Checks"). It watches each load for 2 seconds after its network goes quiet, then checks that:
+It loads every page in the site's page table, with scrollbars shown: since Phase 2, each page with an address at 320, 768, and 1280 pixels, and at 320 pixels in dark mode, and the 404 page at 320 pixels, in light and dark mode. It also loads each page at its other addresses, a reload, and missing pages below each address and at the root (ADR 0010, "Checks"). It watches each load for 2 seconds after its network goes quiet, then checks that:
 
 - no script threw, nothing logged a console error, and no request failed or got an error status. The 404 page's own status, and the one console message Chromium logs for it, are the exceptions;
 - every script and stylesheet the page links loaded, and every stylesheet has rules;

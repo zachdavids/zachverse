@@ -25,15 +25,20 @@ Phase 2, as the owner planned it on 2026-10-16, makes the site a complete HTML p
 
 | # | Milestone | Status | PR / evidence |
 | --- | --- | --- | --- |
-| 1 | Design direction, content module, home page, navigation, and verified URL handling, plus the résumé page, brought forward from milestone 2 | In review | TODO-PR; ADR 0010 |
+| 1 | Design direction, content module, home page, navigation, and verified URL handling, plus the résumé page, brought forward from milestone 2 | In review | TODO-PR, whose description holds the verification before the merge; ADR 0010 |
 | 2 | Flagship case study (and a second, if approved material is ready), and "How this site is built" | Not started | |
 | 3 | Cross-page checks, a real-device review, a five-second test with five people, fixes, and release verification | Not started | |
 
 **Design direction (2026-10-18).** The owner declined both generated homepage concepts and kept Phase 1's layout. It may stay for good, or a redesign by the owner or a designer may replace it (ADR 0010, "Design").
 
-**3D moves to Phase 3.** Phase 1's documents assumed Phase 2 would bring the 3D scenes, in two places: `docs/phase-2-inputs.md`'s "3D content" section, and ADR 0007's note that "Phase 2's 3D assets may need a higher tier". Under the owner's plan, Phase 2 has no 3D, controls, physics, or game assets, so those notes now apply to Phase 3. The inputs file marks which items milestone 1 addressed.
+**3D moves to Phase 3.** Phase 1's documents assumed Phase 2 would bring the 3D scenes:
+- `docs/phase-2-inputs.md`'s "3D content" section, and the 3D parts of its "Rate limit" and "Compression" items;
+- ADR 0007's note that "Phase 2's 3D assets may need a higher tier", and its rate-limit limit, which said Phase 2 would re-derive the limit.
+
+Under the owner's plan, Phase 2 has no 3D, controls, physics, or game assets, so those notes now apply to Phase 3. ADR 0007 now says so. Of the "3D content" section, three items still apply to Phase 2's pages: "Content module", "Styles", and "Prerendering". The inputs file marks which items milestone 1 addressed.
 
 **Outstanding outside Phase 2's milestones.** None of these is a milestone 1 change, and each is tracked here:
 - **CAA record:** an apex CAA record set naming Amazon is now due, since milestone 9 ended the rollback window (`docs/phase-2-inputs.md`, "CAA"). It takes a reviewed `infra/dns/` batch and its reverse, applied by an administrator.
 - **Registrant email:** the check of the registrant's email after the transfer is still open for the owner (the domain transfer paragraph in Phase 1, above).
 - **Owner decisions:** detection and response, and read-only access for agents (`docs/phase-2-inputs.md`, "Operations and security").
+- **Upgrades:** `docs/phase-2-inputs.md`'s "Dependencies" item asks for deliberate upgrades as each milestone starts, but the owner's Phase 2 plan rules out unrelated upgrades. So milestone 1 upgraded nothing. On 2026-10-19, `npm outdated` listed patch releases of React, Vitest, jsdom, and Playwright; whether to take them is the owner's call.
