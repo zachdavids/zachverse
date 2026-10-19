@@ -63,7 +63,47 @@ The 404 page asks not to be indexed and has none of these tags. `public/sitemap.
 
 **Preview picture.** `docs/og-image/render.mjs` renders `public/og-image.png` from the name and role in `src/content/profile.ts`, using Phase 1's card, palette, and system fonts. The committed picture was rendered on Windows, in Segoe UI. Run the script again after a change to the name, role, or palette.
 
-TODO-CHECKS
+**Checks.** Every check reads the page table, so a page added to it is checked with no other change.
+- **`check:dist`** runs in CI and in the deploy build. It checks:
+  - each page's title, description, `data-page` value, and canonical URL;
+  - for each page with an address, its Open Graph and `twitter:card` tags. `og:url` must be the canonical URL, and `og:image` the site's picture, which must exist as a PNG of the size its tags give;
+  - for each page with an address, exactly one JSON-LD script, which parses, names a `ProfilePage` at the canonical URL with Zach as its main entity, and holds no `<`, and no robots rule that keeps the page out of search results;
+  - the 404 page's `noindex`, and that it has none of the tags above;
+  - the home page's links to every other page with an address;
+  - the sitemap's entries.
+
+  It also measures the build against the size budgets below.
+- **The browser check** runs in CI, in the deploy build, and on the live release (ADR 0006).
+  - **Pages and widths:** every page with an address at 320, 768, and 1280 pixels with scrollbars shown, and at 320 pixels in dark mode. The 404 page is loaded at a missing address, in light and dark mode.
+  - **Keyboard:** at 320 pixels, in light and dark mode, Tab walks every stop. Each stop must show a focus indicator and lie on the screen, and Tab must reach each of the page's focusable elements once, in document order.
+  - **Accessibility rules:** every one of those loads runs axe-core's WCAG 2.0, 2.1, and 2.2 A and AA rules, and its best practices.
+  - **Addresses:** each page loads with a query string. Each page below the root also loads without its trailing slash and after a reload, and a missing page below it must get the 404 page with status 404. Every page must name its own canonical URL, and the 404 page none.
+  - **Request budget:** all the loads together stay within 200 requests, a fifth of the web ACL's rate limit for one address. `tests/repo-policy.test.ts` keeps the two in step (`docs/phase-2-inputs.md`, "Browser check").
+  - **Screenshots:** in CI, it saves a screenshot of each page at each width and in dark mode. CI keeps them with the run for 30 days, for the pull request's review.
+- **Lighthouse** runs in CI's web job only. It measures each page with an address as a phone and as a desktop, with simulated throttling, against these limits:
+  - scores of 100 for accessibility, best practices, and SEO, and at least 90 for performance;
+  - LCP of at most 2.5 s and CLS of at most 0.1;
+  - total blocking time (TBT) of at most 200 ms. TBT stands in for INP, which needs a visitor's interactions.
+
+  The deploy workflow skips Lighthouse, because lab scores vary from run to run and CI on the pull request gates the merge.
+- **The local server** that the browser check and Lighthouse use serves `dist/` as CloudFront serves the bucket: the viewer-request function's mapping, the 404 page with status 404, and CloudFront's compression (Brotli or gzip, for the types and sizes CloudFront compresses). So lab measurements see the bytes a visitor downloads. It compresses each file before it starts, so no request waits on it.
+- **`tests/path-mapping.test.ts`** runs the real viewer-request function on the paths that the two copies of its mapping see (`docs/phase-2-inputs.md`, "Path mapping"). One copy is `check:dist`'s; the other, in `scripts/release-lib.ts`, is shared by the smoke test and the local server.
+
+**Size budgets.** Each file counts at the size CloudFront would send to a browser that accepts gzip: gzipped at Node's default level if CloudFront compresses its type and size, and otherwise its own size. Node's gzip only approximates CloudFront's.
+
+| Kind | Budget | Milestone 1 |
+| --- | --- | --- |
+| JavaScript (all of it, under `assets/`) | 100 KiB | 75.4 KiB |
+| CSS | 10 KiB | 0.9 KiB |
+| HTML, the largest page | 30 KiB | 8.6 KiB, the résumé |
+| Images | 100 KiB | 31.3 KiB: the preview picture and the icon |
+| Fonts | none | none |
+
+Most of the JavaScript is React, which hydrates every page (ADR 0001). The one bundle also carries every page's text, so each new page adds to every page's script.
+
+**Load and allowance.** A release is now 9 files, 304 KB. Its smoke test sends 18 requests through the distribution, against a budget of 500. The live browser check sends 48 against its budget of 200, and each release invalidates 10 paths.
+
+A visitor's first load of the home page is 4 requests and about 80 KB as sent. Against the Free plan's monthly allowance, 1 million requests last about 250,000 such visits and 100 GB about 1.25 million (`docs/phase-2-inputs.md`, "Allowance").
 
 **Test tooling.** Two new dev dependencies, pinned exactly like Playwright:
 - axe-core 4.13.0, published 2026-08-05.
@@ -73,8 +113,48 @@ They are pinned because a new rule or a scoring change could fail CI with no cha
 
 ## Verification before the merge (2026-10-18)
 
-TODO-VERIFY
+On this branch, on Windows 11 with Node 24 and Playwright's Chromium 153 headless shell:
+- **`npm run typecheck`:** passed.
+- **`npm run test:coverage`:** 765 tests passed in 23 files, at 100% of statements, branches, functions, and lines. Three were skipped: a file-symlink case, once per page, which Windows refuses without Developer Mode and CI on Linux runs.
+- **`npm run check:dist`:** passed, with the sizes above.
+- **`npm run check:browser`:** passed: 15 loads and 48 requests, with no axe-core violation in light or dark mode.
+- **`npm run check:lighthouse`:** passed:
+
+| Page | Form factor | Performance | Accessibility | Best practices | SEO | LCP | CLS | TBT |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `/` | mobile | 100 | 100 | 100 | 100 | 1201 ms | 0 | 0 ms |
+| `/` | desktop | 100 | 100 | 100 | 100 | 321 ms | 0 | 0 ms |
+| `/resume/` | mobile | 100 | 100 | 100 | 100 | 1201 ms | 0 | 0 ms |
+| `/resume/` | desktop | 100 | 100 | 100 | 100 | 321 ms | 0 | 0 ms |
+
+These are lab results: one simulated load per page and form factor, from the local server.
+
+**Manual checks** on the built pages, served as CloudFront serves them, in the same Chromium:
+- **Keyboard:** Tab reaches every link on each page, in order, each with a 2-pixel outline in the link colour and on the screen. The browser check now checks this on every run.
+- **Menu:** the site has none.
+- **200% zoom:** each page in a 640 × 400 window, which is a 1280 × 800 window at 200%, with scrollbars shown. Nothing scrolls sideways, and the text reflows.
+- **Reduced motion:** no animation or transition runs, with or without `prefers-reduced-motion`. The stylesheet has none.
+- **Narrow phone:** at 320 pixels, in light and dark mode, nothing scrolls sideways. The browser check checks this too.
+- **Screen reader:** none was run. The accessibility tree, which a screen reader reads, was inspected instead. It has the landmarks (`main`, and the "Site" and "Contact" navigation), one `h1` a page, the résumé's outline of `h2` to `h4` headings, lists, and a definition list for the skills. A screen reader's spot check belongs to milestone 3's device review.
+
+**Links:**
+- GitHub's profile resolves, and its API names Zach Davids.
+- The LinkedIn link redirects to `/in/zacharydavids`, which refuses automated requests (status 999). It needs the check by hand that milestone 3's review includes.
+- The email address receives mail (`docs/progress.md`, "Email records").
+
+**Production** can be checked only after the merge, since the deploy workflow runs only on `main` (ADR 0006, "Limits"). The Deploy run's smoke test fetches `/resume/` and every file through the distribution. Its live browser check loads every address above at `zachdavids.com`, through the distribution: `/resume`, the query strings, the reload, and the 404 page below `/resume/`.
 
 ## Limits
 
-TODO-LIMITS
+- **Lab, not field:** every performance number here is a lab measurement, one simulated load per page and form factor. The site collects no field data, so INP is unmeasured, and LCP and CLS for real visits are unknown.
+- **Lighthouse's machine:** scores and timings depend on the CPU they run on, so a slow runner could fail a page that passes elsewhere. The margins were wide on 2026-10-18: the worst LCP was 1.2 s against 2.5 s.
+- **What the browser check sees:** it sees what Chromium sees, and judges nothing about a page's look beyond what it measures (ADR 0006, "Limits").
+  - Dark mode is loaded only at 320 pixels.
+  - Its Tab walk models what Chromium's Tab reaches, without radio groups, image maps, or scrolling regions, which the site doesn't have.
+  - A negative `tabindex` takes an element out of the walk on purpose, so a link given one by mistake passes.
+- **Automated accessibility checks:** axe-core and Lighthouse find only what rules can find. A person using a screen reader, and on real devices, is milestone 3's review.
+- **One bundle:** the JavaScript carries every page's text, so every page's script grows with the site. If the budget tightens, the next step is a chunk for each page.
+- **No redirect to the trailing slash:** `/resume` and `/resume/` both answer 200, and the page names `/resume/` as canonical, which search engines follow. A redirect would take a change to the viewer-request function, staged as ADR 0006's "Infrastructure first" requires.
+- **The sitemap** is written by hand. The policy test keeps it equal to the page table.
+- **The preview picture** is rendered with the machine's fonts, so rendering it on another machine gives a slightly different picture.
+- **The LinkedIn link** can't be checked automatically.

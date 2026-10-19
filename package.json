@@ -2,7 +2,7 @@
   "name": "zachverse",
   "private": true,
   "version": "0.1.0",
-  "description": "Zachverse: Zach Davids's portfolio site (Phase 1 placeholder).",
+  "description": "Zachverse: Zach Davids's portfolio site.",
   "license": "MIT",
   "type": "module",
   "engines": {
