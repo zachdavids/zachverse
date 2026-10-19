@@ -7,6 +7,7 @@ import {
   checkOrder,
   type Context,
   describeFile,
+  encodingFor,
   type Entry,
   IMMUTABLE,
   invalidationPaths,
@@ -17,6 +18,7 @@ import {
   restore,
   rollBack,
   REVALIDATE,
+  servedPath,
   sha256,
   siteFiles,
   type Store,
@@ -268,6 +270,19 @@ describe('checkOrder', () => {
 });
 
 describe('publish', () => {
+  it('writes a page below the root before the home page, which links to it', async () => {
+    const { log, repository, context } = fakes();
+    await publish(site({ 'about/index.html': '<!doctype html><title>About</title>' }), A, repository, context);
+    const pages = log.filter((line) => /^write (?!_releases\/|assets\/)/.test(line));
+    expect(pages).toEqual([
+      'write favicon.svg',
+      'write robots.txt',
+      'write 404.html',
+      'write about/index.html',
+      'write index.html',
+    ]);
+  });
+
   it('uploads assets, then a copy of the release, then the pages with index.html last, then invalidates them', async () => {
     const { objects, log, compared, repository, context } = fakes();
     const outcome = await publish(site(), A, repository, context);
@@ -971,5 +986,43 @@ describe('readHistory', () => {
   it('reads a history from before the format marker as format 1', async () => {
     const { store } = fakes(new Map([['_releases/history.json', json({ entries: [entry(A)] })]]));
     expect(await readHistory(store)).toEqual([entry(A)]);
+  });
+});
+
+describe('encodingFor', () => {
+  const file = (contentType: string, length: number) => ({ contentType, body: Buffer.alloc(length) });
+
+  it('prefers Brotli, then gzip, for a type CloudFront compresses, at the sizes it compresses', () => {
+    expect(encodingFor(file('text/html; charset=utf-8', 1000), 'gzip, deflate, br, zstd')).toBe('br');
+    expect(encodingFor(file('text/javascript; charset=utf-8', 5000), 'gzip;q=1.0, identity')).toBe('gzip');
+    expect(encodingFor(file('image/svg+xml', 10_000_000), 'BR')).toBe('br');
+    for (const type of ['text/css; charset=utf-8', 'text/plain; charset=utf-8', 'application/json', 'application/xml']) {
+      expect(encodingFor(file(type, 2000), 'gzip'), type).toBe('gzip');
+    }
+  });
+
+  it('sends no encoding the browser did not ask for', () => {
+    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'identity')).toBeNull();
+    expect(encodingFor(file('text/css; charset=utf-8', 2000), 'zstd, deflate')).toBeNull();
+    expect(encodingFor(file('text/css; charset=utf-8', 2000))).toBeNull();
+  });
+
+  it('leaves a file outside 1,000 to 10,000,000 bytes, or of a type CloudFront does not compress, as it is', () => {
+    expect(encodingFor(file('text/html; charset=utf-8', 999), 'br')).toBeNull();
+    expect(encodingFor(file('text/html; charset=utf-8', 10_000_001), 'br')).toBeNull();
+    for (const type of ['image/png', 'font/woff2', 'application/manifest+json', 'model/gltf+json', 'text/htmlx']) {
+      expect(encodingFor(file(type, 5000), 'br, gzip'), type).toBeNull();
+    }
+  });
+});
+
+describe('servedPath', () => {
+  // tests/path-mapping.test.ts runs infra/functions/viewer-request.js against this copy, path by path.
+  it('gives a directory path its index.html, and a path whose last segment has a dot that file', () => {
+    expect(servedPath('/')).toBe('index.html');
+    expect(servedPath('/resume/')).toBe('resume/index.html');
+    expect(servedPath('/resume')).toBe('resume/index.html');
+    expect(servedPath('/assets/index-AbCd1234.js')).toBe('assets/index-AbCd1234.js');
+    expect(servedPath('/v1.2/notes')).toBe('v1.2/notes/index.html');
   });
 });

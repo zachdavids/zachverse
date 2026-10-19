@@ -1,7 +1,7 @@
 # ADR 0007: Web ACL and the Free flat-rate plan
 
 - Status: Accepted (milestone 7), and deployed on 2026-10-15 with the runbook below, after milestone 6's first release had passed its checks. Its steps 6 to 9 passed ("Deployed").
-- Date: 2026-10-15, revised the same day after review and after the Phase 1 review
+- Date: 2026-10-15, revised the same day after review and after the Phase 1 review, and on 2026-10-19 for Phase 2's browser check and 3D's move to Phase 3 (ADR 0010)
 
 ## Context
 
@@ -186,11 +186,11 @@ An administrator ran the runbook from #7's branch, with the owner's approval:
 
 ## Limits
 
-- **Usage allowances:** the Free tier's 1 million requests and 100 GB a month are not hard limits. AWS notifies at 50%, 80%, and 100%, and may slow delivery after sustained excess. Phase 2's 3D assets may need a higher tier.
+- **Usage allowances:** the Free tier's 1 million requests and 100 GB a month are not hard limits. AWS notifies at 50%, 80%, and 100%, and may slow delivery after sustained excess. Phase 3's 3D assets may need a higher tier.
 - **Rule group updates:** AWS updates its managed rule groups, and the web ACL uses their default versions, so a new rule could start blocking legitimate requests. The smoke test and browser check would see it only at the next release, and the owner's monitor ("Monitoring") only if it blocks the monitor's own requests.
 - **Seeing blocks:** without request logs, a block shows only in sampled requests, which WAF keeps for 3 hours, and in CloudWatch metrics.
 - **The checks' addresses:** the IP reputation group can list a GitHub-hosted runner's address, and so fail that run ("If a step fails").
-- **The rate limit:** it counts per IP address, so visitors behind one shared address share it. The smoke test's requests count too: `check:dist` keeps each build under half the limit, and a release with more files than that needs a higher limit or a smoke test that paces itself, though the release jobs' time limits bind first (ADR 0006, "Limits"). The live browser check's requests count as well, with no budget: three page loads with an empty cache, from one runner. The limit was sized for the placeholder; Phase 2 re-derives it from its pages' request counts (`docs/phase-2-inputs.md`).
+- **The rate limit:** it counts per IP address, so visitors behind one shared address share it. The smoke test's requests count too: `check:dist` keeps each build under half the limit, and a release with more files than that needs a higher limit or a smoke test that paces itself, though the release jobs' time limits bind first (ADR 0006, "Limits"). The live browser check's requests count as well, from one runner: since Phase 2, 15 page loads with an empty cache, about 50 requests, within a budget of 200, a fifth of the limit, which `tests/repo-policy.test.ts` keeps in step (ADR 0010). The limit was sized for the placeholder, and Phase 2's pages fit it; Phase 3 re-derives it from its 3D pages' request counts (`docs/phase-2-inputs.md`).
 - **Hosted zone records:** the zone must stay within the Free tier's 50 records while it is attached.
 - **No alerting:** nothing in AWS or this repository watches the live site between releases. The Website account's SCP denies CloudWatch alarm writes, SNS, EventBridge, and Synthetics in us-east-1, where CloudFront's and the web ACL's metrics live, and an alarm can't watch another Region's metrics. The repository's workflows run only on pushes, pull requests, and by hand. The release checks connect to the distribution directly, whatever DNS says. What still reaches the owner is email: AWS Health notices, ACM's renewal warnings, the usage notices above, the payer budget's alerts, and a failed Deploy run. Any of it sent to a zachdavids.com address depends on the same zone as the site. From milestone 8's cutover on, the owner's monitor ("Monitoring") is the only check that goes through public DNS.
 - **What the guardrails can't check:** they read templates. They can't see another distribution's use of the viewer-request function, a web ACL attached outside CloudFormation, Shield Advanced, the account's plan, or usage that rules out a tier. Runbook step 3 checks the first three and compares the usage with the allowances; the owner confirmed the account's plan, which no API reports. AWS judges usage by a rule it doesn't publish, and refuses an ineligible subscription at deploy time, which rolls the update back ("If a step fails").

@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { appendFileSync } from 'node:fs';
 import { chromium } from 'playwright';
-import { site } from '../src/content.ts';
+import { pages, site } from '../src/content/index.ts';
 import { browserCheck, open, serve } from './browser-check-lib.ts';
 
 function required(name: string): string {
@@ -36,10 +36,22 @@ async function main(args: string[]): Promise<string[]> {
     throw new Error('Usage: node scripts/browser-check.ts local <dir> | live');
   }
   try {
-    const browser = await chromium.launch({ args: launchArgs });
+    // Playwright hides headless Chromium's scrollbars. Shown, as Windows and Linux show them, they take their width
+    // from the page's, so a layout 100vw wide scrolls sideways, as it would there.
+    const browser = await chromium.launch({ args: launchArgs, ignoreDefaultArgs: ['--hide-scrollbars'] });
     try {
-      const target = { origin, release, probe: `browser-check-${randomUUID()}` };
-      const { passed, failures } = await browserCheck(target, (url, width, tab) => open(browser, url, width, tab));
+      // The pages name their canonical URLs at the site's own origin, wherever they are served from. CI keeps a
+      // screenshot of each page at each width for the pull request's review, in BROWSER_CHECK_SCREENSHOTS.
+      const target = {
+        origin,
+        canonicalOrigin: site.origin,
+        release,
+        probe: `browser-check-${randomUUID()}`,
+        screenshots: process.env.BROWSER_CHECK_SCREENSHOTS || undefined,
+      };
+      const { passed, failures } = await browserCheck(target, pages, (url, width, options) =>
+        open(browser, url, width, options),
+      );
       const lines = [
         `### Browser check (${mode === 'live' ? `${site.origin}, through the distribution` : dir})`,
         '',
@@ -47,9 +59,12 @@ async function main(args: string[]): Promise<string[]> {
         ...failures.map((failure) => `- **Failed:** ${failure}`),
       ];
       console.log(lines.join('\n'));
-      // Added to the run's summary page as well.
+      // Added to the run's summary page as well. GitHub reads it as Markdown, which would take a tag a problem names,
+      // such as <a>, for HTML, so &, <, and > go in as entities there; the log and the annotations keep them as they
+      // are.
       const summary = process.env.GITHUB_STEP_SUMMARY;
-      if (summary) appendFileSync(summary, `${lines.join('\n')}\n\n`);
+      const escaped = lines.join('\n').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+      if (summary) appendFileSync(summary, `${escaped}\n\n`);
       return failures;
     } finally {
       await browser.close();

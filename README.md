@@ -1,18 +1,18 @@
 # zachverse
 An interactive 3D portfolio exploring my journey from Rockstar Games to Amazon Kindle, built with React, Three.js, and AWS CDK.
 
-Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) plus the hosting and deployment infrastructure; the 3D experience comes later.
+Phase 1 built the hosting and deployment infrastructure behind [zachdavids.com](https://zachdavids.com). Phase 2 makes the site a complete HTML portfolio, a home page and a résumé so far (ADR 0010, `docs/progress.md`), and the 3D experience comes in Phase 3.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML |
-| `scripts/` | Prerender step, post-build output check, browser check, and the release and smoke-test scripts the deploy and restore workflows run |
-| `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows, CI steps, and the deploy and restore workflows' build, artifact, role, and release steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
+| `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML: the content and the page table in `src/content/`, the pages in `src/pages/` |
+| `scripts/` | Prerender step, post-build output check, browser check, Lighthouse run, and the release and smoke-test scripts the deploy and restore workflows run |
+| `tests/` | The test that runs the viewer-request function against the scripts' copies of its path mapping, and the repository policy checks, both run by the root `npm test`. The policy checks cover GitHub Actions workflows, CI steps, and the deploy and restore workflows' build, artifact, role, and release steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
 | `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and the template guardrails (`infra/lib/guardrails/`), which run in every synthesis and in the tests |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
-| `docs/` | Architecture decisions (`docs/adr/`), milestone status (`docs/progress.md`), and what the Phase 1 review left for Phase 2 (`docs/phase-2-inputs.md`) |
+| `docs/` | Architecture decisions (`docs/adr/`), milestone status (`docs/progress.md`), what the Phase 1 review left for later phases (`docs/phase-2-inputs.md`), and the script that renders the link-preview picture (`docs/og-image/`) |
 | `docs/org-policy/` | The SCP change behind ADR 0002's us-east-1 decision: backup, the policies as applied, a comparison script, and apply, verify, and rollback steps |
 
 ## Commands
@@ -26,9 +26,10 @@ npm run typecheck    # the type check (the root tsconfig.json only points editor
 npm test             # Vitest: unit tests and repository policy checks
 npm run test:coverage  # Vitest with the 100% coverage gate CI enforces
 npm run build        # client build, SSR build, prerender into dist/
-npx playwright install --only-shell chromium  # once, the browser for check:browser (CI adds --with-deps on Linux)
-npm run check:browser  # load the built pages in headless Chromium: errors, failed requests, layout, focus, 404 page
-npm run check:dist   # verify prerendered HTML and head, 404 page, robots.txt, sitemap, referenced files, hashed assets
+npx playwright install --only-shell chromium  # once, the browser for check:browser and check:lighthouse (CI adds --with-deps on Linux)
+npm run check:browser  # load every page in headless Chromium: errors, layout, every Tab stop, axe-core, addresses, 404s
+npm run check:lighthouse  # Lighthouse lab measurements of each page with an address, as a phone and a desktop (CI runs it)
+npm run check:dist   # verify prerendered HTML and head, link previews, 404 page, crawler files, references, size budgets
 
 cd infra
 npm ci

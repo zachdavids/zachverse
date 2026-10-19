@@ -1,6 +1,6 @@
 // The release smoke test (ADR 0006): what viewers get through CloudFront, at the distribution's own hostname and, with
 // connections made through it, at both custom hostnames, compared with the release's own files.
-import { RECORDS, type SiteFile, sha256, siteFiles } from './release-lib.ts';
+import { RECORDS, type SiteFile, servedPath, sha256, siteFiles } from './release-lib.ts';
 
 export interface Reply {
   status: number;
@@ -70,14 +70,10 @@ export function prerendered(body: Buffer): string[] {
   return html.includes('<!--app-') ? [...problems, 'the home page still has a prerender marker'] : problems;
 }
 
-/** The root-relative URLs a page loads or links to, and the release file each one gets, as the viewer-request function maps paths. */
+/** The root-relative URLs a page loads or links to, and the release file each one gets (servedPath). */
 function references(page: SiteFile): { url: string; path: string }[] {
   const urls = [...page.body.toString('utf8').matchAll(/\s(?:src|href)="(\/(?!\/)[^"?#]*)/g)].map((match) => match[1]!);
-  return [...new Set(urls)].map((url) => {
-    const path = url.slice(1);
-    const name = path.slice(path.lastIndexOf('/') + 1);
-    return { url, path: name === '' ? `${path}index.html` : name.includes('.') ? path : `${path}/index.html` };
-  });
+  return [...new Set(urls)].map((url) => ({ url, path: servedPath(url) }));
 }
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));

@@ -2,6 +2,20 @@
 
 From the Phase 1 review of 2026-10-15: six reviewers covered the whole of Phase 1, and two skeptics checked each finding. What Phase 1 had to fix went into ADRs 0003 to 0007, into ADRs 0008 and 0009 on #8 and #11, and, for what the owner does, `docs/progress.md`. What's left here needs no change before Phase 2; an item that names no time applies from the start of Phase 2's design.
 
+**Status after Phase 2's milestone 1 (2026-10-18).** Phase 2, as the owner planned it on 2026-10-16, has no 3D (ADR 0010; `docs/progress.md`, "Phase 2"). So the "3D content" section, apart from "Content module", "Styles", and "Prerendering", which apply to every page, and the 3D parts of "Rate limit" and "Compression", now apply to Phase 3.
+
+Milestone 1 addressed these items:
+- **Routes:** one page table, `pages` in `src/content/site.ts`.
+- **Path mapping:** `tests/path-mapping.test.ts` runs the real function against both copies.
+- **Browser check:** a request budget tied to the rate limit.
+- **Content module:** now `src/content/`, still plain data.
+- **Styles:** in part. The browser check now walks every Tab stop on every page at 320 pixels, loads each page at a middle width, 768 pixels, and shows scrollbars. `src/styles.test.ts` stays, since no canvas has come.
+- **Allowance:** estimated for milestone 1's pages (ADR 0010, "Load and allowance"); Phase 3 estimates it again for its 3D assets.
+- **Docs:** milestone 1's verification log is in its pull request's description, and ADR 0010 names its tests rather than restating them.
+- **Dependencies:** for milestone 1, by the owner's choice on 2026-10-19 (`docs/progress.md`, "Phase 2").
+
+The rest are open.
+
 ## Releases
 
 - **Speed.** The release scripts handle one object per AWS CLI call, one call after another, at about a second each (ADR 0006, "Limits"). Before the site passes about 200 files, run each publishing step's per-file calls a few at a time (4 to 8), keeping the page order's ranks and the history's ordering rules, or add a file ceiling to `check:dist` beside `SMOKE_REQUEST_BUDGET`.
@@ -20,7 +34,7 @@ From the Phase 1 review of 2026-10-15: six reviewers covered the whole of Phase 
 - **Readiness.** The browser check would pass a scene that never renders, and it sees only SwiftShader's WebGL2, with no WebGPU. Have the app set a readiness state on the root element once the scene has drawn with its first assets. Have both browser runs wait for it, with timeouts sized for software rendering, and fail on a failed state or a timeout. Decide how the `h1` rule applies to a canvas landing, and how real devices get tested.
 - **Testing.** Keep the 100% coverage gate: `@react-three/test-renderer`, in the node environment, reaches it under the current config. Keep scene logic in pure modules, inject GPU capabilities, and stub loaders. React Three Fiber's `<Canvas>` throws under jsdom, which has no `ResizeObserver`, and `src/main.test.tsx` renders and hydrates the pages there: stub `ResizeObserver` in each jsdom test that reaches a canvas, since `tests/repo-policy.test.ts` allows no `setupFiles`. Record the decision in an ADR before the first scene pull request.
 - **Styles.** `src/styles.test.ts` pins the stylesheet's rules in jsdom, which does no layout, and will reject a full-viewport canvas. Before retiring it, extend the browser check: every Tab stop on every page, a middle width such as 768 px, and scrollbars shown.
-- **Content module.** The prerender, `check:dist`, and the browser check load `src/content.ts` under plain Node. Keep it plain data, with no asset, `?url`, or `.tsx` imports, and put scene content in other modules.
+- **Content module.** The prerender, `check:dist`, and the browser check load `src/content/` (until Phase 2, `src/content.ts`) under plain Node. Keep it plain data, with no asset, `?url`, or `.tsx` imports, and put scene content in other modules.
 - **Prerendering.** The prerender imports the server bundle under plain Node, so a module that reads `window`, `document`, or `self` when it's imported fails the build. `renderToString` also sends a `React.lazy` component's nearest `Suspense` fallback instead of waiting for it, and hydrating that boundary reports React error #419, which fails the browser check. So render the page's `h1` and links as content, never as a fallback the scene replaces, and mount the scene only after hydration, from a lazily loaded module that holds the three, React Three Fiber, and drei imports.
 
 ## Routing and headers

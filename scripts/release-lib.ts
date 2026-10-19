@@ -164,6 +164,36 @@ export function siteFiles(dir: string): SiteFile[] {
 }
 
 /**
+ * The release file a root-relative URL path gets, as infra/functions/viewer-request.js maps paths: a directory's
+ * index.html, for a path ending in a slash or whose last segment has no dot. It leaves out the function's /.well-known/
+ * exception, so such a path fails closed in the smoke test and the browser check's local server, which use it (ADR
+ * 0006, "Limits"); tests/path-mapping.test.ts runs the real function against this copy.
+ */
+export function servedPath(url: string): string {
+  const path = url.slice(1);
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  return name === '' ? `${path}index.html` : name.includes('.') ? path : `${path}/index.html`;
+}
+
+// The content types CloudFront compresses, of those CONTENT_TYPES gives files, and the sizes it compresses: 1,000 to
+// 10,000,000 bytes (https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/ServingCompressedFiles.html,
+// read 2026-10-18). The distribution's behavior compresses (infra/lib/site-stack.ts).
+const COMPRESSED_TYPES = /^(?:text\/(?:html|javascript|css|plain)|application\/(?:json|xml)|image\/svg\+xml)(?:;|$)/;
+
+/**
+ * The encoding CloudFront would send file in to a browser that accepts the encodings named in acceptEncoding: Brotli
+ * when the browser takes both it and gzip, as CloudFront prefers it, and none for a type or size it leaves alone.
+ * check:dist measures the build by it, and the browser check's local server serves by it.
+ */
+export function encodingFor(file: Pick<SiteFile, 'contentType' | 'body'>, acceptEncoding = ''): 'br' | 'gzip' | null {
+  const { length } = file.body;
+  if (!COMPRESSED_TYPES.test(file.contentType) || length < 1000 || length > 10_000_000) return null;
+  const accepted = acceptEncoding.toLowerCase().split(',').map((part) => part.split(';')[0]!.trim());
+  if (accepted.includes('br')) return 'br';
+  return accepted.includes('gzip') ? 'gzip' : null;
+}
+
+/**
  * The paths to invalidate for a release's pages: each file's own path and, since the viewer-request function serves
  * index.html for a directory path, the paths viewers request it by. Assets need none: a new release names its own.
  */
@@ -181,9 +211,12 @@ export function invalidationPaths(files: { path: string }[]): string[] {
   return [...paths].sort();
 }
 
-/** Pages in the order they go out: other files first, then HTML, then each index.html, so a page's references exist. */
+/**
+ * Pages in the order they go out: other files first, then HTML, then each index.html, and the home page last, since it
+ * links to every other page with an address (check:dist), so a page's references exist before it does.
+ */
 function pageOrder(files: SiteFile[]): SiteFile[] {
-  const rank = (path: string) => (isIndex(path) ? 2 : path.endsWith('.html') ? 1 : 0);
+  const rank = (path: string) => (path === 'index.html' ? 3 : isIndex(path) ? 2 : path.endsWith('.html') ? 1 : 0);
   return files.filter((file) => !isAsset(file.path)).sort((a, b) => rank(a.path) - rank(b.path));
 }
 
