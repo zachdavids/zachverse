@@ -28,6 +28,7 @@ describe('browser check script', () => {
     vi.resetModules();
     summaryDir = mkdtempSync(join(tmpdir(), 'browser-check-test-'));
     vi.stubEnv('RELEASE_COMMIT', '');
+    vi.stubEnv('BROWSER_CHECK_SCREENSHOTS', '');
     vi.stubEnv('CLOUDFRONT_DOMAIN', 'd111111abcdef8.cloudfront.net');
     vi.stubEnv('GITHUB_STEP_SUMMARY', join(summaryDir, 'summary.md'));
     lib.serve.mockResolvedValue({ origin: 'http://127.0.0.1:4173', close });

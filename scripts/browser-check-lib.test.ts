@@ -7,6 +7,18 @@ import { join } from 'node:path';
 import { brotliDecompressSync, gunzipSync } from 'node:zlib';
 import type { Browser } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// serve() compresses with these; the spies call through, so tests see when it compresses, not only what it sends.
+const zlib = vi.hoisted(() => ({
+  brotliCompressSync: vi.fn<typeof import('node:zlib').brotliCompressSync>(),
+  gzipSync: vi.fn<typeof import('node:zlib').gzipSync>(),
+}));
+vi.mock('node:zlib', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:zlib')>();
+  zlib.brotliCompressSync.mockImplementation(actual.brotliCompressSync);
+  zlib.gzipSync.mockImplementation(actual.gzipSync);
+  return { ...actual, ...zlib };
+});
 import {
   AXE_TAGS,
   axeProblems,
@@ -612,12 +624,17 @@ describe('serve', () => {
     const script = `console.log(${JSON.stringify('x'.repeat(2000))});`;
     const missing = `<!doctype html><title>Missing</title>${'<p>gone</p>'.repeat(100)}`;
     const dir = build({ 'index.html': 'home', '404.html': missing, 'assets/index-AbCd1234.js': script });
+    zlib.brotliCompressSync.mockClear();
+    zlib.gzipSync.mockClear();
     const server = await serve(dir);
+    // Each file CloudFront would compress, both ways, before the server answers anything, so no request waits on it.
+    const compressedUpFront = (spy: typeof zlib.gzipSync) => spy.mock.calls.map(([body]) => String(body)).sort();
+    expect(compressedUpFront(zlib.brotliCompressSync)).toEqual([missing, script].sort());
+    expect(compressedUpFront(zlib.gzipSync)).toEqual([missing, script].sort());
     try {
       const url = `${server.origin}/assets/index-AbCd1234.js`;
       const br = await getRaw(url, 'gzip, deflate, br, zstd');
       expect([br.status, br.encoding, brotliDecompressSync(br.body).toString()]).toEqual([200, 'br', script]);
-      // A second request gets the same bytes: each file is compressed once, before the server starts.
       expect((await getRaw(url, 'br')).body).toEqual(br.body);
       const gzip = await getRaw(url, 'gzip');
       expect([gzip.status, gzip.encoding, gunzipSync(gzip.body).toString()]).toEqual([200, 'gzip', script]);
@@ -631,6 +648,8 @@ describe('serve', () => {
         'br',
         missing,
       ]);
+      // And none while answering.
+      expect([zlib.brotliCompressSync.mock.calls.length, zlib.gzipSync.mock.calls.length]).toEqual([2, 2]);
     } finally {
       await server.close();
     }

@@ -214,6 +214,7 @@ export function checkDist(rootDir: URL, release?: string): string[] {
       ['rel="canonical"', 'a canonical URL'],
       ['property="og:', 'Open Graph tags'],
       ['type="application/ld+json"', 'structured data'],
+      ['name="twitter:', 'a Twitter card'],
     ] as const;
     for (const [needle, what] of tags) {
       if (html.includes(needle)) failures.push(`dist/${file} has ${what}, though every missing address serves it`);
@@ -329,7 +330,7 @@ export function checkDist(rootDir: URL, release?: string): string[] {
 
 /** The bytes of each kind of file a build sends, as measureDist counts them and BUDGETS limits them. */
 export interface Sizes {
-  /** Every .js and .mjs file under assets/, where Vite writes the bundles. */
+  /** Every .js and .mjs file: Vite's bundles under assets/, and any script copied from public/. */
   javascript: number;
   /** Every stylesheet. */
   css: number;
@@ -365,7 +366,7 @@ export const BUDGETS: Sizes = {
 // Extensions match in any case, as release-lib.ts reads a file's type; under assets/, HASHED_NAME keeps them
 // lower-case.
 const KINDS: [keyof Sizes, string, RegExp][] = [
-  ['javascript', 'JavaScript', /^assets\/.*\.m?js$/],
+  ['javascript', 'JavaScript', /\.m?js$/i],
   ['css', 'CSS', /\.css$/i],
   ['html', 'largest page', /\.html$/i],
   ['images', 'images', /\.(?:png|jpe?g|gif|webp|avif|svg|ico)$/i],

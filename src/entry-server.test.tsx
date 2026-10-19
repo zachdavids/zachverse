@@ -71,6 +71,18 @@ describe('render', () => {
       }
     });
 
+    it("lists the résumé's lines and skills in its order: the summary, then each role's lines and then its projects'", () => {
+      const lines = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map((match) => match[1]);
+      expect(lines).toEqual(
+        [
+          ...resume.summary,
+          ...resume.experience.flatMap((role) => [...role.highlights, ...role.projects.flatMap((p) => p.highlights)]),
+        ].map(escapeHtml),
+      );
+      const skills = [...html.matchAll(/<dt>([^<]*)<\/dt>/g)].map((match) => match[1]);
+      expect(skills).toEqual(resume.skills.map((skill) => escapeHtml(skill.name)));
+    });
+
     it('heads each role and degree with its title, then its employer or school and dates', () => {
       const entries = [...html.matchAll(/<h3>([^<]*)<\/h3><p class="meta">([^<]*)<\/p>/g)].map((m) => [m[1], m[2]]);
       expect(entries).toEqual([

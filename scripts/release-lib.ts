@@ -211,9 +211,12 @@ export function invalidationPaths(files: { path: string }[]): string[] {
   return [...paths].sort();
 }
 
-/** Pages in the order they go out: other files first, then HTML, then each index.html, so a page's references exist. */
+/**
+ * Pages in the order they go out: other files first, then HTML, then each index.html, and the home page last, since it
+ * links to every other page with an address (check:dist), so a page's references exist before it does.
+ */
 function pageOrder(files: SiteFile[]): SiteFile[] {
-  const rank = (path: string) => (isIndex(path) ? 2 : path.endsWith('.html') ? 1 : 0);
+  const rank = (path: string) => (path === 'index.html' ? 3 : isIndex(path) ? 2 : path.endsWith('.html') ? 1 : 0);
   return files.filter((file) => !isAsset(file.path)).sort((a, b) => rank(a.path) - rank(b.path));
 }
 

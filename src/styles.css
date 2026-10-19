@@ -54,8 +54,11 @@ body {
   border: 1px solid var(--border);
   border-radius: 1rem;
   background: var(--card);
-  /* A long word, such as compile_commands.json on the résumé, breaks rather than widening the card on a phone. */
-  overflow-wrap: break-word;
+  /*
+   * A long word, such as localization/internationalization on the résumé, breaks rather than widening the card on a
+   * phone. Unlike break-word, anywhere also lowers the width the body's grid sizes the card to.
+   */
+  overflow-wrap: anywhere;
 }
 
 /* Keeps the bottom padding even with the top, whatever element ends the card. */

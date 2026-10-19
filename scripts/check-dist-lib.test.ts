@@ -565,7 +565,7 @@ describe('checkDist', () => {
       {
         problem: 'an empty og:site_name',
         file,
-        from: tag('og:site_name', 'Zachverse'),
+        from: tag('og:site_name', escapeHtml(site.name)),
         to: tag('og:site_name', ''),
         failure: `dist/${file} has no og:site_name, or an empty one`,
       },
@@ -720,6 +720,13 @@ describe('checkDist', () => {
         from: '</head>',
         to: '<script type="application/ld+json">{}</script></head>',
         failure: `dist/${file} has structured data, though every missing address serves it`,
+      },
+      {
+        problem: 'a Twitter card',
+        file,
+        from: '</head>',
+        to: '<meta name="twitter:card" content="summary_large_image" /></head>',
+        failure: `dist/${file} has a Twitter card, though every missing address serves it`,
       },
     ])('reports $problem', expectProblem);
   });
@@ -996,7 +1003,7 @@ describe('measureDist', () => {
       '404.html': '<!doctype html><title>Page not found</title>\n',
       'assets/index-AbCd1234.js': script,
       'assets/chunk-AbCd1234.mjs': chunk,
-      // Outside assets/, so not one of the bundles.
+      // Outside assets/, as a script copied from public/ would be, but sent all the same.
       'sw.js': script,
       'assets/index-AbCd1234.css': style,
       'assets/print-AbCd1234.css': print,
@@ -1018,7 +1025,7 @@ describe('measureDist', () => {
       'assets/data-AbCd1234.json': `"${digits(3000)}"`,
     });
     expect(measureDist(root)).toEqual({
-      javascript: gzipped(script) + chunk.length,
+      javascript: 2 * gzipped(script) + chunk.length,
       css: gzipped(style) + print.length,
       html: gzipped(varied),
       images: icon.length + gzipped(sprite) + png.length + 1100 + 1200 + 1300 + 1400 + 1500 + 1600 + 1700,

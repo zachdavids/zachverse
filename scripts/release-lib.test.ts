@@ -270,6 +270,19 @@ describe('checkOrder', () => {
 });
 
 describe('publish', () => {
+  it('writes a page below the root before the home page, which links to it', async () => {
+    const { log, repository, context } = fakes();
+    await publish(site({ 'about/index.html': '<!doctype html><title>About</title>' }), A, repository, context);
+    const pages = log.filter((line) => /^write (?!_releases\/|assets\/)/.test(line));
+    expect(pages).toEqual([
+      'write favicon.svg',
+      'write robots.txt',
+      'write 404.html',
+      'write about/index.html',
+      'write index.html',
+    ]);
+  });
+
   it('uploads assets, then a copy of the release, then the pages with index.html last, then invalidates them', async () => {
     const { objects, log, compared, repository, context } = fakes();
     const outcome = await publish(site(), A, repository, context);

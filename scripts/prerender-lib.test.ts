@@ -25,9 +25,8 @@ describe('renderDocument', () => {
     const html = renderDocument(template, home!, '<main>hello</main>');
     expect(html).toContain('<title>Zach Davids — Senior Software Engineer at Amazon</title>');
     expect(html).toContain(
-      '<meta name="description" content="Zach Davids, Senior Software Engineer at Amazon. I build embedded C++ systems, ' +
-        'device-platform software, and AWS services for Kindle e-readers. Before Amazon, I was a gameplay programmer at ' +
-        'Rockstar Games." />',
+      '<meta name="description" content="I build embedded C++ systems, device-platform software, and AWS services for ' +
+        'Kindle e-readers. Before Amazon, I was a gameplay programmer at Rockstar Games." />',
     );
     expect(html).toContain('<link rel="canonical" href="https://zachdavids.com/" />');
     expect(html).toContain('<div id="root" data-page="home"><main>hello</main></div>');
@@ -110,7 +109,7 @@ describe('renderDocument', () => {
       '<meta name="description" content="" /></main>';
     const html = renderDocument(template, page, markup);
     expect(html).toContain(`<div id="root" data-page="${page.id}">${markup}</div>`);
-    expect(html).toContain(`<title>${page.title}</title>`);
+    expect(html).toContain(`<title>${escapeHtml(page.title)}</title>`);
     expect(html).toContain(page.head);
   });
 });
@@ -121,7 +120,7 @@ describe('headFor', () => {
     expect(headFor(page).split('\n    ')).toEqual([
       '<link rel="canonical" href="https://zachdavids.com/resume/" />',
       '<meta property="og:type" content="website" />',
-      '<meta property="og:site_name" content="Zachverse" />',
+      '<meta property="og:site_name" content="Zach Davids" />',
       '<meta property="og:title" content="Résumé — Zach Davids" />',
       `<meta property="og:description" content="${escapeHtml(page.description)}" />`,
       '<meta property="og:url" content="https://zachdavids.com/resume/" />',
@@ -213,17 +212,17 @@ describe('prerender', () => {
     expect(notFoundPage).toContain('<div id="root" data-page="not-found"><main>rendered not-found</main></div>');
     expect(notFoundPage).toBe(renderDocument(template, notFound!, '<main>rendered not-found</main>'));
 
-    // A page at a directory's address goes into a directory the client build did not make.
-    expect(await readDist(rootUrl, 'resume/index.html')).toBe(
-      renderDocument(template, resume, '<main>rendered resume</main>'),
-    );
+    // Every page in the table, each in its own file: a page at a directory's address, such as resume/index.html, goes
+    // into a directory the client build did not make.
+    expect(resume.file).toBe('resume/index.html');
+    for (const page of prerenderPages) {
+      expect(await readDist(rootUrl, page.file), page.file).toBe(
+        renderDocument(template, page, `<main>rendered ${page.id}</main>`),
+      );
+    }
 
     expect(existsSync(new URL('dist-ssr/', rootUrl))).toBe(false);
-    expect(log.mock.calls).toEqual([
-      ['prerendered home -> dist/index.html'],
-      ['prerendered resume -> dist/resume/index.html'],
-      ['prerendered not-found -> dist/404.html'],
-    ]);
+    expect(log.mock.calls).toEqual(prerenderPages.map((page) => [`prerendered ${page.id} -> dist/${page.file}`]));
   });
 
   it('names the release in every page when given one, and refuses one that is not a full commit SHA', async () => {
@@ -239,10 +238,11 @@ describe('prerender', () => {
     expect(await readDist(rootUrl, 'index.html')).toBe(template);
 
     await prerender(rootUrl, release);
-    expect(await readDist(rootUrl, 'index.html')).toBe(renderDocument(template, home!, '<main>rendered home</main>', release));
-    expect(await readDist(rootUrl, '404.html')).toBe(
-      renderDocument(template, notFound!, '<main>rendered not-found</main>', release),
-    );
+    for (const page of prerenderPages) {
+      expect(await readDist(rootUrl, page.file), page.file).toBe(
+        renderDocument(template, page, `<main>rendered ${page.id}</main>`, release),
+      );
+    }
   });
 
   it('fails when the client build has not produced dist/index.html', async () => {

@@ -1,7 +1,9 @@
 import { profile } from './profile.ts';
 
 export const site = {
-  name: 'Zachverse',
+  // The site's name in link previews (og:site_name), as the pages give it; Zachverse is the project's name, which the
+  // pages don't show.
+  name: profile.name,
   origin: 'https://zachdavids.com',
   // The picture link previews show for every page: public/og-image.png, at its own size.
   image: {
@@ -35,7 +37,8 @@ export const pages = [
     file: 'index.html',
     label: 'Home',
     title: `${profile.name} — ${profile.role}`,
-    description: `${profile.name}, ${profile.role}. ${profile.summary.join(' ')}`,
+    // The title names the role, so the description is the two lines that name both employers.
+    description: profile.summary.join(' '),
   },
   {
     id: 'resume',
