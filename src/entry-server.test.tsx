@@ -17,7 +17,6 @@ describe('render', () => {
   it('renders the home page as one card with the profile details, the page links, and the contact links', () => {
     expect(render('home')).toBe(
       '<main class="card">' +
-        '<p class="eyebrow">Zachverse</p>' +
         '<h1>Zach Davids</h1>' +
         '<p class="role">Senior Software Engineer at Amazon</p>' +
         '<p class="summary">I build embedded C++ systems, device-platform software, and AWS services for Kindle e-readers.</p>' +

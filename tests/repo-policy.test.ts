@@ -8,6 +8,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { resolveConfig } from 'vite';
 import { describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
+import { BROWSER_REQUEST_BUDGET } from '../scripts/browser-check-lib.ts';
 import { ASSETS, RECORDS } from '../scripts/release-lib.ts';
 import { SITE_ORIGIN } from '../scripts/site-origin.ts';
 import { SMOKE_REQUEST_BUDGET } from '../scripts/smoke-lib.ts';
@@ -95,7 +96,11 @@ const WEB_CHECKS = [
   'npm run check:dist',
 ];
 const BROWSER_CHECK = ['npx playwright install --with-deps --only-shell chromium', 'npm run check:browser'];
-const WEB_STEPS = [...WEB_CHECKS, ...BROWSER_CHECK];
+// CI's web job then measures the pages with Lighthouse, in the Chromium the browser check installed. The deploy
+// workflow doesn't: lab scores vary from run to run, so a release could fail on one that CI passed, and CI on the pull
+// request gates the merge.
+const LIGHTHOUSE = 'npm run check:lighthouse';
+const WEB_STEPS = [...WEB_CHECKS, ...BROWSER_CHECK, LIGHTHOUSE];
 
 // The browser job's installs, retried: the release it checks is already live, and a failed install would roll it back.
 const NPM_CI_RETRIED = [
@@ -565,8 +570,15 @@ describe('CI workflow', () => {
     }
   });
 
-  it('runs web install, typecheck, coverage, build, and dist checks as separate required steps in order', () => {
+  it('runs web install, typecheck, coverage, build, checks, and Lighthouse as separate required steps in order', () => {
     expectRequiredSteps(ci, 'ci.yml', 'web', WEB_STEPS);
+  });
+
+  it("measures the pages with Lighthouse only in CI's web job", () => {
+    // Any step that names Lighthouse in the action it uses or the script it runs: the npm script,
+    // scripts/lighthouse.ts, Lighthouse's own CLI, or an action. Finding CI's own step shows the search reaches it.
+    const measuring = steps.filter(({ step }) => /lighthouse/i.test(`${step.uses ?? ''}\n${step.run ?? ''}`));
+    expect(measuring.map(({ where }) => where)).toEqual(['ci.yml web']);
   });
 
   it('runs infra install, typecheck, and coverage in infra as separate required steps in order', () => {
@@ -650,12 +662,13 @@ describe('CI workflow', () => {
 
   it('builds, prerenders, and checks the site with fixed commands', () => {
     const { scripts } = readJson<{ scripts: Record<string, string | undefined> }>('package.json');
-    // CI runs both by name, so another body, or "|| true", would leave the prerendered pages unchecked.
+    // CI runs each by name, so another body, or "|| true", would leave the prerendered pages unchecked.
     expect(scripts.build).toBe(
       'vite build && vite build --ssr src/entry-server.tsx --outDir dist-ssr && node scripts/prerender.ts',
     );
     expect(scripts['check:dist']).toBe('node scripts/check-dist.ts');
     expect(scripts['check:browser']).toBe('node scripts/browser-check.ts local dist');
+    expect(scripts['check:lighthouse']).toBe('node scripts/lighthouse.ts dist');
   });
 
   it('lets the Vite config set no client output name without a content hash', async () => {
@@ -1278,6 +1291,10 @@ describe('Restore workflow', () => {
   });
 });
 
+// The web ACL's rate limit for one address, as infra/lib/site-stack.ts sets it, or undefined if it no longer does.
+const rateLimitPerIp = () =>
+  /^export const RATE_LIMIT_PER_IP = (\d+);$/m.exec(read('infra/lib/site-stack.ts'))?.[1];
+
 describe('Release and smoke-test scripts', () => {
   it("publish nothing unhashed under assets/: public/ has no assets/ directory, whose files Vite copies as they are", () => {
     // Publishing caches every file under assets/ as immutable for a year, trusting the content hash in its name, and
@@ -1287,7 +1304,7 @@ describe('Release and smoke-test scripts', () => {
 
   it("keep the smoke test within half the web ACL's rate limit for one address", () => {
     // Every request the smoke test sends comes from one runner address, and WAF counts approximately (ADR 0007).
-    const limit = /^export const RATE_LIMIT_PER_IP = (\d+);$/m.exec(read('infra/lib/site-stack.ts'))?.[1];
+    const limit = rateLimitPerIp();
     expect(limit).toBeDefined();
     expect(SMOKE_REQUEST_BUDGET).toBeLessThanOrEqual(Number(limit) / 2);
   });
@@ -1367,6 +1384,16 @@ describe('Release and smoke-test scripts', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Browser check', () => {
+  it("keeps its requests within a fifth of the web ACL's rate limit for one address", () => {
+    // The live check sends every request from one runner address too, and leaves the rest of the limit to visitors
+    // who share that address (docs/phase-2-inputs.md, "Browser check").
+    const limit = rateLimitPerIp();
+    expect(limit).toBeDefined();
+    expect(BROWSER_REQUEST_BUDGET).toBeLessThanOrEqual(Number(limit) / 5);
   });
 });
 

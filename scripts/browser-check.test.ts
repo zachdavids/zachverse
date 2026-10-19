@@ -2,10 +2,11 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Open, Result, Target } from './browser-check-lib.ts';
+import { pages } from '../src/content/index.ts';
+import type { Open, Result, SitePage, Target } from './browser-check-lib.ts';
 
 const lib = vi.hoisted(() => ({
-  browserCheck: vi.fn<(target: Target, open: Open) => Promise<Result>>(),
+  browserCheck: vi.fn<(target: Target, pages: readonly SitePage[], open: Open) => Promise<Result>>(),
   open: vi.fn(),
   serve: vi.fn<(dir: string) => Promise<{ origin: string; close: () => Promise<void> }>>(),
 }));
@@ -60,20 +61,28 @@ describe('browser check script', () => {
     return output;
   };
 
-  it('serves a local build, checks it with no release named, reports it, and closes the browser and the server', async () => {
+  it('serves a local build, checks every page with no release named, reports it, and closes the browser and the server', async () => {
     const { exit, error, log } = await run('local', 'dist');
 
     expect(lib.serve).toHaveBeenCalledExactlyOnceWith('dist');
-    expect(playwright.chromium.launch).toHaveBeenCalledExactlyOnceWith({ args: [] });
-    const [target, open] = lib.browserCheck.mock.calls[0]!;
+    // With scrollbars shown, which Playwright hides by default.
+    expect(playwright.chromium.launch).toHaveBeenCalledExactlyOnceWith({
+      args: [],
+      ignoreDefaultArgs: ['--hide-scrollbars'],
+    });
+    const [target, checked, open] = lib.browserCheck.mock.calls[0]!;
+    // Served locally, the pages still name their canonical URLs at the site's origin.
     expect(target).toEqual({
       origin: 'http://127.0.0.1:4173',
+      canonicalOrigin: 'https://zachdavids.com',
       release: null,
       probe: expect.stringMatching(/^browser-check-[0-9a-f-]{36}$/),
     });
+    // Every page in the site's table, the 404 page included.
+    expect(checked).toEqual(pages);
     // The check opens pages in the browser the script launched.
-    await open('http://127.0.0.1:4173/', 320, true);
-    expect(lib.open).toHaveBeenCalledExactlyOnceWith(browser, 'http://127.0.0.1:4173/', 320, true);
+    await open('http://127.0.0.1:4173/', 320, { tab: true, axe: true });
+    expect(lib.open).toHaveBeenCalledExactlyOnceWith(browser, 'http://127.0.0.1:4173/', 320, { tab: true, axe: true });
     const report = '### Browser check (dist)\n\n- Passed: check one';
     expect(log).toHaveBeenCalledExactlyOnceWith(report);
     expect(readFileSync(join(summaryDir, 'summary.md'), 'utf8')).toBe(`${report}\n\n`);
@@ -91,8 +100,15 @@ describe('browser check script', () => {
     expect(dns.lookup).toHaveBeenCalledExactlyOnceWith('d111111abcdef8.cloudfront.net', { family: 4 });
     expect(playwright.chromium.launch).toHaveBeenCalledExactlyOnceWith({
       args: ['--host-resolver-rules=MAP zachdavids.com 192.0.2.10, MAP www.zachdavids.com 192.0.2.10'],
+      ignoreDefaultArgs: ['--hide-scrollbars'],
     });
-    expect(lib.browserCheck.mock.calls[0]![0]).toMatchObject({ origin: 'https://zachdavids.com', release: RELEASE });
+    const [target, checked] = lib.browserCheck.mock.calls[0]!;
+    expect(target).toMatchObject({
+      origin: 'https://zachdavids.com',
+      canonicalOrigin: 'https://zachdavids.com',
+      release: RELEASE,
+    });
+    expect(checked).toEqual(pages);
     expect(lib.serve).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledExactlyOnceWith(
       '### Browser check (https://zachdavids.com, through the distribution)\n\n- Passed: check one',
@@ -107,6 +123,18 @@ describe('browser check script', () => {
     expect(exit).toHaveBeenCalledExactlyOnceWith(1);
     expect(browser.close).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('writes the tags and ampersands a problem names to the summary as entities, which Markdown shows as written, and to the log as they are', async () => {
+    const failure = 'check one: the focused <a> "Q&A" shows no focus indicator';
+    lib.browserCheck.mockResolvedValue({ passed: [], failures: [failure] });
+    const { error, log } = await run('local', 'dist');
+    expect(log).toHaveBeenCalledExactlyOnceWith(`### Browser check (dist)\n\n- **Failed:** ${failure}`);
+    expect(error).toHaveBeenCalledExactlyOnceWith(`::error::${failure}`);
+    expect(readFileSync(join(summaryDir, 'summary.md'), 'utf8')).toBe(
+      '### Browser check (dist)\n\n' +
+        '- **Failed:** check one: the focused &lt;a&gt; "Q&amp;A" shows no focus indicator\n\n',
+    );
   });
 
   it('fails on a wrong command, a live check without its release or distribution, or a browser that will not start', async () => {

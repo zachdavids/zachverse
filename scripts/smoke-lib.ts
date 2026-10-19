@@ -70,14 +70,22 @@ export function prerendered(body: Buffer): string[] {
   return html.includes('<!--app-') ? [...problems, 'the home page still has a prerender marker'] : problems;
 }
 
-/** The root-relative URLs a page loads or links to, and the release file each one gets, as the viewer-request function maps paths. */
+/**
+ * The release file a root-relative URL path gets, as infra/functions/viewer-request.js maps paths: a directory's
+ * index.html, for a path ending in a slash or whose last segment has no dot. It leaves out the function's /.well-known/
+ * exception, so such a path fails closed here (ADR 0006, "Limits"); tests/path-mapping.test.ts runs the real function
+ * against this copy.
+ */
+export function servedPath(url: string): string {
+  const path = url.slice(1);
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  return name === '' ? `${path}index.html` : name.includes('.') ? path : `${path}/index.html`;
+}
+
+/** The root-relative URLs a page loads or links to, and the release file each one gets. */
 function references(page: SiteFile): { url: string; path: string }[] {
   const urls = [...page.body.toString('utf8').matchAll(/\s(?:src|href)="(\/(?!\/)[^"?#]*)/g)].map((match) => match[1]!);
-  return [...new Set(urls)].map((url) => {
-    const path = url.slice(1);
-    const name = path.slice(path.lastIndexOf('/') + 1);
-    return { url, path: name === '' ? `${path}index.html` : name.includes('.') ? path : `${path}/index.html` };
-  });
+  return [...new Set(urls)].map((url) => ({ url, path: servedPath(url) }));
 }
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));

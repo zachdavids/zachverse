@@ -1,18 +1,18 @@
 # zachverse
 An interactive 3D portfolio exploring my journey from Rockstar Games to Amazon Kindle, built with React, Three.js, and AWS CDK.
 
-Phase 1 is a responsive placeholder at [zachdavids.com](https://zachdavids.com) plus the hosting and deployment infrastructure; the 3D experience comes later.
+Phase 1 built the hosting and deployment infrastructure behind [zachdavids.com](https://zachdavids.com). Phase 2 makes the site a complete HTML portfolio, a home page and a résumé so far (ADR 0010, `docs/progress.md`), and the 3D experience comes in Phase 3.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML |
-| `scripts/` | Prerender step, post-build output check, browser check, and the release and smoke-test scripts the deploy and restore workflows run |
+| `src/`, `index.html`, `public/` | React + TypeScript site (Vite), prerendered to static HTML: the content and the page table in `src/content/`, the pages in `src/pages/` |
+| `scripts/` | Prerender step, post-build output check, browser check, Lighthouse run, and the release and smoke-test scripts the deploy and restore workflows run |
 | `tests/` | Repository policy checks, run by the root `npm test`: GitHub Actions workflows, CI steps, and the deploy and restore workflows' build, artifact, role, and release steps; Dependabot; type-check, test, and coverage settings; build commands and output names; npm settings, lockfiles, and Node engines; `.gitignore`; AWS access key IDs, secret access keys after a name such as `aws_secret_access_key`, and private key blocks in any file git does not ignore; crawler files |
 | `infra/` | AWS CDK app (TypeScript), its CloudFront Function (`infra/functions/`), and the template guardrails (`infra/lib/guardrails/`), which run in every synthesis and in the tests |
 | `infra/dns/` | Reviewed Route 53 change batches for website records |
-| `docs/` | Architecture decisions (`docs/adr/`), milestone status (`docs/progress.md`), and what the Phase 1 review left for Phase 2 (`docs/phase-2-inputs.md`) |
+| `docs/` | Architecture decisions (`docs/adr/`), milestone status (`docs/progress.md`), what the Phase 1 review left for later phases (`docs/phase-2-inputs.md`), and the script that renders the link-preview picture (`docs/og-image/`) |
 | `docs/org-policy/` | The SCP change behind ADR 0002's us-east-1 decision: backup, the policies as applied, a comparison script, and apply, verify, and rollback steps |
 
 ## Commands

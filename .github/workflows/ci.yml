@@ -37,10 +37,14 @@ jobs:
         run: npm run build
       - name: Check prerendered output
         run: npm run check:dist
-      # Chromium's headless shell, and the system libraries it needs, for the browser check (ADR 0006).
+      # Chromium's headless shell, and the system libraries it needs, for the browser check (ADR 0006) and Lighthouse.
       - run: npx playwright install --with-deps --only-shell chromium
       - name: Check the pages in a browser
         run: npm run check:browser
+      # Lab measurements of the built pages. The deploy workflow doesn't take them: lab scores vary from run to run,
+      # and this job, on the pull request, gates the merge.
+      - name: Measure the pages with Lighthouse (lab)
+        run: npm run check:lighthouse
 
   infra:
     name: Infra (typecheck, template checks)
