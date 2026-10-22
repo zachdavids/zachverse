@@ -5,7 +5,7 @@ import { dirname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { pages } from '../src/content/index.ts';
-import { escapeHtml, headFor, prerender, prerenderPages, profilePageData, renderDocument } from './prerender-lib.ts';
+import { escapeHtml, headFor, prerender, prerenderPages, renderDocument, structuredData } from './prerender-lib.ts';
 
 const template = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const byId = (id: string) => prerenderPages.find((page) => page.id === id)!;
@@ -117,6 +117,7 @@ describe('renderDocument', () => {
 describe('headFor', () => {
   it('gives a page with an address its canonical URL, link-preview tags, and structured data, one tag a line', () => {
     const page = pages.find((p) => p.id === 'resume')!;
+    const data = structuredData({ type: 'ProfilePage' }, 'https://zachdavids.com/resume/');
     expect(headFor(page).split('\n    ')).toEqual([
       '<link rel="canonical" href="https://zachdavids.com/resume/" />',
       '<meta property="og:type" content="website" />',
@@ -129,7 +130,7 @@ describe('headFor', () => {
       '<meta property="og:image:height" content="630" />',
       '<meta property="og:image:alt" content="Zach Davids, Senior Software Engineer at Amazon" />',
       '<meta name="twitter:card" content="summary_large_image" />',
-      `<script type="application/ld+json">${profilePageData('https://zachdavids.com/resume/')}</script>`,
+      `<script type="application/ld+json">${data}</script>`,
     ]);
   });
 
@@ -144,9 +145,9 @@ describe('headFor', () => {
   });
 });
 
-describe('profilePageData', () => {
-  it('describes the page and Zach, with the profiles that are also his', () => {
-    expect(JSON.parse(profilePageData('https://zachdavids.com/'))).toEqual({
+describe('structuredData', () => {
+  it('describes a page about Zach, with Zach and the profiles that are also his', () => {
+    expect(JSON.parse(structuredData({ type: 'ProfilePage' }, 'https://zachdavids.com/'))).toEqual({
       '@context': 'https://schema.org',
       '@type': 'ProfilePage',
       url: 'https://zachdavids.com/',
@@ -162,12 +163,35 @@ describe('profilePageData', () => {
     });
   });
 
+  it('describes an article by its headline, with Zach as its author by the same @id', () => {
+    const schema = { type: 'Article', headline: 'A case study' } as const;
+    expect(JSON.parse(structuredData(schema, 'https://zachdavids.com/work/x/'))).toEqual({
+      '@context': 'https://schema.org',
+      '@type': 'Article',
+      url: 'https://zachdavids.com/work/x/',
+      headline: 'A case study',
+      author: {
+        '@type': 'Person',
+        '@id': 'https://zachdavids.com/#person',
+        name: 'Zach Davids',
+        url: 'https://zachdavids.com/',
+      },
+    });
+  });
+
   it('writes no < that could end the script element, and JSON reads the escape back', () => {
     const url = 'https://zachdavids.com/</script><script>alert(1)</script>';
-    const data = profilePageData(url);
+    const data = structuredData({ type: 'Article', headline: '<!-- x -->' }, url);
     expect(data).not.toContain('<');
     expect(data).toContain('\\u003c/script>');
-    expect(JSON.parse(data).url).toBe(url);
+    expect(JSON.parse(data)).toMatchObject({ url, headline: '<!-- x -->' });
+  });
+
+  it('gives each page with an address the structured data its entry names', () => {
+    for (const page of pages) {
+      if (page.path === null) continue;
+      expect(headFor(page)).toContain(structuredData(page.schema, `https://zachdavids.com${page.path}`));
+    }
   });
 });
 

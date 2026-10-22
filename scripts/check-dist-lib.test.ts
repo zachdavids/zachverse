@@ -6,10 +6,10 @@ import { dirname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
-import { pages, resume, site } from '../src/content/index.ts';
+import { caseStudy, howBuilt, pages, resume, site } from '../src/content/index.ts';
 import { render } from '../src/entry-server.tsx';
 import { BUDGETS, budgetProblems, checkDist, measureDist, releaseProblems, sizeReport } from './check-dist-lib.ts';
-import { escapeHtml, prerenderPages, profilePageData, renderDocument } from './prerender-lib.ts';
+import { escapeHtml, prerenderPages, renderDocument, structuredData } from './prerender-lib.ts';
 import { siteFiles } from './release-lib.ts';
 import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
 
@@ -488,11 +488,13 @@ describe('checkDist', () => {
 
   // What link previews and search engines read of each page with an address. The values are escaped as the head
   // escapes them.
-  describe.each(addressed)('in $file, at $url', ({ file, title, description, url }) => {
+  describe.each(addressed)('in $file, at $url', ({ file, title, description, url, schema }) => {
     const tag = (property: string, content: string | number) => `<meta property="${property}" content="${content}" />`;
     const canonical = `<link rel="canonical" href="${url}" />`;
     const picture = tag('og:image', 'https://zachdavids.com/og-image.png');
-    const json = profilePageData(url);
+    const json = structuredData(schema, url);
+    // Where the structured data names Zach: as the page's main entity, or as the article's author.
+    const zach = schema.type === 'Article' ? 'author.name' : 'mainEntity.name';
     const script = `<script type="application/ld+json">${json}</script>`;
     const notOne = `dist/${file} does not carry exactly one application/ld+json script`;
 
@@ -612,15 +614,15 @@ describe('checkDist', () => {
       {
         problem: 'structured data about another kind of page',
         file,
-        from: '"@type":"ProfilePage"',
+        from: `"@type":"${schema.type}"`,
         to: '"@type":"WebPage"',
-        failure: `dist/${file} has structured data whose @type is "WebPage", not "ProfilePage"`,
+        failure: `dist/${file} has structured data whose @type is "WebPage", not "${schema.type}"`,
       },
       {
         problem: 'structured data for another address',
         file,
-        from: `"@type":"ProfilePage","url":"${url}"`,
-        to: '"@type":"ProfilePage","url":"https://zachdavids.com/other/"',
+        from: `"@type":"${schema.type}","url":"${url}"`,
+        to: `"@type":"${schema.type}","url":"https://zachdavids.com/other/"`,
         failure: `dist/${file} has structured data whose url is "https://zachdavids.com/other/", not "${url}"`,
       },
       {
@@ -628,16 +630,22 @@ describe('checkDist', () => {
         file,
         from: '"name":"Zach Davids"',
         to: '"name":"Someone Else"',
-        failure: `dist/${file} has structured data whose mainEntity.name is "Someone Else", not "Zach Davids"`,
+        failure: `dist/${file} has structured data whose ${zach} is "Someone Else", not "Zach Davids"`,
       },
     ])('reports $problem', expectProblem);
 
     it('reports each field of structured data that is not an object', async () => {
-      expect(checkDist(await project(edit(file, json, 'null')))).toEqual([
-        `dist/${file} has structured data whose @type is undefined, not "ProfilePage"`,
-        `dist/${file} has structured data whose url is undefined, not "${url}"`,
-        `dist/${file} has structured data whose mainEntity.name is undefined, not "Zach Davids"`,
-      ]);
+      const about =
+        schema.type === 'Article'
+          ? [
+              ['headline', schema.headline],
+              ['author.name', 'Zach Davids'],
+            ]
+          : [['mainEntity.name', 'Zach Davids']];
+      const fields = [['@type', schema.type], ['url', url], ...about];
+      expect(checkDist(await project(edit(file, json, 'null')))).toEqual(
+        fields.map(([field, value]) => `dist/${file} has structured data whose ${field} is undefined, not "${value}"`),
+      );
     });
 
     it('accepts its one script of structured data with an id before its type', async () => {
@@ -807,6 +815,18 @@ describe('checkDist', () => {
     },
   ])('reports $problem', expectProblem);
 
+  // An article's structured data gives its headline, as its entry in the page table does.
+  const articles = addressed.flatMap(({ file, schema }) =>
+    schema.type === 'Article' ? [{ file, headline: JSON.stringify(schema.headline) }] : [],
+  );
+
+  it.each(articles)('reports structured data in $file that gives another headline', async ({ file, headline }) => {
+    const changes = edit(file, `"headline":${headline}`, '"headline":"Another"');
+    expect(checkDist(await project(changes))).toEqual([
+      `dist/${file} has structured data whose headline is "Another", not ${headline}`,
+    ]);
+  });
+
   // The home page links to every other page with an address, so a visitor can reach each one.
   it.each(addressed.filter(({ id }) => id !== 'home'))(
     'reports a home page that does not link to $path',
@@ -819,6 +839,29 @@ describe('checkDist', () => {
   it.each(resume.experience)('reports a résumé without the heading for $title', async ({ title }) => {
     const changes = edit('resume/index.html', `<h3>${escapeHtml(title)}</h3>`, '<h3></h3>');
     expect(checkDist(await project(changes))).toEqual([lacks('resume/index.html', `>${escapeHtml(title)}</h3>`)]);
+  });
+
+  // The long pages: each one's heading, and each section's heading with the anchor a link to it uses.
+  const longPages = [
+    { id: 'kindle-feature-gating', file: 'work/kindle-feature-gating/index.html', ...caseStudy },
+    { id: 'how-this-site-is-built', file: 'how-this-site-is-built/index.html', ...howBuilt },
+  ];
+
+  it.each(longPages)('reports the $id page without its heading', async ({ file, title }) => {
+    const heading = `>${escapeHtml(title)}</h1>`;
+    expect(checkDist(await project(edit(file, heading, '></h1>')))).toEqual([lacks(file, heading)]);
+  });
+
+  const sections = longPages.flatMap(({ id: page, file, sections }) =>
+    sections.map(({ id: anchor, heading }) => ({ page, file, anchor, heading })),
+  );
+
+  it.each(sections)('reports the $page page without the heading for its section $heading', async (section) => {
+    const { file, anchor, heading } = section;
+    const needle = `<h2 id="${anchor}">${escapeHtml(heading)}</h2>`;
+    for (const changed of [`<h2>${escapeHtml(heading)}</h2>`, `<h2 id="${anchor}"></h2>`]) {
+      expect(checkDist(await project(edit(file, needle, changed)))).toEqual([lacks(file, needle)]);
+    }
   });
 
   it.each(addressed)('reports a sitemap that does not list $url', async ({ url }) => {
@@ -868,10 +911,41 @@ describe('checkDist', () => {
     );
   });
 
-  // The résumé and the 404 page link home, and the home page links to the résumé, so each needs the other's file.
+  // Every other page links home, and each page with an address links to the others with one, so each needs their files.
   it.each([
-    ['index.html', ['dist/resume/index.html references missing /', 'dist/404.html references missing /']],
-    ['resume/index.html', ['dist/index.html references missing /resume/']],
+    [
+      'index.html',
+      [
+        'dist/resume/index.html references missing /',
+        'dist/work/kindle-feature-gating/index.html references missing /',
+        'dist/how-this-site-is-built/index.html references missing /',
+        'dist/404.html references missing /',
+      ],
+    ],
+    [
+      'resume/index.html',
+      [
+        'dist/index.html references missing /resume/',
+        'dist/work/kindle-feature-gating/index.html references missing /resume/',
+        'dist/how-this-site-is-built/index.html references missing /resume/',
+      ],
+    ],
+    [
+      'work/kindle-feature-gating/index.html',
+      [
+        'dist/index.html references missing /work/kindle-feature-gating/',
+        'dist/resume/index.html references missing /work/kindle-feature-gating/',
+        'dist/how-this-site-is-built/index.html references missing /work/kindle-feature-gating/',
+      ],
+    ],
+    [
+      'how-this-site-is-built/index.html',
+      [
+        'dist/index.html references missing /how-this-site-is-built/',
+        'dist/resume/index.html references missing /how-this-site-is-built/',
+        'dist/work/kindle-feature-gating/index.html references missing /how-this-site-is-built/',
+      ],
+    ],
     ['404.html', []],
     ['robots.txt', []],
     ['sitemap.xml', []],

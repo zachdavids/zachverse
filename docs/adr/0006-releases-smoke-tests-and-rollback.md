@@ -31,7 +31,7 @@ The jobs with the role install no packages. The browser checks, which need Playw
    - **Checksums:** each upload carries a SHA-256 checksum, which S3 checks before it accepts the object.
 5. **Saves a copy**, if there is none: every file of the release under `_releases/<commit>/site/`, then its manifest (each file's path, SHA-256, size, content type, and `Cache-Control`) as `_releases/<commit>/manifest.json`. The manifest is written last, so a manifest means a complete copy.
 6. **Records the release as started** in `_releases/history.json`: the action, the commit, the run (`<run ID>-<attempt>`), and the time.
-7. **Publishes the pages**, every file outside `assets/`: other files first, then HTML, then each `index.html`, and the home page last, since it links to every other page with an address (ADR 0010), so whatever a page refers to is there before it.
+7. **Publishes the pages**, every file outside `assets/`: other files first, then HTML, then each `index.html` in path order, and the home page last, since it links to every other page with an address (ADR 0010). So the files a page refers to, and every page the home page links to, are there before it. Pages below the home page link to one another too (ADR 0011), so on a release that adds a page, a page written before it can link to it for about a second, one write. A visitor who follows that link then gets the 404 page, which CloudFront keeps until the release's invalidation completes, at most 60 seconds.
 8. **Removes the pages the release no longer has:** every object outside `assets/` and `_releases/` that the release does not list.
 9. **Invalidates**, and waits for the invalidation to complete (the AWS CLI gives up after 10 minutes):
    - the paths of its pages and of the pages it removed;

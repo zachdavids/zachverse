@@ -66,7 +66,7 @@ A release writes the home page after every other page, since it links to each of
 
 **Head tags.** Every page with an address names its canonical URL. It also gives link previews a title, description, URL, and picture: the Open Graph tags, which X reads too, plus `twitter:card`. The previews name the site "Zach Davids", as the pages do. The picture is `public/og-image.png`, at 1200 × 630. The home page's description is its two summary lines, which name both employers within the width search results show.
 
-Each such page also carries a JSON-LD `ProfilePage`. Its main entity is Zach: his name, title, and employer, with his GitHub and LinkedIn profiles as `sameAs`. Any `<` in it is written as an escape, so the data can't end its script element.
+Each such page also carries a JSON-LD `ProfilePage`, except the two long pages, which carry an `Article` (ADR 0011). The `ProfilePage`'s main entity is Zach: his name, title, and employer, with his GitHub and LinkedIn profiles as `sameAs`. Any `<` in it is written as an escape, so the data can't end its script element.
 
 The 404 page asks not to be indexed and has none of these tags. `public/sitemap.xml` lists the pages that have an address, and `tests/repo-policy.test.ts` keeps it equal to the table. `robots.txt` is unchanged.
 

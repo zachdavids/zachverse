@@ -1,5 +1,5 @@
-import { ContactLinks } from '../components/Links.tsx';
-import { profile, resume } from '../content/index.ts';
+import { ContactLinks, SiteNav } from '../components/Links.tsx';
+import { resume } from '../content/index.ts';
 
 function Bullets({ items }: { items: readonly string[] }) {
   return (
@@ -11,13 +11,14 @@ function Bullets({ items }: { items: readonly string[] }) {
   );
 }
 
-/** The résumé, in the order Zach's résumé gives it, in one card that links home and to his contact links. */
+/**
+ * The résumé, in the order Zach's résumé gives it, in one card that links to the site's other pages and to his
+ * contact links.
+ */
 export function Resume() {
   return (
     <main className="card">
-      <nav aria-label="Site" className="eyebrow">
-        <a href="/">{profile.name}</a>
-      </nav>
+      <SiteNav current="resume" />
       <h1>Résumé</h1>
       <p className="role">{resume.headline}</p>
       <ContactLinks />

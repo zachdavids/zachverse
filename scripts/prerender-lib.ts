@@ -1,5 +1,5 @@
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { type Page, type PageId, pages, profile, site } from '../src/content/index.ts';
+import { type Page, type PageId, pages, profile, type Schema, site } from '../src/content/index.ts';
 
 export interface PrerenderPage {
   id: PageId;
@@ -24,25 +24,27 @@ export function escapeHtml(value: string): string {
 }
 
 /**
- * Structured data for a page about Zach: the page, and Zach as its main entity, with the profiles that are also his.
- * JSON.stringify escapes nothing that could end the script element, so every < is written as \u003c, which JSON reads
- * back as <.
+ * Structured data for the page at `url`. A page about Zach has him as its main entity, with the profiles that are also
+ * his; an article has its headline and Zach as its author, by the same @id. JSON.stringify escapes nothing that could
+ * end the script element, so every < is written as \u003c, which JSON reads back as <.
  */
-export function profilePageData(url: string): string {
-  const data = {
-    '@context': 'https://schema.org',
-    '@type': 'ProfilePage',
-    url,
-    mainEntity: {
-      '@type': 'Person',
-      '@id': `${site.origin}/#person`,
-      name: profile.name,
-      url: `${site.origin}/`,
-      jobTitle: profile.title,
-      worksFor: { '@type': 'Organization', name: profile.employer },
-      sameAs: profile.links.filter((link) => link.href.startsWith('https:')).map((link) => link.href),
-    },
-  };
+export function structuredData(schema: Schema, url: string): string {
+  const person = { '@type': 'Person', '@id': `${site.origin}/#person`, name: profile.name, url: `${site.origin}/` };
+  const context = 'https://schema.org';
+  const data =
+    schema.type === 'Article'
+      ? { '@context': context, '@type': 'Article', url, headline: schema.headline, author: person }
+      : {
+          '@context': context,
+          '@type': 'ProfilePage',
+          url,
+          mainEntity: {
+            ...person,
+            jobTitle: profile.title,
+            worksFor: { '@type': 'Organization', name: profile.employer },
+            sameAs: profile.links.filter((link) => link.href.startsWith('https:')).map((link) => link.href),
+          },
+        };
   return JSON.stringify(data).replace(/</g, '\\u003c');
 }
 
@@ -68,7 +70,7 @@ export function headFor(page: Page): string {
     meta('og:image:height', site.image.height),
     meta('og:image:alt', site.image.alt),
     '<meta name="twitter:card" content="summary_large_image" />',
-    `<script type="application/ld+json">${profilePageData(url)}</script>`,
+    `<script type="application/ld+json">${structuredData(page.schema, url)}</script>`,
   ].join('\n    ');
 }
 
