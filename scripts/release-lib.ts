@@ -212,8 +212,10 @@ export function invalidationPaths(files: { path: string }[]): string[] {
 }
 
 /**
- * Pages in the order they go out: other files first, then HTML, then each index.html, and the home page last, since it
- * links to every other page with an address (check:dist), so a page's references exist before it does.
+ * Pages in the order they go out: other files first, then HTML, then each index.html in path order, and the home page
+ * last, since it links to every other page with an address (check:dist). So the files a page refers to, and every page
+ * the home page links to, exist before it does. Pages below the home page link to one another too (ADR 0011), so on a
+ * release that adds a page, a page written before it can link to it for about one write.
  */
 function pageOrder(files: SiteFile[]): SiteFile[] {
   const rank = (path: string) => (path === 'index.html' ? 3 : isIndex(path) ? 2 : path.endsWith('.html') ? 1 : 0);

@@ -1,7 +1,7 @@
 # zachverse
 An interactive 3D portfolio exploring my journey from Rockstar Games to Amazon Kindle, built with React, Three.js, and AWS CDK.
 
-Phase 1 built the hosting and deployment infrastructure behind [zachdavids.com](https://zachdavids.com). Phase 2 makes the site a complete HTML portfolio, a home page and a résumé so far (ADR 0010, `docs/progress.md`), and the 3D experience comes in Phase 3.
+Phase 1 built the hosting and deployment infrastructure behind [zachdavids.com](https://zachdavids.com). Phase 2 makes the site a complete HTML portfolio (ADRs 0010 and 0011, `docs/progress.md`): so far, a home page, a résumé, a case study, and "How this site is built". The 3D experience comes in Phase 3.
 
 ## Layout
 

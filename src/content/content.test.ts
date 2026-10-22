@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { render } from '../entry-server.tsx';
-import { pages, profile, resume, site } from './index.ts';
+import { caseStudy, howBuilt, pages, profile, resume, site, type Section } from './index.ts';
 
 // Every string the content module holds, however deeply nested.
 function strings(value: unknown): string[] {
@@ -58,6 +58,51 @@ describe('the résumé', () => {
   });
 });
 
+describe('the long pages', () => {
+  // Each id is its section's anchor, so a link can point at it; "sources" is the anchor of the links HowBuilt adds.
+  it.each([
+    ['case study', caseStudy.sections.map((section) => section.id)],
+    ['"How this site is built"', [...howBuilt.sections.map((section) => section.id), 'sources']],
+  ])('give each %s section a distinct id', (_, ids) => {
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) expect(id).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+  });
+
+  // A deep dive is optional reading, closed until opened, so the decisions and results come first and none hides there.
+  it.each<[string, readonly Section[]]>([
+    ['case study', caseStudy.sections],
+    ['"How this site is built"', howBuilt.sections],
+  ])('put the %s deep dives last, each headed as one', (_, sections) => {
+    const first = sections.findIndex((section) => section.deepDive);
+    expect(first).toBeGreaterThan(0);
+    expect(sections.slice(first).every((section) => section.deepDive)).toBe(true);
+    for (const section of sections) {
+      expect(section.heading.startsWith('Deep dive: '), section.id).toBe(section.deepDive === true);
+    }
+  });
+
+  it('put the diagram after a section of the case study', () => {
+    expect(caseStudy.sections.map((section) => section.id)).toContain(caseStudy.diagram.afterSection);
+  });
+
+  // Zach keeps some of the project's figures private, so the case study gives only those the résumé page already
+  // shows, and scale in its round words, plus any he supplied for the page itself. Years aside, each of its numbers is
+  // one of those, though a small one, such as 1, could match an unrelated number on the résumé.
+  it('give no figure in the case study but those the résumé page shows or Zach supplied', () => {
+    const numbers = (value: unknown) => strings(value).flatMap((text) => text.match(/\d+(?:[.,]\d+)*/g) ?? []);
+    // The feature gates he removed ("Beyond my team"), which he supplied on 2026-10-22.
+    const supplied = ['30'];
+    const published = new Set([...numbers(resume), ...supplied]);
+    expect(numbers(caseStudy).filter((number) => !/^20\d\d$/.test(number) && !published.has(number))).toEqual([]);
+  });
+
+  it('link only to the public repository on GitHub, each page once', () => {
+    const hrefs = howBuilt.links.map((link) => link.href);
+    expect(hrefs.filter((href) => !/^https:\/\/github\.com\/zachdavids\/zachverse(?:\/|$)/.test(href))).toEqual([]);
+    expect(new Set(hrefs).size).toBe(hrefs.length);
+  });
+});
+
 // The résumé the content comes from has a phone number, and a "City, ST, Country" line for Zach and for each employer
 // and the school; the site shows neither (approved 2026-10-18). This test names none of the places it guards against,
 // since this repository is public. Instead, no content type has a field for a location (resume.ts), which `satisfies`
@@ -66,7 +111,7 @@ const PHONE = /\(?\d{3}\)?[\s.-]?\d{3}[\s.-]\d{4}/;
 const LOCATION = /\b[A-Z][a-z]+(?: [A-Z][a-z]+)*, [A-Z]{2}\b/;
 
 describe('the content', () => {
-  const all = strings({ pages, profile, resume, site });
+  const all = strings({ pages, profile, resume, site, caseStudy, howBuilt });
 
   it('holds no phone number, and no location in the form "City, ST"', () => {
     expect(all.filter((text) => PHONE.test(text) || LOCATION.test(text))).toEqual([]);

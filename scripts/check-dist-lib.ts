@@ -10,7 +10,18 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
-import { type Page, type PageId, pages, profile, resume, site } from '../src/content/index.ts';
+import {
+  caseStudy,
+  howBuilt,
+  type Page,
+  type PageId,
+  pages,
+  profile,
+  resume,
+  type Schema,
+  type Section,
+  site,
+} from '../src/content/index.ts';
 import { escapeHtml } from './prerender-lib.ts';
 import { ASSETS, encodingFor, HASHED_NAME, isAsset, type SiteFile, siteFiles } from './release-lib.ts';
 import { distributionRequests, SMOKE_REQUEST_BUDGET } from './smoke-lib.ts';
@@ -20,6 +31,11 @@ export function servedFile(path: string): string {
   if (path.startsWith('/.well-known/')) return path;
   if (path.endsWith('/')) return `${path}index.html`;
   return path.lastIndexOf('.') < path.lastIndexOf('/') ? `${path}/index.html` : path;
+}
+
+// Each section's heading, with the id that lets a link point at it, as Sections renders it.
+function sectionHeadings(sections: readonly Section[]): string[] {
+  return sections.map((section) => `<h2 id="${escapeHtml(section.id)}">${escapeHtml(section.heading)}</h2>`);
 }
 
 // The path a browser requests for a root-relative reference: dot segments,
@@ -74,7 +90,13 @@ function pngSize(body: Buffer): { width: number; height: number } | undefined {
 }
 
 // What the check reads of a page's structured data. JSON.parse can return any value, so every field may be missing.
-type ProfilePageData = { '@type'?: unknown; url?: unknown; mainEntity?: { name?: unknown } } | null;
+type StructuredData = {
+  '@type'?: unknown;
+  url?: unknown;
+  headline?: unknown;
+  mainEntity?: { name?: unknown };
+  author?: { name?: unknown };
+} | null;
 
 // Each script of structured data on a page, with its text, wherever the type sits among the start tag's attributes:
 // JSX writes them in the order its props are given.
@@ -162,9 +184,9 @@ export function checkDist(rootDir: URL, release?: string): string[] {
     if (!hasImage) failures.push(`dist/${file} references missing ${site.image.path}`);
   }
 
-  // The page's structured data: one script, whose JSON describes a ProfilePage at url about Zach. Its text holds no
+  // The page's structured data: one script, whose JSON describes the page at url as schema says. Its text holds no
   // "<", which could end the script early; the prerender writes each one as an escape that JSON reads back as "<".
-  function expectStructuredData(file: string, html: string, url: string): void {
+  function expectStructuredData(file: string, html: string, url: string, schema: Schema): void {
     const scripts = [...html.matchAll(STRUCTURED_DATA)];
     if (scripts.length !== 1) {
       failures.push(`dist/${file} does not carry exactly one application/ld+json script`);
@@ -175,17 +197,25 @@ export function checkDist(rootDir: URL, release?: string): string[] {
     if (json.includes('<')) {
       failures.push(`dist/${file} has structured data holding a "<", which can end its script early`);
     }
-    let data: ProfilePageData;
+    let data: StructuredData;
     try {
-      data = JSON.parse(json) as ProfilePageData;
+      data = JSON.parse(json) as StructuredData;
     } catch {
       failures.push(`dist/${file} has structured data that is not JSON`);
       return;
     }
+    // A page about Zach has him as its main entity; an article has its headline, and him as its author.
+    const about: [string, unknown, string][] =
+      schema.type === 'Article'
+        ? [
+            ['headline', data?.headline, schema.headline],
+            ['author.name', data?.author?.name, profile.name],
+          ]
+        : [['mainEntity.name', data?.mainEntity?.name, profile.name]];
     const fields: [string, unknown, string][] = [
-      ['@type', data?.['@type'], 'ProfilePage'],
+      ['@type', data?.['@type'], schema.type],
       ['url', data?.url, url],
-      ['mainEntity.name', data?.mainEntity?.name, profile.name],
+      ...about,
     ];
     for (const [field, value, expected] of fields) {
       if (value !== expected) {
@@ -241,7 +271,7 @@ export function checkDist(rootDir: URL, release?: string): string[] {
       expectIndexed(file, html);
       expectPreview(file, html, page, url);
       expectOnce(file, html);
-      expectStructuredData(file, html, url);
+      expectStructuredData(file, html, url, page.schema);
     }
   }
 
@@ -260,7 +290,8 @@ export function checkDist(rootDir: URL, release?: string): string[] {
   }
 
   // Each page's own markup. The home page links to every other page with an address, so a visitor can reach each
-  // one; the résumé has modest needles, its heading and each role's title, not its whole markup.
+  // one. The other pages have modest needles, not their whole markup: the résumé its heading and each role's title,
+  // and the case study and "How this site is built" their headings and each section's.
   const markup: Record<PageId, string[]> = {
     home: [
       `>${escapeHtml(profile.name)}</h1>`,
@@ -271,6 +302,8 @@ export function checkDist(rootDir: URL, release?: string): string[] {
       ...pages.flatMap((page) => (page.path === null || page.id === 'home' ? [] : [`href="${escapeHtml(page.path)}"`])),
     ],
     resume: ['>Résumé</h1>', ...resume.experience.map((role) => `>${escapeHtml(role.title)}</h3>`)],
+    'kindle-feature-gating': [`>${escapeHtml(caseStudy.title)}</h1>`, ...sectionHeadings(caseStudy.sections)],
+    'how-this-site-is-built': [`>${escapeHtml(howBuilt.title)}</h1>`, ...sectionHeadings(howBuilt.sections)],
     'not-found': ['>Page not found</h1>'],
   };
   for (const { page, file, html } of built) expectIncludes(file, html, markup[page.id]);
