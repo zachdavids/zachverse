@@ -2,7 +2,8 @@ import { type PageId, pages, profile } from '../content/index.ts';
 
 /**
  * The top line of each page below the home page: Zach's name, which links home, then the site's other pages, so every
- * page is a click away from any other.
+ * page is a click away from any other. Pages put it before their main element, so a screen reader's jump to the main
+ * landmark lands on the page's heading, not on links that repeat on every page.
  */
 export function SiteNav({ current }: { current: PageId }) {
   return (

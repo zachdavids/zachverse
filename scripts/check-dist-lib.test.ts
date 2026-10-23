@@ -233,8 +233,9 @@ describe('checkDist', () => {
       {
         problem: 'a leftover body marker',
         file,
-        from: '</main></div>',
-        to: '</main><!--app-html--></div>',
+        // #root's closing tag, the only one a newline follows, whatever element ends the page.
+        from: '</div>\n',
+        to: '<!--app-html--></div>\n',
         failure: `dist/${file} still contains a prerender marker`,
       },
       {

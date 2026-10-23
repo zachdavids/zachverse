@@ -9,7 +9,7 @@ Phase 2, as the owner planned it on 2026-10-16, makes the site a complete HTML p
 - metadata for search and link previews;
 - axe and Lighthouse in CI;
 - explicit size budgets;
-- lab targets of LCP ≤ 2.5 s and CLS ≤ 0.1. INP ≤ 200 ms needs field data, which the site doesn't collect;
+- targets of LCP ≤ 2.5 s, CLS ≤ 0.1, and INP ≤ 200 ms. A page-load audit doesn't measure INP, so the plan asks for interaction testing reported on its own; INP itself needs field data, which the site doesn't collect;
 - URL handling verified as production serves it: direct loads and refresh, trailing slashes, query strings, assets, and genuine 404s, never the home page with 200 for an unknown path.
 
 Phase 1's documents assumed Phase 2 would bring the 3D scenes. Under this plan they come in Phase 3, and the notes written for them move too (`docs/progress.md`, "Phase 2").
@@ -112,13 +112,13 @@ The verification before the merge is in the pull request's description (`docs/pr
 
 ## Limits
 
-- **Lab, not field:** every performance number is a lab measurement, one simulated load per page and form factor. The site collects no field data, so INP is unmeasured, and LCP and CLS for real visits are unknown.
+- **Lab, not field:** every performance number is a lab measurement, one simulated load per page and form factor. The site collects no field data, so INP is unmeasured, and LCP and CLS for real visits are unknown. Milestone 3 measured interaction latency in a lab instead, once: the deep-dive toggles, tapped and keyboard-operated in Chromium as a phone with the CPU slowed 4×, took at most 56 ms, against INP's target of 200 ms (its pull request has the details). It is a one-off measurement, not a check that runs on each change.
 - **Lighthouse's machine:** scores and timings depend on the CPU they run on, so a slow runner could fail a page that passes elsewhere. The margins were wide on 2026-10-19: the worst LCP was 1.2 s, against 2.5 s.
 - **What the browser check sees:** it sees what Chromium sees, and judges nothing about a page's look beyond what it measures (ADR 0006, "Limits").
   - Dark mode is loaded only at 320 pixels.
   - Its Tab walk models what Chromium's Tab reaches, without radio groups, image maps, or scrolling regions, which the site doesn't have.
   - A negative `tabindex` takes an element out of the walk on purpose, so a link given one by mistake passes.
-- **Automated accessibility checks:** axe-core and Lighthouse find only what rules can find. A review by a person, with a screen reader and on real devices, is milestone 3's.
+- **Automated accessibility checks:** axe-core and Lighthouse find only what rules can find. Milestone 3's review by a person found no problems: the owner used Safari on an iPhone 18 Pro Max, with VoiceOver over the home page and the case study. It covered one device, so desktop keyboard use was checked only by an automated probe of the Tab order in Chromium, and 200% text size only by automated probes in Chromium, WebKit, and Firefox (its pull request has the details). Nothing repeats the review as the site changes.
 - **One bundle:** the JavaScript carries every page's text, so every page's script grows with the site. If the budget tightens, the next step is a chunk for each page.
 - **No redirect to the trailing slash:** `/resume` and `/resume/` both answer 200, and the page names `/resume/` as canonical, which search engines follow. A redirect would take a change to the viewer-request function, staged as ADR 0006's "Infrastructure first" requires.
 - **The sitemap** is written by hand. The policy test keeps it equal to the page table.

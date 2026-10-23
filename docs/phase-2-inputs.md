@@ -16,6 +16,8 @@ Milestone 1 addressed these items:
 
 The rest are open.
 
+**Status at Phase 2's exit (milestone 3, 2026-10-22).** `docs/phase-3-inputs.md` lists what Phase 2 leaves open for Phase 3. The items here stay open unless this section says otherwise.
+
 ## Releases
 
 - **Speed.** The release scripts handle one object per AWS CLI call, one call after another, at about a second each (ADR 0006, "Limits"). Before the site passes about 200 files, run each publishing step's per-file calls a few at a time (4 to 8), keeping the page order's ranks and the history's ordering rules, or add a file ceiling to `check:dist` beside `SMOKE_REQUEST_BUDGET`.

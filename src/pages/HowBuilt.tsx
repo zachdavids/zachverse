@@ -8,26 +8,28 @@ import { howBuilt } from '../content/index.ts';
  */
 export function HowBuilt() {
   return (
-    <main className="card">
+    <div className="card">
       <SiteNav current="how-this-site-is-built" />
-      <h1>{howBuilt.title}</h1>
-      {howBuilt.intro.map((paragraph) => (
-        <p className="summary" key={paragraph}>
-          {paragraph}
-        </p>
-      ))}
-      <Sections sections={howBuilt.sections} />
-      <section>
-        <h2 id="sources">The code and the decision records</h2>
-        <ul className="bullets">
-          {howBuilt.links.map((link) => (
-            <li key={link.href}>
-              <a href={link.href}>{link.label}</a>
-            </li>
-          ))}
-        </ul>
-      </section>
+      <main>
+        <h1>{howBuilt.title}</h1>
+        {howBuilt.intro.map((paragraph) => (
+          <p className="summary" key={paragraph}>
+            {paragraph}
+          </p>
+        ))}
+        <Sections sections={howBuilt.sections} />
+        <section>
+          <h2 id="sources">The code and the decision records</h2>
+          <ul className="bullets">
+            {howBuilt.links.map((link) => (
+              <li key={link.href}>
+                <a href={link.href}>{link.label}</a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      </main>
       <ContactLinks />
-    </main>
+    </div>
   );
 }
