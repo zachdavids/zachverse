@@ -97,14 +97,14 @@ describe('render', () => {
 
     it('opens with the site links, its heading, the headline, and the contact links', () => {
       expect(html.startsWith(
-        '<main class="card">' +
+        '<div class="card">' +
           siteNav(caseStudyLink, howBuiltLink) +
-          '<h1>Résumé</h1>' +
+          '<main><h1>Résumé</h1>' +
           '<p class="role">Senior Software Engineer | Embedded Linux, C++ &amp; Device Platforms</p>' +
           contactLinks +
           '<section><h2>Profile Summary</h2><ul class="bullets">',
       )).toBe(true);
-      expect(html.endsWith('</section></main>')).toBe(true);
+      expect(html.endsWith('</section></main></div>')).toBe(true);
     });
 
     it("gives the résumé's sections in its order", () => {
@@ -159,8 +159,9 @@ describe('render', () => {
 
     it('opens with the site links, heading, context, and three answers, and ends with the contact links', () => {
       expect(html.startsWith(
-        '<main class="card">' +
+        '<div class="card">' +
           siteNav(resumeLink, howBuiltLink) +
+          '<main>' +
           `<h1>${escapeHtml(caseStudy.title)}</h1>` +
           `<p class="role">${escapeHtml(caseStudy.context)}</p>` +
           '<dl class="points">' +
@@ -169,7 +170,7 @@ describe('render', () => {
           `<div><dt>What changed</dt><dd>${escapeHtml(summary.changed)}</dd></div>` +
           '</dl><section>',
       )).toBe(true);
-      expect(html.endsWith(`</section>${contactLinks}</main>`)).toBe(true);
+      expect(html.endsWith(`</section></main>${contactLinks}</div>`)).toBe(true);
     });
 
     it('gives its sections in order', () => {
@@ -215,13 +216,14 @@ describe('render', () => {
 
     it('opens with the site links, its heading, and its introduction, and ends with the contact links', () => {
       expect(html.startsWith(
-        '<main class="card">' +
+        '<div class="card">' +
           siteNav(resumeLink, caseStudyLink) +
+          '<main>' +
           `<h1>${escapeHtml(howBuilt.title)}</h1>` +
           howBuilt.intro.map((line) => `<p class="summary">${escapeHtml(line)}</p>`).join('') +
           '<section>',
       )).toBe(true);
-      expect(html.endsWith(`</section>${contactLinks}</main>`)).toBe(true);
+      expect(html.endsWith(`</section></main>${contactLinks}</div>`)).toBe(true);
     });
 
     it('gives its sections in order, then the links to its code and decision records', () => {
@@ -230,7 +232,7 @@ describe('render', () => {
       const links = howBuilt.links.map(
         (link) => `<li><a href="${escapeHtml(link.href)}">${escapeHtml(link.label)}</a></li>`,
       );
-      expect(rest).toBe(`<ul class="bullets">${links.join('')}</ul></section>${contactLinks}</main>`);
+      expect(rest).toBe(`<ul class="bullets">${links.join('')}</ul></section></main>${contactLinks}</div>`);
     });
 
     it('keeps its deep dives closed under their headings', () => {

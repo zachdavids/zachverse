@@ -12,28 +12,30 @@ export function CaseStudy() {
   // content.test.ts holds the diagram to a section that exists.
   const split = sections.findIndex((section) => section.id === diagram.afterSection) + 1;
   return (
-    <main className="card">
+    <div className="card">
       <SiteNav current="kindle-feature-gating" />
-      <h1>{caseStudy.title}</h1>
-      <p className="role">{caseStudy.context}</p>
-      <dl className="points">
-        <div>
-          <dt>The problem</dt>
-          <dd>{summary.problem}</dd>
-        </div>
-        <div>
-          <dt>What I owned</dt>
-          <dd>{summary.owned}</dd>
-        </div>
-        <div>
-          <dt>What changed</dt>
-          <dd>{summary.changed}</dd>
-        </div>
-      </dl>
-      <Sections sections={sections.slice(0, split)} />
-      <Diagram diagram={diagram} />
-      <Sections sections={sections.slice(split)} />
+      <main>
+        <h1>{caseStudy.title}</h1>
+        <p className="role">{caseStudy.context}</p>
+        <dl className="points">
+          <div>
+            <dt>The problem</dt>
+            <dd>{summary.problem}</dd>
+          </div>
+          <div>
+            <dt>What I owned</dt>
+            <dd>{summary.owned}</dd>
+          </div>
+          <div>
+            <dt>What changed</dt>
+            <dd>{summary.changed}</dd>
+          </div>
+        </dl>
+        <Sections sections={sections.slice(0, split)} />
+        <Diagram diagram={diagram} />
+        <Sections sections={sections.slice(split)} />
+      </main>
       <ContactLinks />
-    </main>
+    </div>
   );
 }

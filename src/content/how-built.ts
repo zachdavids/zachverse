@@ -91,7 +91,7 @@ export const howBuilt = {
       paragraphs: [],
       list: [
         "Simplicity over flexibility: apart from the CloudFront Function, there's no server code, so anything dynamic needs a new decision.",
-        'Testing: the browser checks use only Chromium, with JavaScript on, and automated accessibility checks stand in for a planned screen-reader review on real devices.',
+        "Testing: the browser checks use only Chromium, with JavaScript on, and my review on an iPhone, with VoiceOver on the home page and the case study, found no problems but isn't repeated as the site changes.",
         'Measurement: performance figures come from a lab, with no field data, so INP goes unmeasured.',
         'Recovery: the automatic rollback covers neither a deploy cancelled partway nor a bug in the release scripts it shares with publishing and restores.',
         "Planned: 3D in Phase 3, with the firewall's rate limit re-derived for it.",

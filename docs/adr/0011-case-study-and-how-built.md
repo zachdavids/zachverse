@@ -38,6 +38,7 @@ Milestone 2 adds the plan's two long pages (ADR 0010, "Context"). The case study
 
 **Navigation.**
 - Every page below the home page opens with a line of links: Zach's name, which links home, then the site's other pages. On the résumé it replaces the link home.
+- That line sits before the page's `main` element, and on the two long pages the contact links come after it, so a screen reader's jump to the main landmark lands on the page's heading (milestone 3).
 - The home page's buttons list every page, so the row wraps on most screens.
 - The case study and "How this site is built" end with the contact links.
 - The 404 page still links only home.
