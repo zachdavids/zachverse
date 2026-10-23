@@ -16,7 +16,7 @@ Milestone 1 addressed these items:
 
 The rest are open.
 
-**Status at Phase 2's exit (milestone 3, 2026-10-22).** `docs/phase-3-inputs.md` lists what Phase 2 leaves open for Phase 3. The items here stay open unless this section says otherwise.
+**Status at Phase 2's exit (2026-10-23).** `docs/phase-3-inputs.md` lists what Phase 2 leaves open for Phase 3. The items here stay open unless this section says otherwise.
 
 ## Releases
 
